@@ -1,0 +1,9 @@
+# claude
+.claude/
+CLAUDE.md
+
+# env
+.env
+
+# artifacts
+__pycache__/
