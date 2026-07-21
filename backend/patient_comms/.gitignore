@@ -1,0 +1,14 @@
+# Secrets — never commit
+.env
+
+# Local database
+patient_outreach.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
