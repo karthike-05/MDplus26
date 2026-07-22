@@ -1,0 +1,66 @@
+# DB contract — what the backend needs from Supabase
+
+This is the **minimal** set of tables/columns the form-fill + orchestration code
+reads and writes, so three teams (form / SMS / phone) can share one database
+without colliding. Adapt-don't-rewrite: our adapter (`backend/db/supabase.py`)
+translates *his* column names to our contract keys, so **rename freely** — just
+update the maps at the top of that file. The few things below genuinely have to
+*exist* are marked **REQUIRED**; everything else the adapter can map to whatever
+Data already has.
+
+> The DB is the integration bus (CLAUDE.md §2, §5a). Nobody imports anybody's code;
+> everyone reads/writes rows. That's what ties form/SMS/phone back together.
+
+---
+
+## `patients` (read + insert)
+Any columns; the adapter maps them. Used as form-fill `source` values:
+`name`, `dob`, `phone`, `address`, `medicaid_id`, `mobility_needs`, `household_size`.
+- **REQUIRED:** a primary key we can return on insert (`id`).
+
+## `referrals` (read + insert + update)
+- **REQUIRED:** `id` (pk), `patient_id` (fk), `form_id` (which form to fill),
+  and **`current_state` (text)** — this is the scheduler's spine (§7). Without a
+  persisted `current_state` the workflow can't advance.
+- Optional (mapped): `service_name`, `referring_clinic`, `appointment_date`,
+  `appointment_time`.
+- New referrals are inserted with `current_state = 'created'`.
+
+### `current_state` vocabulary (the state machine, §7)
+```
+created · consent_pending · consent_granted · outreach_in_progress ·
+submitted · needs_human · confirmed · check_in_scheduled · completed · escalated
+```
+
+## `outreach_attempts` (insert/upsert) — **the shared write contract**
+Every attempt by **any** of the three methods writes one row here in the
+`ToolOutcome` shape (`contracts/models.py`). This is the single most important table
+to agree on, because form/SMS/phone all write it and the scheduler reads it.
+- **REQUIRED columns:**
+  - `attempt_id` (text) **with a UNIQUE constraint** — idempotency key (§10); the
+    upsert is `ON CONFLICT (attempt_id)`. Without UNIQUE, retries duplicate rows.
+  - `referral_id` (fk)
+  - `channel` (text) — `form | email | phone | whatsapp | escalation`
+  - `status` (text) — `success | needs_human | failed`
+  - `from_state` (text, nullable) — the state the attempt was produced for
+  - `data` (jsonb) — tool-specific payload (confirmation, output path, problems…)
+  - `error` (text, nullable)
+
+> **Enums:** `channel` and `status` above are frozen. If Messaging/Voice write other
+> strings, the scheduler's transition table (keyed on `(from_state, status)`) won't
+> match and referrals stall. Consider a CHECK constraint on `status` to enforce it.
+
+## `form_schemas` — **not needed by this backend**
+We load schemas from the authoritative JSON in `contracts/schemas/` (§5c), so we
+touch none of the form tables. If a cache table already exists, fine — we ignore it.
+
+---
+
+## Tables this backend does NOT touch
+`social_services`, `check_ins` — owned by others; no reads/writes from form-fill.
+
+## To activate the real DB
+1. Set `SUPABASE_DB_URL` in `.env` to the Supabase **connection-pooler** DSN.
+2. Confirm the column names in `backend/db/supabase.py`'s `*_COLS` maps match Data's.
+3. Run a smoke test against the live DB (one `get_patient`, one `record_attempt`).
+   Until step 1, the backend stays on the mock — nothing else changes.

@@ -1,0 +1,61 @@
+{
+  "form_id": "food_assistance",
+  "target_type": "pdf",
+  "source_ref": "sample_forms/food_assistance_blank.pdf",
+  "fields": [
+    {
+      "name": "full_name",
+      "fill_policy": "auto",
+      "source": "patient.name",
+      "required": true,
+      "maxlength": 60,
+      "page": 1,
+      "rect": [205, 120, 562, 142]
+    },
+    {
+      "name": "date_of_birth",
+      "fill_policy": "auto",
+      "source": "patient.dob",
+      "required": true,
+      "format": "date",
+      "maxlength": 10,
+      "page": 1,
+      "rect": [205, 164, 562, 186]
+    },
+    {
+      "name": "phone",
+      "fill_policy": "auto",
+      "source": "patient.phone",
+      "required": true,
+      "format": "phone",
+      "maxlength": 14,
+      "page": 1,
+      "rect": [205, 208, 562, 230]
+    },
+    {
+      "name": "home_address",
+      "fill_policy": "review",
+      "source": "patient.address",
+      "required": true,
+      "maxlength": 80,
+      "page": 1,
+      "rect": [205, 252, 562, 274]
+    },
+    {
+      "name": "household_size",
+      "fill_policy": "review",
+      "source": "patient.household_size",
+      "required": true,
+      "maxlength": 2,
+      "page": 1,
+      "rect": [205, 296, 562, 318]
+    },
+    {
+      "name": "client_signature",
+      "fill_policy": "human_only",
+      "required": true,
+      "page": 1,
+      "rect": [205, 360, 562, 390]
+    }
+  ]
+}

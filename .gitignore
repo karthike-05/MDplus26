@@ -1,10 +1,11 @@
-# claude
-.claude/
-CLAUDE.md
-
-# env
 .env
-
-# artifacts
+.venv/
 __pycache__/
+*.pyc
+node_modules/
 .DS_Store
+sample_forms/*.png
+sample_forms/filled/
+frontend/dist/
+.pytest_cache/
+demo/live-preview/*.png
