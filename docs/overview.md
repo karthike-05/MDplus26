@@ -64,23 +64,39 @@ So a method can run on any infrastructure in any language — it just has to rea
 referral and write a conforming row. See [`db-contract.md`](db-contract.md) for the
 exact shared columns and the frozen `channel` / `status` vocabularies.
 
-## What's built now
+## What's built now (Form-fill workstream — on `main`)
 
-- **Backend:** state machine + scheduler; the form-fill tool (map → validate → review
-  → inject a real PDF); stubs for the phone / text / email methods that conform to the
-  shared tool contract; intake (find/create patient), services directory, dashboard,
-  and referral-timeline APIs; a mock DB for offline dev and a Supabase adapter behind
-  the same interface.
+Merged to `main` (PR #1). Runs offline on the in-memory mock DB; `pytest` green.
+
+- **Backend:** state machine + scheduler (the transition spine); the form-fill tool
+  (map → validate → review → inject a real PDF); stubs for the phone / text / email
+  methods conforming to the shared `ToolOutcome` contract; APIs for intake
+  (find/create patient), services directory, dashboard, referral timeline, and the
+  scheduler-driven `run` / `inbound` (sim) endpoints; a mock DB for offline dev and a
+  Supabase adapter behind the same `ReferralDB` interface (flip via `SUPABASE_DB_URL`).
 - **Frontend:** dashboard (home), services directory, initiate-referral flow, the
   split-screen form review screen, and a referral-timeline detail view. Demo
   simulation controls stand in for the real inbound webhooks so the whole loop is
-  demoable offline.
+  demoable offline. See [`../frontend/README.md`](../frontend/README.md).
 
-## Open expansion notes
+## Other workstreams (their own branches, not yet merged)
 
-- **Email submission channel** — a stub exists (`send_email`) and the dashboard/flow
-  already support an `email` mode; wiring a real provider is deferred.
-- **Upload-a-PDF → auto-extract the schema** — the scalability story for onboarding
-  unseen forms without hand-authoring. Deferred (see `CLAUDE.md` §13).
-- **Real inbound webhooks** — replace the demo simulation controls with real Twilio /
-  email parsing so the loop advances from live patient/service replies.
+- **`origin/call_agent`** (Voice / Retell) — a stateless outbound-call outcome receiver.
+- **`origin/patient_comms`** (Messaging / Twilio, Railway) — a self-contained patient
+  SMS/WhatsApp service with its own scheduler + state machine.
+
+**How they tie in is fully mapped in [`integration-plan.md`](integration-plan.md)** —
+the seams, the status-mapping tables, and the open decisions. Headline: both connect
+through two thin inbound adapter endpoints on our backend that call
+`scheduler.apply_inbound`, keeping our scheduler the sole owner of `current_state`.
+
+## Where to resume
+
+1. **Integration (highest value):** build `POST /api/voice/call-outcome` and
+   `POST /api/patient-comms/event` per [`integration-plan.md`](integration-plan.md),
+   then outbound triggers, then UI `summarize()` rendering. Re-fetch the teammate
+   branches first (they evolve).
+2. **Database:** flip to real Supabase (`SUPABASE_DB_URL` + confirm the `*_COLS` maps in
+   `backend/db/supabase.py`) — see [`db-contract.md`](db-contract.md).
+3. **Deferred:** email provider behind `send_email`; upload-a-PDF → auto-extract schema
+   (`CLAUDE.md` §13); realtime dashboard via `supabase-js`.
