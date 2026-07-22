@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Catalyst-26 · Review (offline preview)</title>
+<style>
+  :root { --border:#e2e8f0; --sel:#2b6cb0; --selbg:rgba(43,108,168,.10); --sub:#718096; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,sans-serif; color:#1a202c; height:100vh; display:flex; flex-direction:column; background:#f7fafc; }
+  header { display:flex; justify-content:space-between; align-items:center; padding:14px 20px; border-bottom:1px solid var(--border); background:#fff; }
+  .h1 { font-size:18px; font-weight:600; } .sub { font-size:13px; color:var(--sub); margin-top:2px; }
+  .pill { color:#fff; font-size:12px; font-weight:600; padding:4px 10px; border-radius:999px; }
+  .split { display:grid; grid-template-columns:minmax(320px,380px) 1fr; flex:1; min-height:0; }
+  .left { overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:10px; border-right:1px solid var(--border); }
+  .card { border:1px solid var(--border); border-radius:10px; padding:10px 12px; cursor:pointer; transition:all .12s; background:#fff; }
+  .card.sel { border-color:var(--sel); background:var(--selbg); }
+  .ftop { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+  .fname { font-size:13px; font-weight:600; }
+  .badge { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.3px; }
+  input { width:100%; padding:7px 9px; font-size:14px; border:1px solid var(--border); border-radius:6px; outline:none; }
+  .human { font-size:13px; color:#6b46c1; background:rgba(107,70,193,.08); padding:7px 9px; border-radius:6px; }
+  .prov { font-size:11px; color:var(--sub); margin-top:5px; }
+  .right { overflow-y:auto; padding:20px; display:flex; justify-content:center; }
+  .pagewrap { position:relative; width:100%; max-width:720px; box-shadow:0 2px 12px rgba(0,0,0,.12); align-self:flex-start; }
+  .pagewrap img { width:100%; display:block; }
+  .box { position:absolute; border:2px solid rgba(43,108,168,.35); border-radius:2px; cursor:pointer; transition:all .12s; }
+  .box.attn { border-color:rgba(192,86,33,.55); }
+  .box.sel { border-color:var(--sel); background:var(--selbg); box-shadow:0 0 0 3px var(--selbg); }
+</style>
+</head>
+<body>
+<header>
+  <div><div class="h1">Review extracted fields</div><div class="sub">transport_intake · referral ref_1001</div></div>
+  <span id="status" class="pill"></span>
+</header>
+<div class="split">
+  <div class="left" id="left"></div>
+  <div class="right"><div class="pagewrap"><img src="page.png" alt="form" /><div id="boxes"></div></div></div>
+</div>
+<script>
+const PAGE = { width:612, height:792 };
+const F = [
+  { name:"client_name", policy:"auto", rect:[205,120,562,142], value:"Maria Gonzalez", prov:"patient.name" },
+  { name:"date_of_birth", policy:"auto", rect:[205,164,562,186], value:"1958-03-12", prov:"patient.dob" },
+  { name:"phone", policy:"auto", rect:[205,208,562,230], value:"(512) 765-4321", prov:"patient.phone" },
+  { name:"home_address", policy:"review", rect:[205,252,562,274], value:"1420 E Cesar Chavez St, Austin, TX 78702", prov:"patient.address" },
+  { name:"medicaid_id", policy:"review", rect:[205,296,562,318], value:"TX-4471-9920", prov:"patient.medicaid_id" },
+  { name:"appointment_date", policy:"review", rect:[205,340,562,362], value:"2026-08-05", prov:"referral.appointment_date" },
+  { name:"appointment_time", policy:"review", rect:[205,384,562,406], value:"", prov:"referral.appointment_time", attn:true },
+  { name:"pickup_address", policy:"review", rect:[205,428,562,450], value:"1420 E Cesar Chavez St, Austin, TX 78702", prov:"patient.address" },
+  { name:"destination", policy:"auto", rect:[205,472,562,494], value:"CapMetro Access NEMT", prov:"referral.service_name" },
+  { name:"mobility_needs", policy:"review", rect:[205,516,562,538], value:"Wheelchair accessible vehicle required", prov:"patient.mobility_needs" },
+  { name:"referring_clinic", policy:"auto", rect:[205,560,562,582], value:"CommUnityCare Hancock", prov:"referral.referring_clinic" },
+  { name:"client_signature", policy:"human_only", rect:[205,620,562,650] },
+  { name:"date_signed", policy:"human_only", rect:[205,664,562,686] },
+];
+const LABEL = { ok:"Auto-filled", attention:"Check this", human:"Sign by hand" };
+const COLOR = { ok:"#2f855a", attention:"#c05621", human:"#6b46c1" };
+let selected = null;
+
+function statusOf(f){ if(f.policy==="human_only")return"human"; if(f.attn)return"attention"; return"ok"; }
+function select(name){ selected=name; render(); }
+
+function render(){
+  const left = document.getElementById("left"); left.innerHTML="";
+  F.forEach(f=>{
+    const st=statusOf(f), sel=selected===f.name;
+    const card=document.createElement("div"); card.className="card"+(sel?" sel":"");
+    card.onclick=()=>select(f.name);
+    card.innerHTML =
+      `<div class="ftop"><span class="fname">${f.name}</span><span class="badge" style="color:${COLOR[st]}">${LABEL[st]}</span></div>`+
+      (f.policy==="human_only"
+        ? `<div class="human">✍️ Left blank for the reviewer to sign</div>`
+        : `<input value="${f.value||""}" placeholder="—" onfocus="select('${f.name}')" />`)+
+      (f.prov?`<div class="prov">from ${f.prov}</div>`:"");
+    left.appendChild(card);
+  });
+  const boxes=document.getElementById("boxes"); boxes.innerHTML="";
+  F.forEach(f=>{
+    const [x0,y0,x1,y1]=f.rect, sel=selected===f.name;
+    const b=document.createElement("div");
+    b.className="box"+(sel?" sel":"")+(f.attn?" attn":"");
+    b.style.left=(x0/PAGE.width*100)+"%"; b.style.top=(y0/PAGE.height*100)+"%";
+    b.style.width=((x1-x0)/PAGE.width*100)+"%"; b.style.height=((y1-y0)/PAGE.height*100)+"%";
+    b.title=f.name; b.onclick=()=>select(f.name);
+    boxes.appendChild(b);
+  });
+  const unresolved=F.filter(f=>f.attn && !f.value).length;
+  const s=document.getElementById("status");
+  s.textContent = unresolved? unresolved+" need attention" : "All checked";
+  s.style.background = unresolved? "#c05621" : "#2f855a";
+}
+render();
+</script>
+</body>
+</html>

@@ -1,34 +1,110 @@
-# MDplus26
-AI Layer for Access 
+# Catalyst-26 — Referral-to-Completion Agent
 
-Idea 1: AI-Powered Referral Intelligence for Rural Generalists
+An agent that closes the **referral-to-completion** loop for social services: a clinic
+initiates a referral (with patient consent), a backend agent attempts outreach
+(form / email / phone), the patient is notified, failures escalate to a human social
+worker, and a utilization check-in fires after enrollment.
 
-Core question: What if a rural generalist had specialist-level decision support on demand and the administrative scaffolding to act on it without needing a specialist in the building?
+> **Read [`CLAUDE.md`](CLAUDE.md) before writing code** — it defines the seams,
+> contracts, and conventions that let the team build in parallel.
 
-The problem: Rural primary care physicians regularly encounter conditions requiring specialist input, but their referral networks are thin, response times are slow, and in-network matching is largely manual. Many clinics refer to only one or two institutions by default, regardless of whether those providers are the best fit for the patient.
+## Quick start
 
-The idea: An AI layer that reads the patient's symptoms and chart, identifies the most appropriate specialty or care team, and surfaces available specialists - ranked by availability, expertise, and insurance compatibility. For cases where in-person referral isn't feasible, the tool would also support telehealth integration to connect patients with non-local specialists on demand.
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt          # (to be added)
 
-Key features we're exploring:
-• Chart-to-referral pathway: AI reads the clinical picture and recommends the appropriate specialty or multi-specialist team, with documentation drafted automatically
-• Smarter matching: Surfaces providers by response rate, patient wait time, and insurance acceptance - going beyond the clinic's default referral list
-• In-network vs. out-of-network clarity: Flags coverage compatibility before the referral is placed
-• Telehealth integration: Enables access to specialists the patient could never physically reach
+python run_demo.py      # headless end-to-end (PDF)
+pytest -q               # layered test suite (no DB / no browser needed)
+```
 
-Metrics we'd track: Referral completion rate, quality of follow-up documentation, and patient-reported accessibility.
+## Layout
 
-Idea 2: AI-Coordinated Social Services Navigation for Underserved Patients
+See [`CLAUDE.md` §4](CLAUDE.md#4-repo-structure) for the full tree. The parts that matter first:
 
-Core question: A patient's zip code shouldn't determine their quality of care but right now, it does. How do we close that gap?
+- `contracts/` — shared source of truth (`models.py` + per-form schema JSON). **Freeze early.**
+- `backend/` — FastAPI app, orchestrator (state machine + scheduler), tools, db seam.
+- `frontend/` — SW dashboard + per-patient review UI, and the local mock web form.
 
-The problem: After a clinical encounter, underserved patients are often handed a list of next steps they can't act on. Transportation barriers, psychiatric needs, housing instability, and scattered county resources create friction that causes patients to fall out of care entirely. Social workers are stretched thin, and the infrastructure connecting patients to the right resources simply doesn't exist in most community settings.
+## Organization & structure
 
-The idea: An AI layer that actively navigates social services on behalf of the patient, not just surfacing options, but completing the action. The tool would connect patients with region-specific resources (transport agencies, housing assistance, psychiatric referrals, county programs) and where possible, directly book services rather than handing off a phone number.
+Four people build in parallel on different infra without colliding, because the code
+is organized around **seams, not shared imports.** Two rules make it work (full
+detail in [`CLAUDE.md`](CLAUDE.md)):
 
-Key features we're exploring:
-• Active coordination: Books transportation, schedules follow-ups, and connects patients to services - reducing friction at every step
-• Clinic-facing integration: Embeds into the clinic workflow so staff can initiate the process during or after a visit, helping patients who don't have smartphones or reliable internet access
-• County-specific resource mapping: Dynamically surfaces the most relevant local programs based on the patient's zip code and needs
-• Regional clinic network (longer-term): A shared layer connecting rural clinics within the same region — pooling resource visibility, referral capacity, and supply availability so clinics can support each other
+1. **Modules talk through the DB + the scheduler — never by importing each other.**
+2. **Depend on interfaces, not implementations** — mock the boundary, ship before
+   the dependency exists.
 
-Metrics we'd track: Rate of successful resource connections, reduction in social worker time spent on coordination, and patient follow-through on referred services.
+### Who owns what
+
+| Area | Owner | Entry point |
+| --- | --- | --- |
+| Contracts · form-fill · orchestration glue | **Form-fill** | `contracts/`, `backend/tools/fill_form/`, `backend/orchestrator/` |
+| Supabase schema · seed · db layer | **Data** | `backend/db/supabase.py` (behind `ReferralDB`) |
+| `notify_patient` — patient WhatsApp/SMS (Twilio) | **Messaging** | `backend/tools/notify_patient.py` |
+| `make_phone_call` — outbound calls to services (Retell) | **Voice** | `backend/tools/make_phone_call.py` |
+
+### How the three submission methods tie back together
+
+A referral can be submitted to a service by **form**, **email**, or **phone**. These
+are interchangeable because of two shared contracts — not shared code:
+
+- **Every tool returns the same `ToolOutcome`** (`contracts/models.py`) and writes one
+  `outreach_attempts` row. Signature for all of them:
+  `tool(referral_id, db, *, attempt_id, from_state) -> ToolOutcome`.
+- **One scheduler** (`backend/orchestrator/scheduler.py`) reads `referrals.current_state`,
+  picks the method (`outreach_channel` → `OUTREACH_TOOLS`), runs it, and advances state
+  from the outcome. Long/async work (a phone call, an email acceptance) returns later as
+  an **inbound** `ToolOutcome` via `scheduler.apply_inbound` — same table, same shape.
+
+So Messaging (Railway) and Voice (their own infra) never import this repo: they read a
+referral and write a conforming `outreach_attempts` row. The DB is the integration bus.
+
+> **The one thing to keep aligned across all three:** the `outreach_attempts` write
+> columns and the `channel` / `status` enums. See [`docs/db-contract.md`](docs/db-contract.md)
+> — it's the minimal spec to hand Data, and the shape SMS/phone must conform to.
+
+### Swapping the database
+
+`ReferralDB` (`backend/db/interface.py`) is the seam. Set `SUPABASE_DB_URL` in `.env`
+and the backend uses real Supabase (`supabase.py`); leave it blank and it uses the
+fixture mock. Data's column names live only in the `*_COLS` maps at the top of
+`supabase.py` — rename there to match his schema; nothing upstream changes.
+
+## Scope
+
+Building the **warm path on one hero form** for the **Aug 2** recorded pitch: pick
+patient → auto-fill → human review → submit → capture confirmation → outcome flows into
+the tracking loop + check-in. See [`CLAUDE.md` §12](CLAUDE.md#12-demo-scope-reminder-aug-2).
+
+**Synthetic data only. No real PHI.**
+
+## Future tasks
+
+**Database integration.** *Currently* the whole app runs on an in-memory fixture
+mock (`backend/db/mock.py`) — no database, no network, no secrets; restarting the
+backend resets the demo. *The plan:* everything depends on the `ReferralDB` interface
+(`backend/db/interface.py`), and the **integration script is the adapter in
+`backend/db/supabase.py`** — an asyncpg layer whose only job is to *translate* between
+our contract keys and the real column names (the `TABLES` / `*_COLS` maps at the top of
+the file). To go live: set `SUPABASE_DB_URL` in `.env` (the `make_db()` switch in
+`backend/main.py` picks Supabase when it's set, mock when it isn't), confirm those maps
+match the real schema, and smoke-test. Reads adapt freely to whatever columns exist;
+the only shared write contract is `outreach_attempts` + the `channel`/`status` enums —
+spec in [`docs/db-contract.md`](docs/db-contract.md). No tool or UI code changes either
+way.
+
+**Other open tasks** (details in [`CLAUDE.md` §13](CLAUDE.md#13-future-directions-post-aug-2)
+and [`frontend/README.md`](frontend/README.md#integration-points-for-teammates)):
+
+- **Real inbound webhooks** — replace the dashboard's simulation buttons with live
+  Twilio (patient opt-in / "Y") and service-response parsing, via
+  `POST /api/webhooks/*` → `scheduler.apply_inbound(...)`.
+- **Messaging / Voice tools live** — swap the stubs in `backend/tools/notify_patient.py`
+  and `make_phone_call.py` for real Twilio / Retell calls.
+- **Email channel** — wire a provider behind the existing `send_email` stub.
+- **Upload-a-PDF → auto-extract the schema** — the cold-path scalability story (Aug-17
+  stretch); today schemas are hand-authored.
+- **Realtime dashboard** — move the dashboard to `supabase-js` realtime so it updates
+  without refetching once real Supabase is in.

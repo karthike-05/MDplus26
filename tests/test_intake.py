@@ -1,0 +1,55 @@
+"""Intake front-door tests (CLAUDE.md §12 "pick patient" beat). No DB/browser.
+
+Covers the seam the find-patient page depends on: identity match (auto-populate),
+create-when-absent, and referral creation starting at `created` so the scheduler
+drives it. Also pins instance isolation — create_* must not leak into the shared
+fixtures.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+from backend.db.mock import MockReferralDB
+
+
+def test_find_patient_matches_on_normalized_name_and_dob():
+    db = MockReferralDB()
+    # pat_001 is "Maria Gonzalez", dob "03/12/1958" (non-ISO in the fixture).
+    p = asyncio.run(db.find_patient("  maria   GONZALEZ ", "1958-03-12"))
+    assert p is not None and p["id"] == "pat_001"
+
+    # Same person, dob typed in the fixture's own non-ISO shape -> still matches.
+    p2 = asyncio.run(db.find_patient("Maria Gonzalez", "03/12/1958"))
+    assert p2 is not None and p2["id"] == "pat_001"
+
+
+def test_find_patient_no_match_returns_none():
+    db = MockReferralDB()
+    assert asyncio.run(db.find_patient("Nobody Here", "2000-01-01")) is None
+    # Right name, wrong dob -> not a match (identity is name AND dob).
+    assert asyncio.run(db.find_patient("Maria Gonzalez", "1990-01-01")) is None
+
+
+def test_create_patient_then_find_it():
+    db = MockReferralDB()
+    pid = asyncio.run(db.create_patient({"name": "Ada Lovelace", "dob": "1815-12-10"}))
+    assert pid.startswith("pat_")
+    found = asyncio.run(db.find_patient("ada lovelace", "1815-12-10"))
+    assert found is not None and found["id"] == pid
+
+
+def test_create_referral_starts_at_created():
+    db = MockReferralDB()
+    rid = asyncio.run(db.create_referral("pat_002", "transport_intake", service_name="Drive A Senior ATX"))
+    ref = asyncio.run(db.get_referral(rid))
+    assert ref["current_state"] == "created"
+    assert ref["patient_id"] == "pat_002" and ref["service_name"] == "Drive A Senior ATX"
+
+
+def test_instances_are_isolated():
+    """create_* on one instance must not bleed into another (§ shared-fixture guard)."""
+    db1 = MockReferralDB()
+    asyncio.run(db1.create_patient({"id": "pat_ghost", "name": "Ghost", "dob": "2000-01-01"}))
+    db2 = MockReferralDB()
+    assert asyncio.run(db2.find_patient("Ghost", "2000-01-01")) is None
