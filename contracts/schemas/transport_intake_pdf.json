@@ -1,0 +1,124 @@
+{
+  "form_id": "transport_intake",
+  "target_type": "pdf",
+  "source_ref": "sample_forms/transport_intake_blank.pdf",
+  "fields": [
+    {
+      "name": "client_name",
+      "fill_policy": "auto",
+      "source": "patient.name",
+      "required": true,
+      "maxlength": 60,
+      "page": 1,
+      "rect": [205, 120, 562, 142]
+    },
+    {
+      "name": "date_of_birth",
+      "fill_policy": "auto",
+      "source": "patient.dob",
+      "required": true,
+      "format": "date",
+      "maxlength": 10,
+      "page": 1,
+      "rect": [205, 164, 562, 186]
+    },
+    {
+      "name": "phone",
+      "fill_policy": "auto",
+      "source": "patient.phone",
+      "required": true,
+      "format": "phone",
+      "maxlength": 14,
+      "page": 1,
+      "rect": [205, 208, 562, 230]
+    },
+    {
+      "name": "home_address",
+      "fill_policy": "review",
+      "source": "patient.address",
+      "required": true,
+      "maxlength": 80,
+      "page": 1,
+      "rect": [205, 252, 562, 274]
+    },
+    {
+      "name": "medicaid_id",
+      "fill_policy": "review",
+      "source": "patient.medicaid_id",
+      "required": true,
+      "maxlength": 20,
+      "page": 1,
+      "rect": [205, 296, 562, 318]
+    },
+    {
+      "name": "appointment_date",
+      "fill_policy": "review",
+      "source": "referral.appointment_date",
+      "required": true,
+      "format": "date",
+      "maxlength": 10,
+      "page": 1,
+      "rect": [205, 340, 562, 362]
+    },
+    {
+      "name": "appointment_time",
+      "fill_policy": "review",
+      "source": "referral.appointment_time",
+      "required": true,
+      "maxlength": 8,
+      "page": 1,
+      "rect": [205, 384, 562, 406]
+    },
+    {
+      "name": "pickup_address",
+      "fill_policy": "review",
+      "source": "patient.address",
+      "required": true,
+      "maxlength": 80,
+      "page": 1,
+      "rect": [205, 428, 562, 450]
+    },
+    {
+      "name": "destination",
+      "fill_policy": "auto",
+      "source": "referral.service_name",
+      "required": true,
+      "maxlength": 60,
+      "page": 1,
+      "rect": [205, 472, 562, 494]
+    },
+    {
+      "name": "mobility_needs",
+      "fill_policy": "review",
+      "source": "patient.mobility_needs",
+      "required": false,
+      "maxlength": 60,
+      "page": 1,
+      "rect": [205, 516, 562, 538]
+    },
+    {
+      "name": "referring_clinic",
+      "fill_policy": "auto",
+      "source": "referral.referring_clinic",
+      "required": true,
+      "maxlength": 60,
+      "page": 1,
+      "rect": [205, 560, 562, 582]
+    },
+    {
+      "name": "client_signature",
+      "fill_policy": "human_only",
+      "required": true,
+      "page": 1,
+      "rect": [205, 620, 562, 650]
+    },
+    {
+      "name": "date_signed",
+      "fill_policy": "human_only",
+      "required": true,
+      "format": "date",
+      "page": 1,
+      "rect": [205, 664, 562, 686]
+    }
+  ]
+}
