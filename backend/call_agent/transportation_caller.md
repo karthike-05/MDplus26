@@ -1,5 +1,10 @@
 # Transportation Referral Call — Agent Workflow
 
+## Other things to implement
+- attempts: referral_id (7d411b58-6eca-4588-8209-7afb0d7ac9ea), service_id (87d2af4b-4a83-4051-b790-9925a736d4fa), attempt_number (iterate by 1), channel (call), provider, purpose, status, outcome, external_id, structured_result, transcript_url, error_code, notes
+- escalations (only if the issue is escalated): referral_id, reason_code, handoff_summary, assigned_social_worker (just say SW1), status
+- patient_service_booking_details (updates): access the row using booking_id and referral_id. Then update booking_status, confirmation_number, scheduled_start_at, scheduled_end_at, pickup_instructions, destination_instructions, patient_instructions, cancellation_instructions, booked_at (timestamptz)
+
 ## Backend / Retell functions to build
 
 **Pre-call (assembles dynamic variables before the call is placed)**
