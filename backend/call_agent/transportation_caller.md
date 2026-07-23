@@ -1,9 +1,16 @@
 # Transportation Referral Call — Agent Workflow
 
-## Other things to implement
-- attempts: referral_id (7d411b58-6eca-4588-8209-7afb0d7ac9ea), service_id (87d2af4b-4a83-4051-b790-9925a736d4fa), attempt_number (iterate by 1), channel (call), provider, purpose, status, outcome, external_id, structured_result, transcript_url, error_code, notes
-- escalations (only if the issue is escalated): referral_id, reason_code, handoff_summary, assigned_social_worker (just say SW1), status
-- patient_service_booking_details (updates): access the row using booking_id and referral_id. Then update booking_status, confirmation_number, scheduled_start_at, scheduled_end_at, pickup_instructions, destination_instructions, patient_instructions, cancellation_instructions, booked_at (timestamptz)
+## Database interaction summary (for other services sharing these tables)
+
+This service is triggered per referral (identified by `referral_id` + `booking_id`) to call a transportation organization and record the outcome. It touches five shared Supabase tables:
+
+- **patients** — read-only. Looks up a patient's DOB, phone, insurance info, mobility needs, and referring clinic by `patient_id`.
+- **patient_service_booking_details** — read + write. Reads the booking row (by `booking_id` + `referral_id`) for trip details (pickup/dropoff, service org, contact number) before calling. After the call, updates that same row's `booking_status`, `confirmation_number`, `scheduled_start_at`, pickup/destination/cancellation instructions, `patient_instructions`, and `booked_at`.
+- **attempts** — write, append-only. Inserts one row per completed call, keyed by `referral_id` + `service_id`, with a 1-indexed `attempt_number` that increments per referral+service. This is the source of truth for "how many times has this service been contacted for this referral."
+- **escalations** — write-only. Inserts a row whenever a case needs social worker follow-up — either because a call surfaced an issue (ineligible, needs verification, etc.) or because 3 call attempts were exhausted without a resolution. Always sets `assigned_social_worker` to `"SW1"`.
+- **schedules** — read-only (not yet active). Will be used to check an organization's `opens_at`/`closes_at` by `service_id` before calling, deferring calls placed outside business hours.
+
+Shared identifiers other services should know about: `referral_id`, `booking_id`, `service_id`, and `patient_id` are the keys this service uses to read/write the above tables — if your service also writes to `patient_service_booking_details` or `attempts`, coordinate on these keys to avoid conflicting updates.
 
 ## Backend / Retell functions to build
 
