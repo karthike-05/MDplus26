@@ -56,12 +56,17 @@ async def _call_retell(booking_id: str, referral_id: str, request_data: dict) ->
         "destination_instructions": request_data["destination_instructions"],
         "patient_instructions": request_data["patient_instructions"],
         "cancellation_instructions": request_data["cancellation_instructions"],
-        "accessibility_accomodations": request_data["accessibility_accomodations"],
         "insurance_type": request_data["insurance_type"],
         "patient_insurance_id": request_data["insurance_member_id"],
         "mobility_needs": request_data["mobility_needs"],
         "referring_clinic_name": request_data["referring_clinic_name"],
+        "appointment_time": request_data["appointment_date"],
+        "appointment_location": request_data["appointment_location"],
     }
+    # Retell rejects the whole request if any dynamic variable is non-string;
+    # fields like confirmation_number/scheduled_start_at are legitimately NULL
+    # before the first call confirms them.
+    dynamic_variables = {k: "" if v is None else str(v) for k, v in dynamic_variables.items()}
 
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -175,7 +180,21 @@ async def log_outcome(request: Request):
     }
 
 
-@app.get("/lookup-patient-appointment")
-def lookup_patient_appointment(case_id: str = Query(...)):
-    appointment = db.get_patient_appointment(case_id)
-    return {"data": appointment}
+@app.get("/lookup-service-request-details")
+def lookup_service_request_details(case_id: str = Query(...)):
+    details = db.get_service_request_details(case_id)
+    return {"data": details}
+
+
+class PlaceReferralCallRequest(BaseModel):
+    booking_id: str
+    referral_id: str
+
+
+@app.post("/place-referral-call")
+async def place_referral_call_endpoint(request: PlaceReferralCallRequest):
+    """HTTP entry point for triggering an outbound Retell call for a
+    referral's transportation booking. Same underlying function
+    trigger_call.py exercises directly for manual testing.
+    """
+    return await place_referral_call(request.booking_id, request.referral_id)
