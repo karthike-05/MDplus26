@@ -1,5 +1,17 @@
 # Transportation Referral Call — Agent Workflow
 
+## Calling this service
+
+Base URL: `https://md-catalyst-call-agent-production.up.railway.app`
+
+| Method | Path | Body / Query | Purpose |
+|---|---|---|---|
+| POST | `/place-referral-call` | `{"booking_id", "referral_id"}` | Places the outbound Retell call for a referral's transportation booking (the actual dial-out). Returns Retell's create-call response, or `{"escalated": true, "reason": "max_attempts_exceeded"}` if the 3-attempt cap has already been hit. |
+| POST | `/log-call-outcome` | Retell post-call webhook payload — either flat, or wrapped as `{"call": {...}, "name", "args": {...}}` (both shapes accepted) | Parses the structured call outcome and writes it to `attempts`/`service_bookings`/`escalations`. Idempotent on Retell's `call_id` (`attempts.external_id`) — safe to retry. |
+| GET | `/lookup-service-request-details?case_id=...` | — | Real-time service-request lookup, used mid-call by Retell's function-calling (step [6] in the flowchart below). |
+
+`/place-referral-call` wraps the same `place_referral_call(booking_id, referral_id)` function that `trigger_call.py` calls directly for manual testing — run `python trigger_call.py [referral_id]` to exercise the call-placing logic locally without going through HTTP, or POST to this endpoint to trigger it remotely.
+
 ## Database interaction summary (for other services sharing these tables)
 
 This service is triggered per referral (identified by `referral_id` + `booking_id`) to call a transportation organization and record the outcome. It touches five shared Supabase tables:
