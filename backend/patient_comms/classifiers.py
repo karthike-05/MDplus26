@@ -1,11 +1,12 @@
 """
 Inbound reply classification -- two implementations behind one interface.
 
-  - KeywordClassifier (default): exact-match keyword logic. Zero deps, offline,
-    safe for mock-mode demos.
-  - LLMClassifier: Claude reads the reply and returns a structured label,
-    catching the cases keywords miss -- "I called but no one answered",
-    "went yesterday, thanks", "which appointment??". Switch with CLASSIFIER=llm.
+  - LLMClassifier (default): Claude reads the reply and returns a structured
+    label, catching the cases keywords miss -- "I called but no one answered",
+    "went yesterday, thanks", "which appointment??". Keeps a keyword fast-path
+    for the obvious YES/NO/STOP so those never hit the API.
+  - KeywordClassifier: exact-match keyword logic only. Zero deps, offline.
+    Opt in with CLASSIFIER=keyword (e.g. an env with no API key).
 
 WHY the LLM is on the INBOUND side only (see CLAUDE.md Section 7):
   - It classifies the patient's reply into ONE enum label. That label is all
@@ -37,15 +38,24 @@ _SYSTEM_PROMPT = (
     "You classify a single inbound SMS reply from a patient who received an "
     "automated message from a healthcare social-services outreach program. "
     "Classify the reply into exactly one category:\n"
-    "- affirmative: confirms, agrees, or indicates something was done/completed "
-    '(e.g. "yes", "yep", "already went", "all set").\n'
-    "- negative: declines or indicates something was NOT done "
-    '(e.g. "no", "not yet", "haven\'t been able to").\n'
-    "- needs_help: tried but hit a problem, is confused, has a question, or asks "
-    'for assistance (e.g. "I called but no one answered", "which appointment?", '
-    '"can someone call me").\n'
-    "- opt_out: wants to stop messages / unsubscribe "
-    '(e.g. "stop", "quit", "unsubscribe", "leave me alone").\n'
+    "- affirmative: confirms/agrees or says something was done "
+    '(e.g. "yes", "already went", "all set").\n'
+    "- negative: declines or says something was NOT done "
+    '(e.g. "no", "not yet").\n'
+    "- reschedule: wants a different date/time "
+    '(e.g. "can we move it", "Tuesday doesn\'t work").\n'
+    "- cancel: wants to cancel the service entirely "
+    '(e.g. "I don\'t need it anymore", "cancel my ride").\n'
+    "- appointment_question: asks for details about the appointment "
+    '(e.g. "what time?", "where do I go?", "who\'s picking me up?").\n'
+    "- accessibility_need: mentions a disability/accommodation need "
+    '(e.g. "I use a wheelchair", "I\'m hard of hearing").\n'
+    "- channel_preference: asks to be contacted a different way "
+    '(e.g. "call me instead", "email me").\n'
+    "- needs_help: a problem/confusion not covered above "
+    '(e.g. "I called but no one answered", "I don\'t have a photo ID").\n'
+    "- opt_out: wants to stop messages "
+    '(e.g. "stop", "unsubscribe", "leave me alone").\n'
     "- unclear: none of the above, or ambiguous.\n"
     "Respond only with the structured category."
 )
@@ -55,7 +65,9 @@ _SCHEMA = {
     "properties": {
         "category": {
             "type": "string",
-            "enum": ["affirmative", "negative", "needs_help", "opt_out", "unclear"],
+            "enum": ["affirmative", "negative", "reschedule", "cancel",
+                     "appointment_question", "accessibility_need",
+                     "channel_preference", "needs_help", "opt_out", "unclear"],
         }
     },
     "required": ["category"],
@@ -74,6 +86,11 @@ def _label_to_class(label: str):
         "needs_help": ReplyClass.NEEDS_HELP,
         "opt_out": ReplyClass.STOP,
         "unclear": ReplyClass.UNCLEAR,
+        "reschedule": ReplyClass.RESCHEDULE,
+        "cancel": ReplyClass.CANCEL,
+        "appointment_question": ReplyClass.APPOINTMENT_QUESTION,
+        "accessibility_need": ReplyClass.ACCESSIBILITY_NEED,
+        "channel_preference": ReplyClass.CHANNEL_PREFERENCE,
     }.get(label, ReplyClass.UNCLEAR)
 
 
@@ -136,12 +153,17 @@ _classifier_singleton: ReplyClassifier | None = None
 
 
 def get_classifier() -> ReplyClassifier:
-    """CLASSIFIER env var selects keyword (default) vs llm."""
+    """CLASSIFIER env var selects the inbound classifier. Defaults to 'llm';
+    set CLASSIFIER=keyword to force the offline keyword-only path (e.g. a
+    dev/CI environment with no ANTHROPIC_API_KEY). The LLM path already keeps
+    a keyword fast-path and degrades to it if the API is unavailable, so 'llm'
+    is a safe default even without a key."""
     global _classifier_singleton
     if _classifier_singleton is None:
-        if os.environ.get("CLASSIFIER", "keyword").lower() == "llm":
+        if os.environ.get("CLASSIFIER", "llm").lower() == "keyword":
+            _classifier_singleton = KeywordClassifier()
+            logger.info("using keyword classifier")
+        else:
             _classifier_singleton = LLMClassifier()
             logger.info("using LLM classifier (model=%s)", DEFAULT_MODEL)
-        else:
-            _classifier_singleton = KeywordClassifier()
     return _classifier_singleton

@@ -8,6 +8,12 @@ Run locally (mock sends, SQLite, demo-speed scheduler):
 
 Point Twilio's inbound webhook (once you have a real number) at:
     POST /webhook/sms-inbound
+
+The comms loop itself is no longer driven by manual POST endpoints -- it's
+driven by referral_actions (Loop A, poller.py) and elapsed-time tracks
+(Loop B, scheduler.py), both started from this app's startup event. This
+module's job is: serve the dashboard/read endpoints, and apply the inbound
+webhook's writes atomically.
 """
 import logging
 import os
@@ -19,24 +25,15 @@ load_dotenv()  # pick up TWILIO_*, SMS_PROVIDER, DEMO_TIMESCALE, etc. from a .en
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from datetime import datetime
-
-from models import Base, ConsentStatus, Message, PatientOutreach, VerificationStatus
+import repo
+from classifiers import get_classifier
+from inbound import execute_inbound
+from models import Base, Message, PatientOutreach, Stage
+from outreach_repo import find_open_by_phone
 from scheduler import start_scheduler
-from service import (
-    log_message,
-    record_booking,
-    send_ack,
-    send_nudge,
-    send_reminder,
-    send_verification,
-    start_outreach,
-)
-from state_machine import route_inbound_reply
 
 logger = logging.getLogger("sms_service")
 logging.basicConfig(level=logging.INFO)
@@ -59,45 +56,6 @@ if os.path.isdir(_STATIC_DIR):
 @app.on_event("startup")
 def _startup():
     start_scheduler(SessionLocal)
-
-
-# ---------- request schemas ----------
-
-class StartOutreachRequest(BaseModel):
-    referral_id: str
-    patient_phone: str  # E.164, e.g. "+15551234567"
-    patient_name: str
-    org_name: str
-    service_type: str
-
-
-class BookingRequest(BaseModel):
-    """Posted by the org-facing agentic layer once it has booked the resource."""
-    appointment_at: datetime | None = None  # ISO 8601, e.g. "2026-08-04T14:00"
-    appointment_location: str | None = None
-    confirmation_code: str | None = None
-    instructions: str | None = None
-
-
-# ---------- helpers ----------
-
-def _find_open_outreach(session, patient_phone: str) -> PatientOutreach | None:
-    """Most recent outreach for this phone that still has a stage awaiting a
-    reply. Filtering on "open" (not just newest) matters once a patient has
-    more than one active referral -- a reply routes to the referral actually
-    asking a question, not just whichever row is newest."""
-    from state_machine import current_stage
-
-    candidates = (
-        session.query(PatientOutreach)
-        .filter(PatientOutreach.patient_phone == patient_phone)
-        .order_by(PatientOutreach.created_at.desc())
-        .all()
-    )
-    for outreach in candidates:
-        if current_stage(outreach) != "none":
-            return outreach
-    return None
 
 
 # ---------- dashboard ----------
@@ -130,98 +88,7 @@ def terms():
     return FileResponse(page)
 
 
-# ---------- endpoints ----------
-
-@app.post("/outreach/start")
-def start(req: StartOutreachRequest):
-    """Create the outreach record and send the consent request. Call this when
-    a referral is created and confirmed on the clinic/org side."""
-    session = SessionLocal()
-    try:
-        outreach = start_outreach(
-            session,
-            referral_id=req.referral_id,
-            patient_phone=req.patient_phone,
-            patient_name=req.patient_name,
-            org_name=req.org_name,
-            service_type=req.service_type,
-        )
-        return {"id": outreach.id, "consent_status": outreach.consent_status}
-    finally:
-        session.close()
-
-
-@app.post("/outreach/{outreach_id}/booking")
-def booking(outreach_id: str, req: BookingRequest):
-    """Called by the agentic layer once it has booked the resource: stores the
-    details and texts them to the patient. Requires confirmed consent."""
-    session = SessionLocal()
-    try:
-        outreach = session.get(PatientOutreach, outreach_id)
-        if not outreach:
-            raise HTTPException(404, "outreach not found")
-        if outreach.consent_status != ConsentStatus.CONFIRMED:
-            raise HTTPException(400, "patient has not confirmed consent yet")
-        record_booking(
-            session,
-            outreach,
-            appointment_at=req.appointment_at,
-            appointment_location=req.appointment_location,
-            confirmation_code=req.confirmation_code,
-            instructions=req.instructions,
-        )
-        return {"id": outreach.id, "booking_notified_at": outreach.booking_notified_at}
-    finally:
-        session.close()
-
-
-@app.post("/outreach/{outreach_id}/reminder")
-def reminder(outreach_id: str):
-    """Manual reminder trigger. The scheduler fires this ~1 day before the
-    appointment; kept for testing / on-stage manual control."""
-    session = SessionLocal()
-    try:
-        outreach = session.get(PatientOutreach, outreach_id)
-        if not outreach:
-            raise HTTPException(404, "outreach not found")
-        if not outreach.booking_notified_at:
-            raise HTTPException(400, "no booking recorded yet")
-        send_reminder(session, outreach)
-        return {"id": outreach.id, "reminder_sent_at": outreach.reminder_sent_at}
-    finally:
-        session.close()
-
-
-@app.post("/outreach/{outreach_id}/verify")
-def verify(outreach_id: str):
-    """Manual verification trigger -- the closed-loop 'did you use it?' question.
-    The scheduler fires this ~1 day after the appointment."""
-    session = SessionLocal()
-    try:
-        outreach = session.get(PatientOutreach, outreach_id)
-        if not outreach:
-            raise HTTPException(404, "outreach not found")
-        if not outreach.booking_notified_at:
-            raise HTTPException(400, "no booking recorded yet")
-        send_verification(session, outreach)
-        return {"id": outreach.id, "verification_sent_at": outreach.verification_sent_at}
-    finally:
-        session.close()
-
-
-@app.post("/outreach/{outreach_id}/nudge")
-def nudge(outreach_id: str):
-    """One retry if verification goes silent. Also fired by the scheduler."""
-    session = SessionLocal()
-    try:
-        outreach = session.get(PatientOutreach, outreach_id)
-        if not outreach:
-            raise HTTPException(404, "outreach not found")
-        send_nudge(session, outreach)
-        return {"id": outreach.id, "nudge_sent_at": outreach.nudge_sent_at}
-    finally:
-        session.close()
-
+# ---------- inbound webhook ----------
 
 def _twiml_ok() -> Response:
     """Empty TwiML -- tells Twilio 'received, no auto-reply' (we send the ack via
@@ -246,10 +113,13 @@ def _valid_twilio_signature(request: Request, params: dict) -> bool:
 
 @app.post("/webhook/sms-inbound")
 async def sms_inbound(request: Request):
-    """Twilio posts here on every inbound patient reply, as
-    application/x-www-form-urlencoded. Routes the reply to whichever stage
-    (consent/active/verification) is open for that phone number, logs it,
-    updates status, and sends a templated acknowledgment back.
+    """Twilio/WhatsApp posts here on every inbound patient reply, as
+    application/x-www-form-urlencoded. Looks up the open outreach row for the
+    sending phone number, classifies the reply, and delegates every write
+    (shared-table writeback, local stage advance, action close-out, attempt
+    log, inbound message log, outbound ack) to `inbound.execute_inbound`,
+    which applies them on ONE connection/transaction so they commit
+    atomically.
 
     Set TWILIO_VALIDATE_SIGNATURE=1 to reject requests without a valid Twilio
     signature (leave off for local/mock testing via curl or the dashboard)."""
@@ -261,26 +131,28 @@ async def sms_inbound(request: Request):
             logger.warning("Rejected inbound SMS: invalid Twilio signature")
             raise HTTPException(403, "invalid Twilio signature")
 
-    # Twilio sends WhatsApp inbound as From="whatsapp:+1..." -- strip the prefix
-    # so it matches the plain E.164 number stored on the outreach row.
-    from_number = params.get("From", "").replace("whatsapp:", "")
-    body = params.get("Body", "")
-    if not from_number:
+    # Twilio sends WhatsApp inbound as From="whatsapp:+1..." -- strip the
+    # prefix so it matches the plain E.164 number stored on the outreach row.
+    from_phone = (params.get("From") or "").replace("whatsapp:", "")
+    body = params.get("Body") or ""
+    if not from_phone:
         raise HTTPException(400, "missing 'From'")
 
     session = SessionLocal()
     try:
-        outreach = _find_open_outreach(session, from_number)
-        if not outreach:
-            logger.warning("Inbound SMS from unknown/idle number: %s", from_number)
+        outreach = find_open_by_phone(session, from_phone)
+        if outreach is None:
+            logger.warning("Inbound message from unknown/idle number: %s", from_phone)
             return _twiml_ok()
 
-        stage, ack_key = route_inbound_reply(outreach, body)
-        log_message(session, outreach, "inbound", stage, body)
-        if ack_key:
-            send_ack(session, outreach, ack_key)  # confirm receipt back to patient
+        reply_class = get_classifier().classify(body)
+        patient = repo.get_patient_for_referral(outreach.referral_id) or {}
+        open_esc = repo.find_open_escalation(outreach.referral_id)
+
+        ack = execute_inbound(session, outreach, reply_class, body, patient, open_esc, repo=repo)
         session.commit()
-        logger.info("Routed inbound reply from %s stage=%s ack=%s", from_number, stage, ack_key)
+        logger.info("Routed inbound from %s reply=%s ack sent (%d chars)",
+                    from_phone, reply_class.value, len(ack))
         return _twiml_ok()
     finally:
         session.close()
@@ -289,10 +161,30 @@ async def sms_inbound(request: Request):
 # ---------- read endpoints (feed the dashboard) ----------
 
 def _needs_attention(o: PatientOutreach) -> bool:
-    return (
-        o.verification_status in (VerificationStatus.NO_RESPONSE, VerificationStatus.NEEDS_REVIEW)
-        or o.consent_status == ConsentStatus.DECLINED
-    )
+    return o.stage == Stage.ESCALATED
+
+
+def _serialize(o: PatientOutreach) -> dict:
+    return {
+        "id": o.id,
+        "referral_id": o.referral_id,
+        "patient_phone": o.patient_phone,
+        "stage": o.stage,
+        "active_action_id": o.active_action_id,
+        "next_consent_retry_at": o.next_consent_retry_at.isoformat() if o.next_consent_retry_at else None,
+        "next_reminder_at": o.next_reminder_at.isoformat() if o.next_reminder_at else None,
+        "next_verify_at": o.next_verify_at.isoformat() if o.next_verify_at else None,
+        "next_nudge_at": o.next_nudge_at.isoformat() if o.next_nudge_at else None,
+        "consent_retry_sent_at": o.consent_retry_sent_at.isoformat() if o.consent_retry_sent_at else None,
+        "reminder_sent_at": o.reminder_sent_at.isoformat() if o.reminder_sent_at else None,
+        "verification_sent_at": o.verification_sent_at.isoformat() if o.verification_sent_at else None,
+        "nudge_sent_at": o.nudge_sent_at.isoformat() if o.nudge_sent_at else None,
+        "consent_attempts": o.consent_attempts,
+        "verification_attempts": o.verification_attempts,
+        "created_at": o.created_at.isoformat(),
+        "updated_at": o.updated_at.isoformat(),
+        "needs_attention": _needs_attention(o),
+    }
 
 
 @app.get("/outreach")
@@ -301,18 +193,7 @@ def list_outreach():
     session = SessionLocal()
     try:
         rows = session.query(PatientOutreach).order_by(PatientOutreach.created_at.desc()).all()
-        cases = [
-            {
-                "id": o.id,
-                "patient_name": o.patient_name,
-                "service_type": o.service_type,
-                "org_name": o.org_name,
-                "consent_status": o.consent_status,
-                "verification_status": o.verification_status,
-                "needs_attention": _needs_attention(o),
-            }
-            for o in rows
-        ]
+        cases = [_serialize(o) for o in rows]
         cases.sort(key=lambda c: not c["needs_attention"])  # attention first
         return cases
     finally:
@@ -333,21 +214,7 @@ def get_outreach(outreach_id: str):
             .all()
         )
         return {
-            "id": o.id,
-            "referral_id": o.referral_id,
-            "patient_name": o.patient_name,
-            "patient_phone": o.patient_phone,
-            "org_name": o.org_name,
-            "service_type": o.service_type,
-            "consent_status": o.consent_status,
-            "appointment_at": o.appointment_at.isoformat() if o.appointment_at else None,
-            "appointment_location": o.appointment_location,
-            "confirmation_code": o.confirmation_code,
-            "instructions": o.instructions,
-            "booking_notified_at": o.booking_notified_at.isoformat() if o.booking_notified_at else None,
-            "verification_status": o.verification_status,
-            "verification_response": o.verification_response_raw,
-            "needs_attention": _needs_attention(o),
+            **_serialize(o),
             "thread": [
                 {
                     "direction": m.direction,

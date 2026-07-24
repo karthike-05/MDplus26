@@ -11,70 +11,59 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Column, String, DateTime, Enum as SAEnum
+from sqlalchemy import Column, String, DateTime, Integer, Boolean, Enum as SAEnum
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
 
 
-class ConsentStatus(str, enum.Enum):
-    NOT_SENT = "not_sent"
-    SENT = "sent"
-    CONFIRMED = "confirmed"
-    DECLINED = "declined"  # patient replied STOP
-
-
-class VerificationStatus(str, enum.Enum):
-    PENDING = "pending"
-    VERIFIED_UTILIZED = "verified_utilized"
-    VERIFIED_NOT_UTILIZED = "verified_not_utilized"
-    NEEDS_REVIEW = "needs_review"  # reply didn't parse as yes/no
-    NO_RESPONSE = "no_response"
+class Stage(str, enum.Enum):
+    CONSENT = "consent"              # consent sent, awaiting reply
+    AWAITING_BOOKING = "awaiting_booking"  # consent confirmed, no booking yet
+    NOTIFIED = "notified"            # booking details sent
+    REMINDED = "reminded"            # reminder sent
+    VERIFYING = "verifying"          # verification sent, awaiting reply
+    DONE = "done"                    # utilization recorded / loop closed
+    ESCALATED = "escalated"          # handed to a social worker
 
 
 class PatientOutreach(Base):
-    """One row per patient per referral, tracking the SMS consent +
-    closed-loop verification lifecycle."""
+    """Loop-owned comms state ONLY. Consent/booking/utilization are read live
+    from Gyan's shared tables via repo.py; this table holds what has no home
+    there: the stage cursor, scheduling times, and attempt counters."""
 
     __tablename__ = "patient_outreach"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    referral_id = Column(String, nullable=False, index=True)   # uuid FK into referrals
+    patient_phone = Column(String, nullable=False, index=True)  # E.164, webhook lookup key
 
-    # Link back to the shared referral record (Gyan's schema owns this id).
-    referral_id = Column(String, nullable=False, index=True)
+    # values_callable makes the DB enum labels the lowercase .value ("consent",
+    # "done", ...) instead of SQLAlchemy's default member NAMES ("CONSENT"). This
+    # keeps the stored labels consistent with the .value used everywhere else
+    # (API/JSON, dashboard JS, logs), so a raw `WHERE stage = 'done'` matches.
+    stage = Column(
+        SAEnum(Stage, name="stage", values_callable=lambda e: [m.value for m in e]),
+        default=Stage.CONSENT, nullable=False,
+    )
+    active_action_id = Column(String, nullable=True)  # referral_actions row in_progress
 
-    patient_phone = Column(String, nullable=False, index=True)  # E.164 format
-    patient_name = Column(String, nullable=False)
-    org_name = Column(String, nullable=False)       # social service org referred to
-    service_type = Column(String, nullable=False)   # e.g. "transportation", "WIC"
+    # True while an open issue (reschedule/cancel) should hold the scheduled
+    # reminder/verification sends. Loop B skips paused rows. Cleared on resolve.
+    paused = Column(Boolean, default=False, nullable=False)
 
-    # --- Consent stage (authorization before the agent books) ---
-    consent_status = Column(SAEnum(ConsentStatus), default=ConsentStatus.NOT_SENT, nullable=False)
-    consent_requested_at = Column(DateTime, nullable=True)
-    consent_confirmed_at = Column(DateTime, nullable=True)
+    next_consent_retry_at = Column(DateTime, nullable=True)
+    next_reminder_at = Column(DateTime, nullable=True)
+    next_verify_at = Column(DateTime, nullable=True)
+    next_nudge_at = Column(DateTime, nullable=True)
 
-    # --- Booking details (populated by the org-facing agentic layer once it
-    #     has actually booked the resource; drives the notification + timing) ---
-    appointment_at = Column(DateTime, nullable=True)       # when the service happens
-    appointment_location = Column(String, nullable=True)   # where to go / pickup address
-    confirmation_code = Column(String, nullable=True)      # org's booking reference
-    instructions = Column(String, nullable=True)           # what to bring / prep
-    booking_notified_at = Column(DateTime, nullable=True)  # when we told the patient
-
-    # --- Reminder (informational; fires ~1 day before appointment_at) ---
+    consent_retry_sent_at = Column(DateTime, nullable=True)
     reminder_sent_at = Column(DateTime, nullable=True)
-
-    # --- Utilization verification (the closed-loop signal; ~1 day after) ---
     verification_sent_at = Column(DateTime, nullable=True)
-    verification_response_raw = Column(String, nullable=True)
-    verification_response_at = Column(DateTime, nullable=True)
-
-    # --- No-response nudge (one retry if verification goes silent) ---
     nudge_sent_at = Column(DateTime, nullable=True)
 
-    verification_status = Column(
-        SAEnum(VerificationStatus), default=VerificationStatus.PENDING, nullable=False
-    )
+    consent_attempts = Column(Integer, default=0, nullable=False)
+    verification_attempts = Column(Integer, default=0, nullable=False)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

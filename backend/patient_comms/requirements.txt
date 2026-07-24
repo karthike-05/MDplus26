@@ -2,8 +2,10 @@ fastapi
 python-multipart  # required for FastAPI Form() parsing of Twilio's form-encoded webhook
 uvicorn[standard]
 sqlalchemy
+psycopg2-binary      # Postgres driver for SQLAlchemy (DATABASE_URL -> Supabase); local SQLite needs none
 pydantic
 twilio
 apscheduler          # in-process day3/day7/nudge scheduler (scheduler.py)
 python-dotenv        # load TWILIO_* / DEMO_TIMESCALE from a .env file
 anthropic            # LLM inbound-reply classifier (classifiers.py, CLASSIFIER=llm)
+pytest               # unit tests (tests/)

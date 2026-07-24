@@ -13,15 +13,15 @@
   body { margin:0; font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
          background:var(--bg); color:var(--ink); }
   header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex;
-           align-items:baseline; gap:12px; }
+           align-items:baseline; gap:12px; flex-wrap:wrap; }
   header h1 { font-size:16px; margin:0; }
   header .sub { color:var(--muted); font-size:12px; }
-  .wrap { display:grid; grid-template-columns:300px 1fr 1fr; gap:14px; padding:16px; }
+  .wrap { display:grid; grid-template-columns:300px 1.2fr 1fr; gap:14px; padding:16px; }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
   .panel h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em;
               color:var(--muted); margin:0 0 12px; }
   label { display:block; font-size:12px; color:var(--muted); margin:8px 0 3px; }
-  input, select, button { width:100%; padding:8px 10px; border-radius:7px;
+  input, button { width:100%; padding:8px 10px; border-radius:7px;
     border:1px solid var(--line); background:#0f1a24; color:var(--ink); font:inherit; }
   button { background:var(--accent); border:none; color:#fff; cursor:pointer; margin-top:12px; font-weight:600; }
   button.secondary { background:#22303c; }
@@ -31,93 +31,84 @@
   th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; }
   tr.case { cursor:pointer; }
   tr.case:hover td { background:#1d2a35; }
-  tr.attn td:first-child { border-left:3px solid var(--warn); }
+  tr.attn td:first-child { border-left:3px solid var(--bad); }
+  tr.sel td { background:#1d2a35; }
   .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600; }
   .pill.ok { background:rgba(34,197,94,.15); color:var(--ok); }
   .pill.warn { background:rgba(245,158,11,.15); color:var(--warn); }
   .pill.bad { background:rgba(239,68,68,.15); color:var(--bad); }
+  .pill.info { background:rgba(59,130,246,.15); color:var(--accent); }
   .pill.mut { background:#22303c; color:var(--muted); }
-  .thread { display:flex; flex-direction:column; gap:8px; max-height:60vh; overflow:auto; }
-  .msg { max-width:82%; padding:8px 11px; border-radius:12px; font-size:13px; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; color:var(--muted); }
+  .thread { display:flex; flex-direction:column; gap:8px; max-height:64vh; overflow:auto; }
+  .msg { max-width:82%; padding:8px 11px; border-radius:12px; font-size:13px; white-space:pre-wrap; }
   .msg .meta { display:block; font-size:10px; color:var(--muted); margin-bottom:2px; }
   .msg.out { align-self:flex-start; background:#22303c; border-bottom-left-radius:3px; }
   .msg.in  { align-self:flex-end; background:var(--accent); color:#fff; border-bottom-right-radius:3px; }
   .empty { color:var(--muted); font-style:italic; }
-  .hint { font-size:11px; color:var(--muted); margin-top:4px; }
+  .hint { font-size:11px; color:var(--muted); margin-top:6px; }
+  .info { font-size:12px; color:var(--muted); line-height:1.55; }
+  .info code { background:#0f1a24; padding:1px 5px; border-radius:4px; color:var(--ink); font-size:11px; }
+  .info ol { margin:8px 0 0; padding-left:18px; }
+  .info li { margin-bottom:6px; }
 </style>
 </head>
 <body>
 <header>
   <h1>Patient Outreach</h1>
-  <span class="sub">clinic-initiated · patient-confirmed · closed-loop verification</span>
+  <span class="sub">clinic-initiated · patient-confirmed · closed-loop verification · WhatsApp</span>
+  <span class="sub" id="status" style="margin-left:auto"></span>
 </header>
 
 <div class="wrap">
-  <!-- LEFT: intake + sim reply -->
+  <!-- LEFT: simulate reply + how it works -->
   <div>
     <div class="panel">
-      <h2>New Referral</h2>
-      <label>Patient name</label>
-      <input id="patient_name" value="Maria Lopez" />
-      <label>Patient phone (E.164)</label>
-      <input id="patient_phone" value="+15555550123" />
-      <label>Service type</label>
-      <select id="service_type">
-        <option>transportation</option><option>food</option>
-        <option>housing</option><option>utility assistance</option><option>WIC</option>
-      </select>
-      <label>Organization</label>
-      <input id="org_name" value="KC Community Transit" />
-      <label>Referral ID</label>
-      <input id="referral_id" value="ref_1001" />
-      <button onclick="startOutreach()">Send consent request</button>
-      <div class="hint" id="startHint"></div>
-    </div>
-
-    <div class="panel" style="margin-top:14px">
-      <h2>Simulate reply <span style="text-transform:none">(mock / testing)</span></h2>
-      <label>From phone</label>
-      <input id="sim_from" value="+15555550123" />
+      <h2>Simulate inbound reply</h2>
+      <label>From phone (E.164)</label>
+      <input id="sim_from" placeholder="+15555550123" />
       <label>Message body</label>
-      <input id="sim_body" value="YES" />
-      <button class="secondary" onclick="simReply()">Deliver inbound SMS</button>
-      <div class="hint">In live mode the patient texts your real Twilio number instead.</div>
+      <input id="sim_body" value="yes, I'm in" />
+      <button class="secondary" onclick="simReply()">Deliver inbound message</button>
+      <div class="hint" id="simHint">Posts to <code style="font-size:10px">/webhook/sms-inbound</code> — the same
+        path Twilio hits. In live mode the patient messages your WhatsApp number instead.
+        The reply is classified by the LLM, so free-form text ("went yesterday, thanks")
+        works, not just YES/NO.</div>
     </div>
 
     <div class="panel" style="margin-top:14px">
-      <h2>Agent booking <span style="text-transform:none">(simulates the org-facing layer)</span></h2>
-      <label>Appointment date/time</label>
-      <input id="appt_at" type="datetime-local" />
-      <label>Location / address</label>
-      <input id="appt_loc" value="Pickup at 5th & Main St" />
-      <label>Confirmation / reference #</label>
-      <input id="appt_conf" value="TR-10482" />
-      <label>What to bring / instructions</label>
-      <input id="appt_instr" value="Bring a photo ID and your Medicaid card" />
-      <button onclick="book()">Send booking details</button>
-      <div class="hint">Requires a selected case with consent confirmed.</div>
-      <div style="display:flex; gap:8px; margin-top:10px">
-        <button class="secondary" onclick="stage('reminder')">Reminder</button>
-        <button class="secondary" onclick="stage('verify')">Verify</button>
-        <button class="secondary" onclick="stage('nudge')">Nudge</button>
+      <h2>How a case starts</h2>
+      <div class="info">
+        The loop is <b>DB-driven</b>, not created from this dashboard:
+        <ol>
+          <li><b>Loop A</b> (<code>poller.py</code>) picks up a <code>confirm_consent</code>
+            action from <code>referral_actions</code> (<code>assigned_component='twilio'</code>),
+            creates the case, and sends the consent message.</li>
+          <li>The patient replies → this <b>webhook</b> advances the case
+            (<code>stage</code>) and writes consent back.</li>
+          <li><b>Loop B</b> (<code>scheduler.py</code>) fires the reminder, verification,
+            nudge, and escalation on the service-date schedule.</li>
+        </ol>
+        To seed a demo case, insert a synthetic <code>referral</code> +
+        <code>confirm_consent</code> action per
+        <code style="font-size:10px">docs/…/e-integration-checklist.md</code>.
       </div>
-      <div class="hint">Or let the scheduler fire these automatically.</div>
     </div>
   </div>
 
   <!-- MIDDLE: cases -->
   <div class="panel">
-    <h2>Cases <span style="text-transform:none">(⚠ needs attention on top)</span></h2>
+    <h2>Cases <span style="text-transform:none">(⚠ escalated on top · auto-refreshing)</span></h2>
     <table>
-      <thead><tr><th>Patient</th><th>Service</th><th>Consent</th><th>Verification</th></tr></thead>
-      <tbody id="cases"><tr><td colspan="4" class="empty">No referrals yet.</td></tr></tbody>
+      <thead><tr><th>Referral</th><th>Phone</th><th>Stage</th><th>Attempts</th><th>Next</th></tr></thead>
+      <tbody id="cases"><tr><td colspan="5" class="empty">No cases yet.</td></tr></tbody>
     </table>
   </div>
 
   <!-- RIGHT: thread -->
   <div class="panel">
     <h2 id="threadTitle">Thread</h2>
-    <div id="thread" class="thread"><div class="empty">Select a case to see its SMS thread.</div></div>
+    <div id="thread" class="thread"><div class="empty">Select a case to see its message thread.</div></div>
   </div>
 </div>
 
@@ -135,88 +126,95 @@ async function api(path, opts) {
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
-function pill(v) {
-  const ok = ["confirmed","verified_utilized"], bad = ["declined","verified_not_utilized"],
-        warn = ["no_response","needs_review"];
-  const cls = ok.includes(v) ? "ok" : bad.includes(v) ? "bad" : warn.includes(v) ? "warn" : "mut";
-  return `<span class="pill ${cls}">${v}</span>`;
-}
 
-async function startOutreach() {
-  const body = {
-    patient_name: patient_name.value, patient_phone: patient_phone.value,
-    service_type: service_type.value, org_name: org_name.value, referral_id: referral_id.value,
-  };
-  try {
-    const res = await api("/outreach/start", {
-      method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body) });
-    startHint.textContent = "Consent request sent · id " + res.id.slice(0,8);
-    selected = res.id; refresh();
-  } catch (e) { startHint.textContent = "Error: " + e.message; }
+// Stage -> colored pill. Values come straight from models.Stage.
+const STAGE_CLASS = {
+  consent:"warn", awaiting_booking:"info", notified:"info", reminded:"info",
+  verifying:"warn", done:"ok", escalated:"bad",
+};
+function stagePill(s) {
+  const cls = STAGE_CLASS[s] || "mut";
+  return `<span class="pill ${cls}">${(s || "").replace(/_/g, " ")}</span>`;
+}
+function shortId(id) { return id ? id.slice(0, 8) : "—"; }
+function fmt(iso) { return iso ? new Date(iso + (iso.endsWith("Z") ? "" : "Z")).toLocaleString() : null; }
+
+// Nearest upcoming scheduled step for the "Next" column.
+function nextStep(c) {
+  const steps = [
+    ["consent retry", c.next_consent_retry_at],
+    ["reminder", c.next_reminder_at],
+    ["verification", c.next_verify_at],
+    ["nudge", c.next_nudge_at],
+  ].filter(([, t]) => t).map(([label, t]) => [label, new Date(t + "Z")]);
+  if (!steps.length) return "—";
+  const now = Date.now();
+  const upcoming = steps.filter(([, d]) => d.getTime() >= now).sort((a, b) => a[1] - b[1]);
+  const pick = (upcoming[0] || steps.sort((a, b) => b[1] - a[1])[0]);
+  const [label, d] = pick;
+  const mins = Math.round((d.getTime() - now) / 60000);
+  const when = mins >= 0 ? `in ${mins}m` : `${-mins}m ago`;
+  return `${label} · ${when}`;
 }
 
 async function simReply() {
-  const form = new URLSearchParams({ From: sim_from.value, Body: sim_body.value });
-  await fetch("/webhook/sms-inbound", { method:"POST", body:form });
-  refresh();
-}
-
-async function book() {
-  if (!selected) return alert("Select or create a case first.");
-  const body = {
-    appointment_at: appt_at.value || null,     // datetime-local -> ISO 8601
-    appointment_location: appt_loc.value || null,
-    confirmation_code: appt_conf.value || null,
-    instructions: appt_instr.value || null,
-  };
+  const from = (document.getElementById("sim_from").value || "").trim();
+  const body = document.getElementById("sim_body").value || "";
+  if (!from) { document.getElementById("simHint").textContent = "Enter a From phone first."; return; }
   try {
-    await api(`/outreach/${selected}/booking`, {
-      method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body) });
+    const r = await fetch("/webhook/sms-inbound", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ From: from, Body: body }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    document.getElementById("simHint").textContent =
+      "Delivered. If a case is open for that number, watch its stage + thread update.";
     refresh();
-  } catch (e) { alert("Booking failed: " + e.message); }
+  } catch (e) {
+    document.getElementById("simHint").textContent = "Error: " + e.message;
+  }
 }
-
-async function stage(action) {
-  if (!selected) return alert("Select or create a case first.");
-  try {
-    await api(`/outreach/${selected}/${action}`, { method:"POST" });
-    refresh();
-  } catch (e) { alert(e.message); }
-}
-
-// Prefill the appointment field ~2 min out so the scheduler fires soon in demo mode.
-(function prefillAppt() {
-  const d = new Date(Date.now() + 2 * 60000 - new Date().getTimezoneOffset() * 60000);
-  document.getElementById("appt_at").value = d.toISOString().slice(0, 16);
-})();
 
 async function loadThread(id) {
   selected = id;
   const o = await api("/outreach/" + id);
-  threadTitle.innerHTML = `Thread — ${o.patient_name} · ${o.service_type} ${pill(o.consent_status)} ${pill(o.verification_status)}`;
-  thread.innerHTML = o.thread.length ? o.thread.map(m => `
-    <div class="msg ${m.direction==="inbound"?"in":"out"}">
-      <span class="meta">${m.direction==="inbound"?"patient":"outreach"} · ${m.stage||""} · ${new Date(m.at+"Z").toLocaleTimeString()}</span>
-      ${m.body}
-    </div>`).join("") : `<div class="empty">No messages yet.</div>`;
-  thread.scrollTop = thread.scrollHeight;
+  document.getElementById("threadTitle").innerHTML =
+    `Thread — <span class="mono">${shortId(o.referral_id)}</span> · ${o.patient_phone} ${stagePill(o.stage)}`;
+  const el = document.getElementById("thread");
+  el.innerHTML = (o.thread && o.thread.length)
+    ? o.thread.map(m => `
+      <div class="msg ${m.direction === "inbound" ? "in" : "out"}">
+        <span class="meta">${m.direction === "inbound" ? "patient" : "outreach"} · ${m.stage || ""} · ${fmt(m.at) || ""}</span>
+        ${m.body}
+      </div>`).join("")
+    : `<div class="empty">No messages yet.</div>`;
+  el.scrollTop = el.scrollHeight;
 }
 
 async function refresh() {
-  const cases = await api("/outreach");
-  cases_el().innerHTML = cases.length ? cases.map(c => `
-    <tr class="case ${c.needs_attention?"attn":""}" onclick="loadThread('${c.id}')">
-      <td>${c.needs_attention?"⚠ ":""}${c.patient_name}</td>
-      <td>${c.service_type}</td>
-      <td>${pill(c.consent_status)}</td>
-      <td>${pill(c.verification_status)}</td>
-    </tr>`).join("") : `<tr><td colspan="4" class="empty">No referrals yet.</td></tr>`;
-  if (selected) loadThread(selected);
+  let cases;
+  try {
+    cases = await api("/outreach");
+    document.getElementById("status").textContent = "";
+  } catch (e) {
+    document.getElementById("status").innerHTML = `<span class="pill bad">API error</span>`;
+    return;
+  }
+  const tbody = document.getElementById("cases");
+  tbody.innerHTML = cases.length ? cases.map(c => `
+    <tr class="case ${c.needs_attention ? "attn" : ""} ${c.id === selected ? "sel" : ""}" onclick="loadThread('${c.id}')">
+      <td>${c.needs_attention ? "⚠ " : ""}<span class="mono">${shortId(c.referral_id)}</span></td>
+      <td>${c.patient_phone}</td>
+      <td>${stagePill(c.stage)}</td>
+      <td>c${c.consent_attempts}/v${c.verification_attempts}</td>
+      <td class="mono">${nextStep(c)}</td>
+    </tr>`).join("") : `<tr><td colspan="5" class="empty">No cases yet — seed a referral_action to start one.</td></tr>`;
+  if (selected) { try { await loadThread(selected); } catch (e) { /* case may have been removed */ } }
 }
-function cases_el(){ return document.getElementById("cases"); }
 
 refresh();
-setInterval(refresh, 2000);  // live-poll so scheduler-driven changes show up on their own
+setInterval(refresh, 3000);  // live-poll so Loop A/B + webhook changes surface on their own
 </script>
 </body>
 </html>
