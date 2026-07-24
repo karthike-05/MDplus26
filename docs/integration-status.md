@@ -1,6 +1,6 @@
 # Integration status & next steps (pick-up doc)
 
-**Last updated:** 2026-07-23 · **Branch:** `feat/form-fill-and-ui`
+**Last updated:** 2026-07-23 · **On `main`** (merged via PR #3)
 
 This is the "where we are, how to resume" doc for the integration phase. Design
 rationale lives in [`integration-plan.md`](integration-plan.md); the DB contract in
@@ -11,7 +11,7 @@ rationale lives in [`integration-plan.md`](integration-plan.md); the DB contract
 ## TL;DR
 - **Aug-2 demo runs today** on the mock DB — fully offline, `pytest` 40 green,
   `python run_demo.py` closes the loop. This is the reliable recorded-take path.
-- **Inbound seam is built + committed** (`038851c`): two adapter endpoints translate
+- **Inbound seam is built + on `main`** (PR #3): two adapter endpoints translate
   Voice + Text events into our loop. Channel services integrate via a thin HTTP call
   to these adapters; our backend translates to the shared contract.
 - **Real-DB (Supabase) path is built and proven, but parked.** The API adapter
@@ -29,9 +29,9 @@ rationale lives in [`integration-plan.md`](integration-plan.md); the DB contract
 | --- | --- | --- |
 | State machine + scheduler (owns `current_state`) | done | `backend/orchestrator/` |
 | Form-fill (map→validate→review→inject real PDF) | done | `backend/tools/fill_form/` |
-| Inbound adapters (Voice + Text → `apply_inbound`) | **done, committed `038851c`** | `backend/adapters/inbound.py` |
-| State-machine gap fix `(submitted, needs_human)→needs_human` | done, committed | `backend/orchestrator/state_machine.py` |
-| Supabase **API** adapter (service_role key) | **built, verified, parked** | `backend/db/supabase_api.py` |
+| Inbound adapters (Voice + Text → `apply_inbound`) | **done, on `main` (PR #3)** | `backend/adapters/inbound.py` |
+| State-machine gap fix `(submitted, needs_human)→needs_human` | done, on `main` | `backend/orchestrator/state_machine.py` |
+| Supabase **API** adapter (service_role key) | **built + on `main`, parked (inert)** | `backend/db/supabase_api.py` |
 | `make_db()` 3-tier switch (API / asyncpg / mock) | done | `backend/main.py` |
 | Schema introspection tool (API + Postgres) | done | `backend/scripts/db_introspect.py` |
 | Additive migration SQL | written, **not yet applied** | `contracts/migrations/001_orchestration_bus.sql` |
