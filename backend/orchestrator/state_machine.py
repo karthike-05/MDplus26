@@ -76,7 +76,8 @@ _TRANSITIONS: dict[tuple[str, str], str] = {
     (OUTREACH_IN_PROGRESS, "success"): SUBMITTED,
     (OUTREACH_IN_PROGRESS, "needs_human"): NEEDS_HUMAN,
     (OUTREACH_IN_PROGRESS, "failed"): ESCALATED,
-    (SUBMITTED, "success"): CONFIRMED,                 # [inbound] org email accepted
+    (SUBMITTED, "success"): CONFIRMED,                 # [inbound] org email / phone accepted
+    (SUBMITTED, "needs_human"): NEEDS_HUMAN,           # [inbound] phone alt-slot/ineligible -> SW acts
     (SUBMITTED, "failed"): ESCALATED,
     (CONFIRMED, "success"): CHECK_IN_SCHEDULED,        # check-in text queued
     (CHECK_IN_SCHEDULED, "success"): COMPLETED,        # [inbound] patient "Y" (used it)

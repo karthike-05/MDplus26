@@ -22,6 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from contracts.models import DashboardRow
+from backend.adapters.inbound import build_router as build_inbound_router
 from backend.db.mock import MockReferralDB
 from backend.orchestrator import scheduler
 from backend.orchestrator import state_machine as sm
@@ -63,8 +64,21 @@ INBOUND = {
 
 
 def make_db():
-    """One switch for the whole app (CLAUDE.md §5a, §9): DSN set -> real Supabase,
-    unset -> fixture mock. No tool/route code changes either way."""
+    """One switch for the whole app (CLAUDE.md §5a, §9). Three backends, same
+    ReferralDB interface — no tool/route code changes between them:
+
+      1. SUPABASE_URL + SUPABASE_SERVICE_KEY -> Supabase REST API (service_role).
+         The stable demo path: HTTPS/IPv4, same auth the Voice arm uses, no DB
+         password / IPv6 / pooler friction.
+      2. SUPABASE_DB_URL (and no service key) -> direct Postgres via asyncpg.
+      3. neither -> fixture mock (offline dev + tests).
+    """
+    url = os.getenv("SUPABASE_URL")
+    service_key = os.getenv("SUPABASE_SERVICE_KEY")
+    if url and service_key:
+        from backend.db.supabase_api import SupabaseAPIReferralDB
+
+        return SupabaseAPIReferralDB(url, service_key)
     dsn = os.getenv("SUPABASE_DB_URL")
     if dsn:
         from backend.db.supabase import SupabaseReferralDB
@@ -82,6 +96,11 @@ app.add_middleware(
 )
 
 db = make_db()
+
+# Inbound seams to the Voice + Messaging services (docs/integration-plan.md). The
+# adapter maps their status vocab -> our frozen set and calls scheduler.apply_inbound,
+# then cascades via the same TOOLS the /run + /inbound routes use.
+app.include_router(build_inbound_router(db, TOOLS))
 
 
 # --- Request models ----------------------------------------------------------

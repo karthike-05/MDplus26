@@ -60,7 +60,33 @@ touch none of the form tables. If a cache table already exists, fine — we igno
 `social_services`, `check_ins` — owned by others; no reads/writes from form-fill.
 
 ## To activate the real DB
-1. Set `SUPABASE_DB_URL` in `.env` to the Supabase **connection-pooler** DSN.
-2. Confirm the column names in `backend/db/supabase.py`'s `*_COLS` maps match Data's.
-3. Run a smoke test against the live DB (one `get_patient`, one `record_attempt`).
-   Until step 1, the backend stays on the mock — nothing else changes.
+**Preferred path = the REST API (service_role key), not a Postgres DSN.** The direct
+DSN is IPv6-only/flaky and the DB password was unreliable; the API is HTTPS/IPv4 and
+uses the same auth the Voice arm uses. `make_db()` picks the API adapter when
+`SUPABASE_URL` + `SUPABASE_SERVICE_KEY` are set (falls back to DSN, then mock).
+
+1. Apply `contracts/migrations/001_orchestration_bus.sql` in the Supabase SQL Editor.
+2. Align `backend/db/supabase.py`'s `*_COLS` maps to Data's real column names
+   (reconciled table below).
+3. Set `SUPABASE_URL` + `SUPABASE_SERVICE_KEY` in `.env`.
+4. Smoke test: `python -m backend.scripts.db_introspect`, then one `get_patient` +
+   one `record_attempt`. Until step 3, the backend stays on the mock.
+
+See **[`integration-status.md`](integration-status.md)** for the full flip procedure
+and the "wait until the schema is frozen" rationale.
+
+---
+
+## Reconciled with the live DB (2026-07-23)
+The live DB differs from the defaults above. The seam absorbs this — update the
+`*_COLS` maps; no upstream code moves. Key deltas (full table in `integration-status.md`):
+
+- **`patients`**: `dob` → `date_of_birth`; no `address` column; `medicaid_id` ≈
+  `insurance_member_id`.
+- **`referrals`**: **no `current_state`** (their `status` is different — don't reuse)
+  and **no `form_id`** → both added by the migration / derived from `need_category`.
+- **`services`** (table is `services`, not `social_services`): `website` → `url`;
+  `category` → `need_category`; **no contact-`phone` column** (gap for the phone
+  channel); no `preferred_channel`/`form_id` (derive from `need_category`).
+- **`outreach_attempts`**: does not exist yet → created by the migration. Voice's
+  `attempts` table is a different shape; we do not write it.
