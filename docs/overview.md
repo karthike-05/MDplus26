@@ -54,7 +54,8 @@ contract) and **one scheduler** that owns every state transition.
 | Workstream | Responsibility |
 | --- | --- |
 | **Form-fill** | Auto-fill + review + submit forms; the orchestration glue (state machine + scheduler); shared contracts; the social-worker frontend. |
-| **Data** | The database schema, seed data, and the one vendor-facing DB layer. |
+| **Data** | The database schema (HSDS, `01_schema.sql`), seed data, and the one vendor-facing DB layer. |
+| **Ranking** (Data) | Three-layer service ranking (hard-filter → objective → LLM subjective) that picks *which* service a referral targets. Runs **upstream** of outreach; writes `ranking_results` / `sw_feedback`. Does not touch the scheduler. |
 | **Messaging** | Patient texting — consent opt-in and the utilization check-in (SMS/WhatsApp). |
 | **Voice** | Outbound phone calls to social services. |
 
@@ -79,24 +80,31 @@ Merged to `main` (PR #1). Runs offline on the in-memory mock DB; `pytest` green.
   simulation controls stand in for the real inbound webhooks so the whole loop is
   demoable offline. See [`../frontend/README.md`](../frontend/README.md).
 
-## Other workstreams (their own branches, not yet merged)
+## Integration phase — built + on `main` (PRs #3–#5)
 
-- **`origin/call_agent`** (Voice / Retell) — a stateless outbound-call outcome receiver.
-- **`origin/patient_comms`** (Messaging / Twilio, Railway) — a self-contained patient
-  SMS/WhatsApp service with its own scheduler + state machine.
+The teammate services are now vendored into the tree as snapshots
+(`backend/call_agent/` — Voice/Retell; `backend/patient_comms/` — Messaging/Twilio);
+we import none of their code and modify none of their files. Both connect through **two
+thin inbound adapter endpoints** on our backend that translate their status vocab into
+our frozen set and call `scheduler.apply_inbound`, keeping our scheduler the sole owner
+of `current_state`:
 
-**How they tie in is fully mapped in [`integration-plan.md`](integration-plan.md)** —
-the seams, the status-mapping tables, and the open decisions. Headline: both connect
-through two thin inbound adapter endpoints on our backend that call
-`scheduler.apply_inbound`, keeping our scheduler the sole owner of `current_state`.
+- `POST /api/voice/call-outcome` (Retell) and `POST /api/patient-comms/event` (Twilio).
+- So Voice/Text integrate via **one HTTP call**, not by conforming their DB writes.
+
+A **Supabase real-DB path** (`backend/db/supabase_api.py`, REST API + service_role key)
+is also built and verified, but **parked** — the app defaults to the mock until the
+shared schema is frozen. Full state, findings, and the flip procedure live in
+**[`integration-status.md`](integration-status.md)** (read this first).
 
 ## Where to resume
 
-1. **Integration (highest value):** build `POST /api/voice/call-outcome` and
-   `POST /api/patient-comms/event` per [`integration-plan.md`](integration-plan.md),
-   then outbound triggers, then UI `summarize()` rendering. Re-fetch the teammate
-   branches first (they evolve).
-2. **Database:** flip to real Supabase (`SUPABASE_DB_URL` + confirm the `*_COLS` maps in
-   `backend/db/supabase.py`) — see [`db-contract.md`](db-contract.md).
+1. **Database convergence (next):** align to the canonical HSDS schema (`01_schema.sql`);
+   land `referrals.current_state` (our scheduler spine); **converge the outreach log on
+   the shared `attempts` table** (the ranking system reads it for responsiveness) rather
+   than a separate `outreach_attempts`. Then flip on the API path. See
+   [`integration-status.md`](integration-status.md) and [`db-contract.md`](db-contract.md).
+2. **Outbound triggers + UI:** fire our tools at the teammate services; render the
+   channel-specific fields in the referral detail view.
 3. **Deferred:** email provider behind `send_email`; upload-a-PDF → auto-extract schema
    (`CLAUDE.md` §13); realtime dashboard via `supabase-js`.

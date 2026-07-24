@@ -34,7 +34,7 @@ ALTER TABLE referrals
 
 -- 2) The shared write contract — one row per attempt by ANY channel (§5b).
 --    RECONCILE BEFORE APPLYING (see docs/integration-status.md "Ranking system"):
---    Pranav's ranking system reads the EXISTING `attempts` table for its
+--    The ranking system reads the EXISTING `attempts` table for its
 --    responsiveness score. A separate `outreach_attempts` would fork the outreach
 --    history and starve the ranker. Preferred convergence = extend `attempts`
 --    (ADD attempt_id/from_state; map data->structured_result, error->notes) and

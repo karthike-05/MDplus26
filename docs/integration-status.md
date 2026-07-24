@@ -109,9 +109,9 @@ uses `attempt_number`/`structured_result`/`outcome`).
 
 ---
 
-## Ranking system (Pranav) — how it fits (2026-07-23)
+## Ranking system — how it fits (2026-07-23)
 
-Pranav's "Ranking System — Database Usage Plan" (three-layer service ranking:
+The Ranking workstream's "Database Usage Plan" (three-layer service ranking:
 hard-filter → objective → LLM subjective) is **additive and non-conflicting** with
 our loop, with three concrete impacts on this plan:
 
@@ -132,7 +132,7 @@ our loop, with three concrete impacts on this plan:
    `current_resource_rank`) → SW approves → *then our loop runs* (consent → outreach →
    confirm → check-in). We consume the chosen `service_id`; we don't rank. `ranking_results`
    / `sw_feedback` are new tables we don't touch. Our scheduler + state machine are
-   unaffected. Pranav's plan does **not** define an orchestration state field, so our
+   unaffected. The ranking plan does **not** define an orchestration state field, so our
    `current_state` vs their `referrals.status` reconciliation is still open (below).
 
 ---
@@ -163,7 +163,7 @@ our loop, with three concrete impacts on this plan:
   `attempts` with `attempt_id`/`from_state`; keep their `outcome` for the ranker).
   Revisit the `outreach_attempts` block in the migration before applying it.
 - **Orchestration state:** get `referrals.current_state` (our scheduler spine + what
-  the UI/all-3-agents read) into the shared schema. Pranav's ranking plan doesn't
+  the UI/all-3-agents read) into the shared schema. The ranking plan doesn't
   define a state field, so this is ours to land. Decide `status` vs `current_state`
   (dual is fine for now).
 - **Get `01_schema.sql`** — the canonical HSDS schema. Align `*_COLS` to it (not to
