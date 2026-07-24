@@ -20,7 +20,7 @@ pypdf>=4.2                # AcroForm fillable pdfs
 
 # --- Messaging / voice ---
 twilio>=9.0
-# retell-sdk              # add when Pranav/Aneesh wire voice+SMS
+# retell-sdk              # add when Voice/Messaging wire voice+SMS
 
 # --- Utils ---
 python-dotenv>=1.0
