@@ -9,3 +9,11 @@ sample_forms/filled/
 frontend/dist/
 .pytest_cache/
 demo/live-preview/*.png
+
+# claude
+.claude/
+CLAUDE.md
+
+# packages
+supabase/
+*.json

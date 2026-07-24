@@ -3,30 +3,40 @@ from datetime import datetime, timezone
 
 from supabase import Client, create_client
 
-_MOCK_APPOINTMENTS = {
-    "default": {
-        "appointment_time": "2026-07-28T10:30:00-05:00",
-        "provider_name": "Dr. Elena Martinez",
-        "appointment_type": "Dialysis appointment",
-    }
-}
-
 _supabase: Client = create_client(
     os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 )
 
 _BOOKING_FIELDS = (
-    "patient_id, patient_name, service_id, service_name, organization_name, "
-    "booking_status, confirmation_number, scheduled_start_at, scheduled_end_at, "
-    "pickup_address, pickup_instructions, destination_address, destination_instructions, "
-    "provider_contact_phone, patient_instructions, cancellation_instructions, "
-    "accessibility_accomodations, booked_at, updated_at"
+    "patient_id, service_id, booking_status, confirmation_number, "
+    "scheduled_start_at, scheduled_end_at, pickup_address, pickup_instructions, "
+    "destination_address, destination_instructions, provider_contact_phone, "
+    "patient_instructions, cancellation_instructions, booked_at, updated_at"
 )
 
+_SERVICE_FIELDS = "name, organization_id"
+
 _PATIENT_FIELDS = (
-    "insurance_type, insurance_member_id, mobility_needs, referring_clinic_name, "
-    "date_of_birth, phone"
+    "name, insurance_type, insurance_member_id, mobility_needs, "
+    "referring_clinic_name, date_of_birth, phone, appointment_date, appointment_location"
 )
+
+# Maps Retell's post-call outcome (LogOutcomeRequest.status) onto the DB's
+# constrained vocabularies:
+#   attempts.outcome check: no_response, responded, information_collected, submitted,
+#     accepted, rejected, scheduled, enrolled, completed, patient_declined,
+#     needs_human_followup, technical_failure, ineligible
+#   service_bookings.booking_status check: pending, booked, confirmed, cancelled,
+#     completed, no_show, rescheduling_required
+# booking_status of None means "leave the existing booking_status alone".
+_OUTCOME_MAP: dict[str, tuple[str, str | None]] = {
+    "confirmed": ("scheduled", "confirmed"),
+    "ineligible": ("ineligible", "cancelled"),
+    "unavailable": ("rejected", "cancelled"),
+    "callback_required": ("needs_human_followup", None),
+    "escalation_needed": ("needs_human_followup", "rescheduling_required"),
+    "alt_slot_offered": ("scheduled", "rescheduling_required"),
+}
 
 
 # attempt_number is 1-indexed (first attempt = 1), so MAX_ATTEMPTS=3 allows
@@ -54,7 +64,7 @@ def create_escalation(referral_id: str, reason_code: str, handoff_summary: str) 
         "reason_code": reason_code,
         "handoff_summary": handoff_summary,
         "assigned_social_worker": "SW1",
-        "status": "escalated",
+        "status": "open",
     }
     return _supabase.table("escalations").insert(escalation).execute().data
 
@@ -64,10 +74,22 @@ def save_call_outcome(payload: dict, call_id: str | None) -> dict:
     booking_id = payload["booking_id"]
     status = payload["status"]
 
+    if call_id is not None:
+        duplicate = (
+            _supabase.table("attempts")
+            .select("id")
+            .eq("external_id", call_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        if duplicate:
+            return {"attempt": duplicate[0], "escalation": None, "booking": None, "duplicate": True}
+
     booking = (
-        _supabase.table("patient_service_booking_details")
-        .select("service_id, organization_name")
-        .eq("booking_id", booking_id)
+        _supabase.table("service_bookings")
+        .select("service_id")
+        .eq("id", booking_id)
         .eq("referral_id", referral_id)
         .single()
         .execute()
@@ -75,15 +97,17 @@ def save_call_outcome(payload: dict, call_id: str | None) -> dict:
     )
     service_id = booking["service_id"]
 
+    outcome, booking_status = _OUTCOME_MAP[status]
+
     attempt = {
         "referral_id": referral_id,
         "service_id": service_id,
         "attempt_number": next_attempt_number(referral_id, service_id),
-        "channel": "call",
-        "provider": booking["organization_name"],
+        "channel": "phone",
+        "provider": "retell",
         "purpose": "transportation",
-        "status": status,
-        "outcome": status,
+        "status": "completed",
+        "outcome": outcome,
         "external_id": call_id,
         "structured_result": payload,
         "notes": payload.get("notes"),
@@ -96,7 +120,9 @@ def save_call_outcome(payload: dict, call_id: str | None) -> dict:
             referral_id, payload["escalation_reason"], payload["social_worker_note"]
         )
 
-    booking_update = {"booking_status": status}
+    booking_update = {}
+    if booking_status is not None:
+        booking_update["booking_status"] = booking_status
     if payload.get("confirmation_id") is not None:
         booking_update["confirmation_number"] = payload["confirmation_id"]
     if status == "confirmed" and payload.get("pickup_window") is not None:
@@ -114,20 +140,28 @@ def save_call_outcome(payload: dict, call_id: str | None) -> dict:
         booking_update["patient_instructions"] = payload["patient_message"]
 
     booking_result = (
-        _supabase.table("patient_service_booking_details")
+        _supabase.table("service_bookings")
         .update(booking_update)
-        .eq("booking_id", booking_id)
+        .eq("id", booking_id)
         .eq("referral_id", referral_id)
         .execute()
         .data
+        if booking_update
+        else None
     )
 
     return {"attempt": attempt_result, "escalation": escalation_result, "booking": booking_result}
 
 
-def get_patient_appointment(case_id: str) -> dict:
-    # TODO: replace with a real Postgres query against the appointments table.
-    return _MOCK_APPOINTMENTS.get(case_id, _MOCK_APPOINTMENTS["default"])
+def get_service_request_details(case_id: str) -> dict:
+    return (
+        _supabase.table("service_requests")
+        .select("pickup_notes, emergency_contact, special_instructions, request_notes")
+        .eq("referral_id", case_id)
+        .single()
+        .execute()
+        .data
+    )
 
 
 # def get_service_schedule(service_id: str) -> dict:
@@ -143,10 +177,26 @@ def get_patient_appointment(case_id: str) -> dict:
 
 def get_call_request(booking_id: str, referral_id: str) -> dict:
     booking = (
-        _supabase.table("patient_service_booking_details")
+        _supabase.table("service_bookings")
         .select(_BOOKING_FIELDS)
-        .eq("booking_id", booking_id)
+        .eq("id", booking_id)
         .eq("referral_id", referral_id)
+        .single()
+        .execute()
+        .data
+    )
+    service = (
+        _supabase.table("services")
+        .select(_SERVICE_FIELDS)
+        .eq("id", booking["service_id"])
+        .single()
+        .execute()
+        .data
+    )
+    organization = (
+        _supabase.table("organizations")
+        .select("name")
+        .eq("id", service["organization_id"])
         .single()
         .execute()
         .data
@@ -154,9 +204,16 @@ def get_call_request(booking_id: str, referral_id: str) -> dict:
     patient = (
         _supabase.table("patients")
         .select(_PATIENT_FIELDS)
-        .eq("patient_id", booking["patient_id"])
+        .eq("id", booking["patient_id"])
         .single()
         .execute()
         .data
     )
-    return {**booking, **patient}
+    patient_name = patient.pop("name")
+    return {
+        **booking,
+        **patient,
+        "service_name": service["name"],
+        "organization_name": organization["name"],
+        "patient_name": patient_name,
+    }
