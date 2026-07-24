@@ -2,9 +2,14 @@
 .claude/
 CLAUDE.md
 
+# packages
+supabase/
+node_modules/
+
 # env
 .env
 
 # artifacts
 __pycache__/
 .DS_Store
+*.json
