@@ -1,7 +1,40 @@
 # Integration plan — wiring Voice + Messaging into the loop
 
+**Status:** inbound seam **built** (`backend/adapters/inbound.py`, tested in
+`tests/test_adapters.py`). Both teammate services are vendored into the tree as
+snapshots (`backend/call_agent/`, `backend/patient_comms/`) so everything runs from
+one repo; we import none of their code and edit none of their files. Remaining:
+outbound triggers (our tools → their HTTP endpoints) and DB-bus convergence.
+
+## What's built (the highest-value step)
+Two thin inbound adapter endpoints, both mapping a teammate's status vocab → our
+frozen `{success, needs_human, failed}` set → `scheduler.apply_inbound`, then
+cascading the scheduler. The scheduler stays the sole owner of `current_state`.
+
+- `POST /api/voice/call-outcome` — Retell status → our status (`VOICE_STATUS_MAP`).
+- `POST /api/patient-comms/event` — Twilio verification/consent event → (status,
+  channel) (`PATIENT_COMMS_EVENT_MAP`).
+
+## Resolved open decisions
+1. **Phone `confirmed`:** stays at `submitted` → `confirmed` (no phone-special
+   transition). A phone result arrives while the referral waits at `submitted`, so
+   it reuses the org-email path. **Added** one transition to close the gap:
+   `(submitted, needs_human) → needs_human` for phone `alt_slot_offered` /
+   `ineligible` / `unavailable` / `callback_required` (state_machine.py). *Contract
+   touch — announced.*
+2. **Channel enum:** SMS folded into `whatsapp` for Aug-2. `ToolOutcome.channel` is
+   a free string, so this is convention, not a contract change.
+3. **Shared key:** resolved — both services now carry our `referral_id` end-to-end
+   (Voice sends it as Retell's `case_id`; Messaging stores it on the outreach row),
+   so the adapter keys on `referral_id` directly. No cross-walk table.
+4. **Outbound coupling:** HTTP for Aug-2 (below), DB-bus is the convergence.
+
+---
+
+## Original design notes (retained)
+
 **Status:** design complete (from a review of the teammate branches `origin/call_agent`
-and `origin/patient_comms`). **Nothing wired yet** — this is the next build phase.
+and `origin/patient_comms`).
 
 ## Guiding principle
 Our scheduler is the **single owner of `referrals.current_state`**. Their services

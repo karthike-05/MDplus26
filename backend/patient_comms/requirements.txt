@@ -1,0 +1,9 @@
+fastapi
+python-multipart  # required for FastAPI Form() parsing of Twilio's form-encoded webhook
+uvicorn[standard]
+sqlalchemy
+pydantic
+twilio
+apscheduler          # in-process day3/day7/nudge scheduler (scheduler.py)
+python-dotenv        # load TWILIO_* / DEMO_TIMESCALE from a .env file
+anthropic            # LLM inbound-reply classifier (classifiers.py, CLASSIFIER=llm)
