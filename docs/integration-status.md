@@ -100,12 +100,40 @@ _Also present:_ `need_category`, `urgency`, `consent_confirmed_at`,
 | preferred_channel | — | derive from `need_category`, or add |
 | form_id | — | derive from `need_category`, or add |
 
-**Gaps / missing tables:** `outreach_attempts` (create — migration), `social_services`
+**Gaps / missing tables:** `outreach_attempts` (does not exist — but see Ranking
+section: reconcile with `attempts` before creating a parallel table), `social_services`
 (is `services`), `form_schemas` (we load from JSON, don't need), `check_ins`,
 `patient_service_booking_details` (Voice expects it; absent). Voice's `attempts`
 table exists but is a different shape (no `attempt_id`/`from_state`/`data`/`error`;
-uses `attempt_number`/`structured_result`) — we DON'T write it; we use our own
-`outreach_attempts`.
+uses `attempt_number`/`structured_result`/`outcome`).
+
+---
+
+## Ranking system (Pranav) — how it fits (2026-07-23)
+
+Pranav's "Ranking System — Database Usage Plan" (three-layer service ranking:
+hard-filter → objective → LLM subjective) is **additive and non-conflicting** with
+our loop, with three concrete impacts on this plan:
+
+1. **Canonical schema is `01_schema.sql` (HSDS-standard).** That file — not my live
+   introspection — is the source of truth. **Get it** and align the `*_COLS` maps to
+   it precisely. It already includes some of what we mapped (e.g. `patients.date_of_birth`).
+2. **`attempts` is the *shared* outreach log, not just Voice's.** The ranking system's
+   Layer-2 "responsiveness" score reads `attempts` (`outcome='responded'` vs
+   `created_at`). So creating a separate `outreach_attempts` would **fork** the outreach
+   history and starve the ranker. **Decision to revisit with the team:** converge our
+   `record_attempt` onto `attempts` (add `attempt_id`/`from_state` columns, map
+   `data→structured_result`, `error→notes`) instead of a parallel table. NOTE: `attempts`
+   already overloads `status`/`outcome` with channel-specific vocab (`confirmed`,
+   `responded`), which is NOT our frozen `{success,needs_human,failed}` — so the write
+   needs both: our status in a dedicated field + their `outcome` for the ranker.
+3. **Ranking is UPSTREAM of our loop.** Flow: referral created → **ranking picks the
+   service** (writes `ranking_results`, sets `referrals.service_id` / uses
+   `current_resource_rank`) → SW approves → *then our loop runs* (consent → outreach →
+   confirm → check-in). We consume the chosen `service_id`; we don't rank. `ranking_results`
+   / `sw_feedback` are new tables we don't touch. Our scheduler + state machine are
+   unaffected. Pranav's plan does **not** define an orchestration state field, so our
+   `current_state` vs their `referrals.status` reconciliation is still open (below).
 
 ---
 
@@ -130,15 +158,21 @@ uses `attempt_number`/`structured_result`) — we DON'T write it; we use our own
 ---
 
 ## Open decisions / to raise with the team
-- **Give Data the two shared-contract items** so the next manual-column round matches:
-  `referrals.current_state` (canonical state the UI + all 3 agents read) and the
-  `outreach_attempts` table (shared outcome log). The migration SQL *is* that spec.
+- **Outreach log: converge on `attempts`, don't fork it.** The ranking system reads
+  `attempts` for responsiveness — so all three channels should land there (extend
+  `attempts` with `attempt_id`/`from_state`; keep their `outcome` for the ranker).
+  Revisit the `outreach_attempts` block in the migration before applying it.
+- **Orchestration state:** get `referrals.current_state` (our scheduler spine + what
+  the UI/all-3-agents read) into the shared schema. Pranav's ranking plan doesn't
+  define a state field, so this is ours to land. Decide `status` vs `current_state`
+  (dual is fine for now).
+- **Get `01_schema.sql`** — the canonical HSDS schema. Align `*_COLS` to it (not to
+  the live introspection). Ranking adds `ranking_results` + `sw_feedback` (we don't
+  touch those) and columns to `patients`/`services`.
 - **Service contact phone:** `services` has no phone column, but the phone (Voice)
   channel needs one. Data to add it, or source it elsewhere.
 - **UI read path:** confirm the frontend reads Supabase directly via `supabase-js`
   realtime (assumed) — that's why `current_state` lives on the `referrals` row.
-- **Status vs current_state:** decide if `referrals.status` and our `current_state`
-  eventually converge to one column, or stay dual (dual is fine for now).
 
 ---
 
