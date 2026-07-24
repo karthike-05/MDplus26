@@ -1,19 +1,22 @@
-.env
-.venv/
-__pycache__/
-*.pyc
-node_modules/
-.DS_Store
-sample_forms/*.png
-sample_forms/filled/
-frontend/dist/
-.pytest_cache/
-demo/live-preview/*.png
-
 # claude
 .claude/
 CLAUDE.md
 
-# packages
+#files
+sample_forms/*.png
+demo/live-preview/*.png
+sample_forms/filled/
+frontend/dist/
+
+# packages and venv
+.env
+.venv/
 supabase/
 *.json
+node_modules/
+
+# artifacts and cache
+__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
