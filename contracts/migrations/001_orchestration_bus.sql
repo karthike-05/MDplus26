@@ -33,7 +33,13 @@ ALTER TABLE referrals
 --       'check_in_scheduled','completed','escalated'));
 
 -- 2) The shared write contract — one row per attempt by ANY channel (§5b).
---    Separate from Voice's `attempts` table so nothing collides.
+--    RECONCILE BEFORE APPLYING (see docs/integration-status.md "Ranking system"):
+--    Pranav's ranking system reads the EXISTING `attempts` table for its
+--    responsiveness score. A separate `outreach_attempts` would fork the outreach
+--    history and starve the ranker. Preferred convergence = extend `attempts`
+--    (ADD attempt_id/from_state; map data->structured_result, error->notes) and
+--    DROP this CREATE. Kept here only as the fallback if the team opts to keep the
+--    two logs separate. Do not apply this block until that call is made.
 CREATE TABLE IF NOT EXISTS outreach_attempts (
   attempt_id  text        NOT NULL UNIQUE,   -- idempotency key (§10): upsert ON CONFLICT
   referral_id text        NOT NULL,
