@@ -16,11 +16,21 @@ writes the outreach_attempts row via the injected ReferralDB before returning. O
 "success" the referral moves OUTREACH_IN_PROGRESS -> SUBMITTED and then WAITS for the
 inbound call result.
 
-STATUS: stub — no Retell call yet. Voice: replace the marked block. Budget lives in
-Retell/Twilio minutes, not Claude tokens (CLAUDE.md §3).
+Dispatches to the vendored Voice service (backend/call_agent/) over HTTP — see
+backend/call_agent/integration_plan_call_agent.md for the full seam writeup. Two
+non-"success" outcomes:
+  - call_agent reports `escalated: true` (its own 3-attempt retry cap is already
+    exhausted, backend/call_agent/db.py MAX_ATTEMPTS) -> "failed", nothing left to
+    wait for, so the referral escalates immediately.
+  - the HTTP call itself fails (call_agent unreachable/timeout) -> "needs_human":
+    a recoverable infra issue, distinct from call_agent explicitly giving up.
 """
 
 from __future__ import annotations
+
+import os
+
+import httpx
 
 from contracts.models import ToolOutcome
 from backend.db.interface import ReferralDB
@@ -34,20 +44,33 @@ async def make_phone_call(
     from_state: str | None = None,
     **params,
 ) -> ToolOutcome:
-    # --- TODO(Voice): kick off the Retell outbound call --------------------
-    #   referral = await db.get_referral(referral_id)
-    #   generate the call script (bounded Claude call -> validated JSON, §2),
-    #   place the call to the service; the transcript/outcome returns via webhook.
-    status, error = "success", None
-    # ------------------------------------------------------------------------
+    base_url = os.environ["CALL_AGENT_BASE_URL"]  # required; no silent fallback
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{base_url}/place-referral-call", json={"referral_id": referral_id},
+            )
+            response.raise_for_status()
+            result = response.json()
+    except httpx.HTTPError as e:
+        status, error, data = "needs_human", f"could not reach call_agent: {e}", {}
+    else:
+        if result.get("escalated"):
+            status = "failed"
+            error = result.get("reason", "call_agent escalated before placing the call")
+            data = {"escalated": True, "reason": result.get("reason")}
+        else:
+            status, error = "success", None      # success -> SUBMITTED, then wait for the inbound result
+            data = {"placed": True, "call_agent_response": result}
 
     outcome = ToolOutcome(
         referral_id=referral_id,
         channel="phone",
-        status=status,          # success -> SUBMITTED, then wait for the inbound result
+        status=status,
         attempt_id=attempt_id,
         from_state=from_state,
-        data={"placed": True, "stub": True},
+        data=data,
         error=error,
     )
     await db.record_attempt(outcome)
