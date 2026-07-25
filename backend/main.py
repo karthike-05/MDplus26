@@ -17,12 +17,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from contracts.models import DashboardRow
 from backend.adapters.inbound import build_router as build_inbound_router
+from backend.db.interface import ReferralDB
 from backend.db.mock import MockReferralDB
 from backend.orchestrator import scheduler
 from backend.orchestrator import state_machine as sm
@@ -174,6 +176,28 @@ async def _advance_result(referral_id: str, steps) -> dict:
     return {"state": referral["current_state"], "steps": [o.model_dump() for o in steps]}
 
 
+def _slugify_category(category: str) -> str:
+    """Our fixture services carry a human-readable `category` (e.g. "Transportation");
+    backend/service_ranking's real schema reads a slug `need_category`
+    (docs/integration-status.md). Deterministic, good enough for our own referrals —
+    real Supabase need_category values are populated independently by Data."""
+    return "_".join(category.strip().lower().replace("&", "and").split())
+
+
+def _service_backfill(svc: dict) -> dict:
+    """Fields to backfill onto a referral once its service is known — shared by
+    referral creation and post-creation service selection (e.g. after a social
+    worker acts on backend/service_ranking's output, see integration_plan_service_ranking.md)."""
+    fields = {
+        "service_name": svc["name"],
+        "outreach_channel": svc["preferred_channel"],
+        "need_category": _slugify_category(svc.get("category", "")),
+    }
+    if svc.get("form_id"):
+        fields["form_id"] = svc["form_id"]
+    return fields
+
+
 # --- Review (form fill) ------------------------------------------------------
 
 @app.get("/api/review/{referral_id}")
@@ -298,10 +322,8 @@ async def create_referral(body: NewReferral) -> dict:
             svc = await db.get_service(body.service_id)
         except KeyError:
             raise HTTPException(404, f"unknown service '{body.service_id}'")
-        fields.setdefault("service_name", svc["name"])
-        fields.setdefault("outreach_channel", svc["preferred_channel"])
-        if svc.get("form_id"):
-            fields.setdefault("form_id", svc["form_id"])
+        for key, value in _service_backfill(svc).items():
+            fields.setdefault(key, value)
     form_id = fields.pop("form_id", None)
     referral_id = await db.create_referral(patient_id, form_id, **fields)
     return {"referral_id": referral_id}
@@ -325,3 +347,90 @@ async def get_service(service_id: str) -> dict:
         return {"service": await db.get_service(service_id)}
     except KeyError:
         raise HTTPException(404, f"unknown service '{service_id}'")
+
+
+# --- Service ranking (backend/service_ranking/, upstream of the loop) --------
+# Ranking picks candidate services for a referral before outreach begins; a social
+# worker approves, then our loop runs unchanged (CLAUDE.md §2, integration_plan_
+# service_ranking.md). Our backend is the sole HTTP client to the deployed ranking
+# service — the frontend never calls it directly, same pattern as make_phone_call ->
+# call_agent. Plain db-injected functions (not just route closures) so they're
+# unit-testable with a fresh MockReferralDB, matching this repo's existing
+# tests/test_dashboard.py / test_tools.py convention.
+
+class ChooseService(BaseModel):
+    service_id: str
+    label: str                       # backend/service_ranking's sw_feedback.label enum:
+                                      # good_fit | wrong_service | too_far | insurance_mismatch | other
+    label_notes: str | None = None
+
+
+async def _rank_referral(referral_id: str, db: ReferralDB) -> dict:
+    try:
+        await db.get_referral(referral_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown referral '{referral_id}'")
+    base_url = os.environ["SERVICE_RANKING_BASE_URL"]  # required; no silent fallback
+    async with httpx.AsyncClient(timeout=30.0) as client:  # Layer 3 is a live Claude call
+        response = await client.post(f"{base_url}/rank-referral/{referral_id}")
+        response.raise_for_status()
+        return response.json()
+
+
+async def _get_ranking(referral_id: str, db: ReferralDB) -> dict:
+    try:
+        await db.get_referral(referral_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown referral '{referral_id}'")
+    base_url = os.environ["SERVICE_RANKING_BASE_URL"]  # required; no silent fallback
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(f"{base_url}/ranking-results/{referral_id}")
+        response.raise_for_status()
+        return response.json()
+
+
+async def _choose_service(referral_id: str, body: ChooseService, db: ReferralDB) -> dict:
+    try:
+        await db.get_referral(referral_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown referral '{referral_id}'")
+    try:
+        svc = await db.get_service(body.service_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown service '{body.service_id}'")
+
+    await db.set_referral_service(referral_id, body.service_id, **_service_backfill(svc))
+
+    # Best-effort: log the SW's choice to ranking's own sw_feedback bookkeeping.
+    # The db write above is authoritative for our loop regardless of this succeeding.
+    base_url = os.environ.get("SERVICE_RANKING_BASE_URL")
+    if base_url:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    f"{base_url}/sw-feedback",
+                    json={
+                        "referral_id": referral_id, "service_id": body.service_id,
+                        "label": body.label, "label_notes": body.label_notes,
+                    },
+                )
+                response.raise_for_status()
+        except httpx.HTTPError as e:
+            print(f"[choose_service] sw-feedback forward failed (non-fatal): {e}")
+
+    return {"referral": await db.get_referral(referral_id)}
+
+
+@app.post("/api/referrals/{referral_id}/rank")
+async def rank_referral_endpoint(referral_id: str) -> dict:
+    return await _rank_referral(referral_id, db)
+
+
+@app.get("/api/referrals/{referral_id}/ranking")
+async def get_ranking_endpoint(referral_id: str) -> dict:
+    return await _get_ranking(referral_id, db)
+
+
+@app.post("/api/referrals/{referral_id}/choose-service")
+async def choose_service_endpoint(referral_id: str, body: ChooseService) -> dict:
+    return await _choose_service(referral_id, body, db)

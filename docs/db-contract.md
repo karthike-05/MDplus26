@@ -24,7 +24,17 @@ Any columns; the adapter maps them. Used as form-fill `source` values:
   persisted `current_state` the workflow can't advance.
 - Optional (mapped): `service_name`, `referring_clinic`, `appointment_date`,
   `appointment_time`.
+- **`need_category` (text, 2026-07-24)** — a real column in the live HSDS schema
+  (`docs/integration-status.md`), read directly by `backend/service_ranking`'s
+  `rank_referral(referral_id)`. Our mock backfills it from the chosen service's
+  existing `category` at creation time (slugified — `backend/main.py`'s
+  `_slugify_category`); Data's real schema populates it independently.
 - New referrals are inserted with `current_state = 'created'`.
+- **`service_id` is updatable post-creation (2026-07-24)** — `ReferralDB.set_referral_service(referral_id, service_id, **fields)`
+  (`backend/db/interface.py`). CONTRACT TOUCH — added so a social worker can act on
+  `backend/service_ranking`'s output (ranking runs upstream, picks candidates; we only
+  consume the chosen `service_id`, per CLAUDE.md §2). See
+  `backend/service_ranking/integration_plan_service_ranking.md`.
 
 ### `current_state` vocabulary (the state machine, §7)
 ```
@@ -58,6 +68,9 @@ touch none of the form tables. If a cache table already exists, fine — we igno
 
 ## Tables this backend does NOT touch
 `social_services`, `check_ins` — owned by others; no reads/writes from form-fill.
+`ranking_results`, `sw_feedback` — owned by `backend/service_ranking`; we only proxy
+its HTTP endpoints and consume the `service_id` a social worker chooses
+(`set_referral_service`, above) — no direct reads/writes of its tables.
 
 ## To activate the real DB
 **Preferred path = the REST API (service_role key), not a Postgres DSN.** The direct
