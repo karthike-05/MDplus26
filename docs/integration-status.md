@@ -1,6 +1,7 @@
 # Integration status & next steps (pick-up doc)
 
-**Last updated:** 2026-07-23 · **On `main`** (merged via PR #3)
+**Last updated:** 2026-07-24 · **On `main`** (merged via PR #3; Voice + Ranking HTTP
+wiring below added 2026-07-24 on `service_ranking_and_call_agent`)
 
 This is the "where we are, how to resume" doc for the integration phase. Design
 rationale lives in [`integration-plan.md`](integration-plan.md); the DB contract in
@@ -35,6 +36,8 @@ rationale lives in [`integration-plan.md`](integration-plan.md); the DB contract
 | `make_db()` 3-tier switch (API / asyncpg / mock) | done | `backend/main.py` |
 | Schema introspection tool (API + Postgres) | done | `backend/scripts/db_introspect.py` |
 | Additive migration SQL | written, **not yet applied** | `contracts/migrations/001_orchestration_bus.sql` |
+| Voice outbound + inbound HTTP wiring (`make_phone_call` ↔ `call_agent`) | **done, unit-tested against mocks (2026-07-24)** — live run blocked on the same DB-convergence gap as everything else here | `backend/tools/make_phone_call.py`, `backend/call_agent/main.py`+`db.py`, `tests/test_tools.py` |
+| Ranking proxy wiring (`rank`/`ranking`/`choose-service` ↔ `service_ranking`) | **done, unit-tested against mocks (2026-07-24)** — same DB-convergence blocker; also adds `referrals.need_category` + `set_referral_service` to our own contract | `backend/main.py`, `backend/db/interface.py`+`mock.py`, `tests/test_service_ranking.py` |
 
 ### The inbound adapters (the conformance layer)
 - `POST /api/voice/call-outcome` — Retell status → our `{success,needs_human,failed}`
@@ -43,6 +46,59 @@ rationale lives in [`integration-plan.md`](integration-plan.md); the DB contract
   channel) (`PATIENT_COMMS_EVENT_MAP`), channel `whatsapp`.
 - Both call `scheduler.apply_inbound` then cascade. The scheduler stays the sole
   owner of `current_state`. Tests: `tests/test_adapters.py` (L1, no network).
+
+### The Voice dispatch (2026-07-24 — make_phone_call ↔ call_agent)
+Closes the outbound half of the phone channel that the inbound adapter above was
+already waiting on. Full writeup:
+[`backend/call_agent/integration_plan_call_agent.md`](../backend/call_agent/integration_plan_call_agent.md).
+
+- **Outbound:** `make_phone_call` (`backend/tools/make_phone_call.py`) POSTs
+  `{referral_id}` to `call_agent`'s `POST /place-referral-call`
+  (`CALL_AGENT_BASE_URL` — required, no fallback). `booking_id` is now resolved
+  server-side from `referral_id` alone (`call_agent/db.py`'s
+  `get_latest_booking_id`), so the tool never needs to know it exists.
+- **Inbound:** `call_agent`'s `log_outcome` handler forwards each outcome to our
+  `POST /api/voice/call-outcome` after its own Supabase write
+  (`ORCHESTRATOR_BASE_URL` — **optional**, unset today on the live Railway deploy, so
+  this forward is currently a no-op there until the orchestrator itself is deployed
+  and that var is set).
+- Both sides map `escalated: true` (call_agent's own 3-attempt cap already exhausted)
+  → `failed`; an unreachable/timed-out `call_agent` → `needs_human` (a recoverable
+  infra issue, kept distinct from an explicit escalation).
+- Tests: `tests/test_tools.py` (`httpx.AsyncClient.post` mocked via stdlib
+  `unittest.mock` — no live network, no new dependency).
+- Same blocking dependency as the rest of this doc: needs the same `referral_id` in
+  the same database on both sides (see "Supabase: what we found" below) before this
+  can run live end-to-end — see "Guardrails" and the flip procedure.
+
+### The Ranking dispatch (2026-07-24 — backend proxy ↔ service_ranking)
+Unlike Voice/Messaging, ranking is **upstream** of our loop (§"Ranking system — how it
+fits" below) — it picks candidate services before outreach begins; it doesn't
+participate in `current_state` transitions at all, so nothing here touches the state
+machine or scheduler. Full writeup:
+[`backend/service_ranking/integration_plan_service_ranking.md`](../backend/service_ranking/integration_plan_service_ranking.md).
+
+- **Proxy endpoints** (`backend/main.py`, our backend is the sole HTTP client — the
+  frontend never calls the deployed Railway service directly, same pattern as
+  `make_phone_call` → `call_agent`): `POST /api/referrals/{id}/rank`,
+  `GET /api/referrals/{id}/ranking`, `POST /api/referrals/{id}/choose-service`.
+  `SERVICE_RANKING_BASE_URL` — required, no fallback, same reasoning as
+  `CALL_AGENT_BASE_URL` (our backend isn't deployed anywhere yet either).
+- **New contract surface, scoped to backend-only wiring this pass (no frontend
+  change):** `referrals.need_category` (auto-derived by slugifying the chosen
+  service's existing `category` at creation — `backend/main.py`'s
+  `_slugify_category`/`_service_backfill`) and `ReferralDB.set_referral_service(...)`
+  (lets a social worker's choice update `service_id` after creation — a future
+  frontend pass is the natural place to surface the ranked list itself; this pass
+  only builds the backend seam it would call).
+- `choose-service`'s forward to ranking's own `POST /sw-feedback` is best-effort/
+  optional (unset `SERVICE_RANKING_BASE_URL` just skips it) — our own
+  `set_referral_service` write is authoritative for our loop regardless, same
+  asymmetry as the Voice dispatch's inbound forward.
+- Tests: `tests/test_service_ranking.py` (mocked `httpx.AsyncClient`, no live network;
+  ranking itself has no mock mode and needs real Supabase HSDS tables our fixtures
+  don't model, so these tests only prove our side of the seam).
+- Same blocking dependency as the Voice dispatch above — not run live yet.
 
 ---
 
@@ -134,6 +190,13 @@ our loop, with three concrete impacts on this plan:
    / `sw_feedback` are new tables we don't touch. Our scheduler + state machine are
    unaffected. The ranking plan does **not** define an orchestration state field, so our
    `current_state` vs their `referrals.status` reconciliation is still open (below).
+
+> **Update (2026-07-24):** the proxy seam described above is built — see "The Ranking
+> dispatch" earlier in this doc and
+> `backend/service_ranking/integration_plan_service_ranking.md`. The SW-approval step
+> ("SW approves" in the flow above) is still a backend-only endpoint
+> (`POST /api/referrals/{id}/choose-service`) with no frontend UI yet — building the
+> ranked-list picker screen is the natural next step once this is ready to go live.
 
 ---
 
