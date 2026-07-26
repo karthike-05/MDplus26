@@ -88,15 +88,18 @@ def test_make_phone_call_escalated_maps_to_failed(monkeypatch):
     assert outcome.data["escalated"] is True
 
 
-def test_make_phone_call_requires_base_url(monkeypatch):
+def test_make_phone_call_stubs_when_no_base_url(monkeypatch):
+    """No CALL_AGENT_BASE_URL -> stub the dispatch rather than raise, so the phone
+    channel closes the loop offline (§9). The stub must be legible in the recorded
+    attempt: `placed` False + `stub` True, so no reader mistakes it for a real call."""
     monkeypatch.delenv("CALL_AGENT_BASE_URL", raising=False)
     db = MockReferralDB()
-    try:
-        asyncio.run(make_phone_call("ref_1001", db, attempt_id="att_x", from_state="outreach_in_progress"))
-    except KeyError:
-        pass
-    else:
-        raise AssertionError("expected KeyError when CALL_AGENT_BASE_URL is unset")
+    outcome = asyncio.run(
+        make_phone_call("ref_1001", db, attempt_id="att_x", from_state="outreach_in_progress")
+    )
+    assert outcome.status == "success"
+    assert outcome.data["placed"] is False and outcome.data["stub"] is True
+    assert db.attempts["att_x"] is outcome
 
 
 # --- Channel selection: OUTREACH_IN_PROGRESS picks the right submission method ---

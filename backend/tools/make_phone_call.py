@@ -24,6 +24,14 @@ non-"success" outcomes:
     wait for, so the referral escalates immediately.
   - the HTTP call itself fails (call_agent unreachable/timeout) -> "needs_human":
     a recoverable infra issue, distinct from call_agent explicitly giving up.
+
+With CALL_AGENT_BASE_URL unset the tool STUBS the dispatch instead of raising, so the
+phone channel closes the loop with no external service running (§9: the suite and
+run_demo.py work with no DB, no browser, no network). The stub is not silent — the
+attempt row carries `placed: False, stub: True`, so the timeline/dashboard shows no
+call was actually placed. This mirrors the inbound leg, where both channel services
+skip their forward when our URL is unset (call_agent ORCHESTRATOR_BASE_URL,
+patient_comms ORG_BACKEND_URL) rather than failing.
 """
 
 from __future__ import annotations
@@ -44,25 +52,31 @@ async def make_phone_call(
     from_state: str | None = None,
     **params,
 ) -> ToolOutcome:
-    base_url = os.environ["CALL_AGENT_BASE_URL"]  # required; no silent fallback
+    base_url = os.environ.get("CALL_AGENT_BASE_URL")
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                f"{base_url}/place-referral-call", json={"referral_id": referral_id},
-            )
-            response.raise_for_status()
-            result = response.json()
-    except httpx.HTTPError as e:
-        status, error, data = "needs_human", f"could not reach call_agent: {e}", {}
+    if not base_url:
+        # Offline: no call_agent configured. Advance the loop, but record that the
+        # dispatch was stubbed so nothing downstream reads it as a placed call.
+        status, error = "success", None
+        data = {"placed": False, "stub": True, "reason": "CALL_AGENT_BASE_URL unset"}
     else:
-        if result.get("escalated"):
-            status = "failed"
-            error = result.get("reason", "call_agent escalated before placing the call")
-            data = {"escalated": True, "reason": result.get("reason")}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    f"{base_url}/place-referral-call", json={"referral_id": referral_id},
+                )
+                response.raise_for_status()
+                result = response.json()
+        except httpx.HTTPError as e:
+            status, error, data = "needs_human", f"could not reach call_agent: {e}", {}
         else:
-            status, error = "success", None      # success -> SUBMITTED, then wait for the inbound result
-            data = {"placed": True, "call_agent_response": result}
+            if result.get("escalated"):
+                status = "failed"
+                error = result.get("reason", "call_agent escalated before placing the call")
+                data = {"escalated": True, "reason": result.get("reason")}
+            else:
+                status, error = "success", None  # success -> SUBMITTED, then wait for the inbound result
+                data = {"placed": True, "call_agent_response": result}
 
     outcome = ToolOutcome(
         referral_id=referral_id,
