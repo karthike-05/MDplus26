@@ -16,9 +16,38 @@ from backend.tools.fill_form.injectors.base import get_injector
 from backend.tools.fill_form.validation import validate_field
 
 
-def build_sources(patient: dict, referral: dict) -> mapper.Sources:
-    """The record bundle the mapper resolves `patient.*` / `referral.*` against."""
-    return {"patient": patient, "referral": referral}
+def build_sources(
+    patient: dict, referral: dict, service_request: dict | None = None
+) -> mapper.Sources:
+    """The record bundle the mapper resolves a field's dotted ``source`` against:
+    `patient.*`, `referral.*`, `service_request.*`.
+
+    Request-specific trip values (pickup/destination, requested date + time, mobility
+    requirements) come from `service_request` — the shared `service_requests` row that
+    Voice reads too — rather than being duplicated onto the referral. Optional so
+    fixture-only L1 tests can pass just the two records."""
+    return {
+        "patient": patient,
+        "referral": referral,
+        "service_request": service_request or {},
+    }
+
+
+def service_request_writeback(schema: FormSchema, values: dict) -> dict:
+    """Reviewed form values -> `service_requests` columns.
+
+    Each field's own ``source`` is the mapping, used in reverse: a field sourced from
+    ``service_request.pickup_address`` writes back to that column. So the schema stays
+    the single place the correspondence is declared, and adding a field needs no change
+    here. Skips blanks — never overwrite a stored value with an empty one — and skips
+    ``human_only`` fields, which the agent may not fill at all (§2).
+    """
+    out: dict = {}
+    for field in schema.fillable_fields():
+        root, _, column = (field.source or "").partition(".")
+        if root == "service_request" and column and values.get(field.name) not in (None, ""):
+            out[column] = values[field.name]
+    return out
 
 
 def prepare_from_records(
@@ -58,7 +87,10 @@ async def prepare(referral_id: str, db: ReferralDB) -> ReviewPayload:
     referral = await db.get_referral(referral_id)
     patient = await db.get_patient(referral["patient_id"])
     schema = await db.get_form_schema(referral["form_id"])
-    return prepare_from_records(referral_id, schema, build_sources(patient, referral))
+    service_request = await db.get_service_request(referral_id)
+    return prepare_from_records(
+        referral_id, schema, build_sources(patient, referral, service_request)
+    )
 
 
 async def submit(
@@ -113,6 +145,15 @@ async def submit(
         status, error = "success", None
     except Exception as exc:  # a broken selector / unwritable path is a real failure
         confirmation, status, error = {}, "failed", f"{type(exc).__name__}: {exc}"
+
+    # Persist what the reviewer confirmed back onto the shared service_requests row,
+    # so Voice and the dashboard see the corrected trip details rather than only the
+    # PDF holding them. Only on success: a failed injection must not leave the shared
+    # row claiming values that were never submitted.
+    if status == "success":
+        writeback = service_request_writeback(schema, clean)
+        if writeback:
+            await db.save_service_request(referral_id, writeback)
 
     outcome = ToolOutcome(
         referral_id=referral_id,

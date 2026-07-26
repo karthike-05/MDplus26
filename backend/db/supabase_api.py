@@ -165,6 +165,23 @@ class SupabaseAPIReferralDB(ReferralDB):
             out.append(d)
         return out
 
+    # --- service_requests ---------------------------------------------------
+    # No *_COLS map: the form schemas' `source` paths name these live columns directly
+    # (`service_request.pickup_address`), so there's nothing to translate.
+
+    async def get_service_request(self, referral_id: str) -> dict:
+        c = await self._c()
+        res = await c.table(TABLES["service_requests"]).select("*").eq(
+            "referral_id", referral_id).order("created_at", desc=True).limit(1).execute()
+        return dict(res.data[0]) if res.data else {}
+
+    async def save_service_request(self, referral_id: str, fields: dict) -> None:
+        if not fields:
+            return
+        c = await self._c()
+        await c.table(TABLES["service_requests"]).update(fields).eq(
+            "referral_id", referral_id).execute()
+
     def list_forms(self) -> list[dict]:
         """UI sugar (not on the Protocol; from the JSON schemas, like the mock)."""
         return [{"form_id": s.form_id, "target_type": s.target_type}

@@ -40,3 +40,12 @@ class ReferralDB(Protocol):
     # loop and picks the service; we just consume the chosen service_id). CONTRACT
     # TOUCH — announced; Data implements this in supabase.py alongside the others.
     async def set_referral_service(self, referral_id: str, service_id: str, **fields) -> None: ...
+
+    # The trip/request payload a form actually fills, held in the shared
+    # `service_requests` table (pickup_address, destination_address, requested_date,
+    # requested_start_time, mobility_requirements, ...). Voice reads the same row, so
+    # this is where form-fill sources its request-specific values from and writes the
+    # reviewed values back to — rather than duplicating them onto the referral.
+    # Returns {} when there is no row yet. CONTRACT TOUCH — announced.
+    async def get_service_request(self, referral_id: str) -> dict: ...
+    async def save_service_request(self, referral_id: str, fields: dict) -> None: ...

@@ -49,6 +49,9 @@ from backend.db.mock import SCHEMA_DIR, _load_schemas
 TABLES = {
     "patients": "patients",
     "referrals": "referrals",
+    "service_requests": "service_requests",   # the trip payload a form fills; Voice
+                                              # reads the same row (fill_form sources
+                                              # from it and writes reviewed values back)
     "outreach_attempts": "attempts",     # SHARED outreach log — ranking's Layer-2
                                          # responsiveness score reads it, and call_agent
                                          # writes it. Never fork this into our own table.
@@ -296,3 +299,29 @@ class SupabaseReferralDB(ReferralDB):
             *base.values(),
         )
         return str(rid)
+
+    # --- service_requests ---------------------------------------------------
+    # No *_COLS map here on purpose: the form schemas' `source` paths already name
+    # these live columns directly (`service_request.pickup_address`), so there is
+    # nothing to translate. Column names in the UPDATE come from those schema files
+    # (ours, version-controlled), not from user input.
+
+    async def get_service_request(self, referral_id: str) -> dict:
+        pool = await self._p()
+        row = await pool.fetchrow(
+            f"SELECT * FROM {TABLES['service_requests']} WHERE referral_id = $1 "
+            f"ORDER BY created_at DESC LIMIT 1",
+            referral_id,
+        )
+        return dict(row) if row else {}
+
+    async def save_service_request(self, referral_id: str, fields: dict) -> None:
+        if not fields:
+            return
+        assignments = ", ".join(f"{col} = ${i + 2}" for i, col in enumerate(fields))
+        pool = await self._p()
+        await pool.execute(
+            f"UPDATE {TABLES['service_requests']} SET {assignments}, updated_at = now() "
+            f"WHERE referral_id = $1",
+            referral_id, *fields.values(),
+        )

@@ -51,6 +51,8 @@ class MockReferralDB:
         # dict preserves insertion order -> attempts read back as a timeline.
         self.attempts: dict[str, ToolOutcome] = {}   # keyed on attempt_id (idempotent)
         self.attempt_times: dict[str, str] = {}       # attempt_id -> ISO timestamp
+        # referral_id -> the reviewed `service_requests` row, once one is submitted.
+        self._service_requests: dict[str, dict] = {}
 
     async def get_patient(self, patient_id: str) -> dict:
         return dict(self._patients[patient_id])
@@ -74,6 +76,42 @@ class MockReferralDB:
     async def set_referral_service(self, referral_id: str, service_id: str, **fields) -> None:
         self._referrals[referral_id]["service_id"] = service_id
         self._referrals[referral_id].update(fields)
+
+    # --- service_requests: the trip payload a form fills ---------------------
+    # Live, this is a real `service_requests` row that Voice reads too. Here it's
+    # DERIVED from the referral + patient fixtures rather than duplicated into them,
+    # so the offline demo shows the same values it always has and no fixture had to
+    # change. Once a reviewer submits, save_service_request stores the reviewed row
+    # and that takes precedence — same read-your-writes behaviour as the real table.
+
+    def _derive_service_request(self, referral: dict, patient: dict) -> dict:
+        return {
+            "referral_id": referral["id"],
+            "patient_id": referral.get("patient_id"),
+            "service_id": referral.get("service_id"),
+            "pickup_address": patient.get("address"),
+            "destination_address": referral.get("service_name"),
+            "requested_date": referral.get("appointment_date"),
+            "requested_start_time": referral.get("appointment_time"),
+            "mobility_requirements": patient.get("mobility_needs"),
+            "insurance_member_id": patient.get("medicaid_id"),
+            "contact_phone": patient.get("phone"),
+        }
+
+    async def get_service_request(self, referral_id: str) -> dict:
+        stored = self._service_requests.get(referral_id)
+        if stored is not None:
+            return dict(stored)
+        referral = self._referrals.get(referral_id)
+        if referral is None:
+            return {}
+        patient = self._patients.get(referral.get("patient_id"), {})
+        return self._derive_service_request(referral, patient)
+
+    async def save_service_request(self, referral_id: str, fields: dict) -> None:
+        row = await self.get_service_request(referral_id)
+        row.update({k: v for k, v in fields.items() if v is not None})
+        self._service_requests[referral_id] = row
 
     # --- Intake front door -------------------------------------------------
 
