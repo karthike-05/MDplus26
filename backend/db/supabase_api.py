@@ -182,6 +182,40 @@ class SupabaseAPIReferralDB(ReferralDB):
         await c.table(TABLES["service_requests"]).update(fields).eq(
             "referral_id", referral_id).execute()
 
+    # --- The shared action queue --------------------------------------------
+    # No *_COLS maps: these are the live column names verbatim, and this is the one
+    # place we speak the DB scheduler's own vocabulary (see orchestrator/actions.py).
+
+    async def list_ready_actions(self, component: str) -> list[dict]:
+        c = await self._c()
+        res = await c.table("referral_actions").select("*").eq(
+            "assigned_component", component).eq(
+            "action_status", "ready").order("created_at").execute()
+        return [dict(r) for r in res.data or []]
+
+    async def set_action_status(self, action_id: str, status: str, *,
+                               result: dict | None = None, error: str | None = None) -> None:
+        fields: dict = {"action_status": status}
+        if result is not None:
+            fields["result"] = result
+        if error is not None:
+            fields["error_message"] = error
+        if status in ("completed", "failed"):
+            fields["completed_at"] = "now()"
+        c = await self._c()
+        await c.table("referral_actions").update(fields).eq("id", action_id).execute()
+
+    async def record_shared_attempt(self, row: dict) -> None:
+        c = await self._c()
+        await c.table("attempts").insert(row).execute()
+
+    async def advance_referral(self, referral_id: str) -> dict:
+        """Call the DB's own scheduler. It — not us — decides the next step (§7: one
+        owner of transitions; here that owner is the database)."""
+        c = await self._c()
+        res = await c.rpc("advance_referral", {"p_referral_id": referral_id}).execute()
+        return res.data if isinstance(res.data, dict) else {"result": res.data}
+
     def list_forms(self) -> list[dict]:
         """UI sugar (not on the Protocol; from the JSON schemas, like the mock)."""
         return [{"form_id": s.form_id, "target_type": s.target_type}

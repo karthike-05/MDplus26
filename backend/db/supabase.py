@@ -86,6 +86,11 @@ PATIENT_COLS = {
     "medicaid_id": "insurance_member_id",
     "mobility_needs": "mobility_needs",
     "household_size": "household_size",
+    # NOT NULL, no default -> an INSERT must supply these two (plus `name`).
+    "referring_clinic": "referring_clinic_name",
+    # The consent gate `advance_referral()` reads before dispatching any outreach;
+    # Messaging owns writing it.
+    "consent_status": "consent_status",
     # -- no column on `patients`: --
     "address": None,                     # has postal_code + county + lat/long instead
 }

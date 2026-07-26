@@ -120,7 +120,13 @@ app.include_router(build_inbound_router(db, TOOLS))
 class NewPatient(BaseModel):
     name: str
     dob: str
-    phone: str | None = None
+    # `phone` and `referring_clinic` are REQUIRED, not by our preference but because
+    # the live `patients` table declares them NOT NULL with no default (verified
+    # 2026-07-26) — an insert missing either is rejected outright. They're also both
+    # read by the other services: Messaging renders `referring_clinic_name` into the
+    # consent message, and every channel needs the phone.
+    phone: str
+    referring_clinic: str
     address: str | None = None
     medicaid_id: str | None = None
     mobility_needs: str | None = None
