@@ -74,7 +74,7 @@ Merged to `main` (PR #1). Runs offline on the in-memory mock DB; `pytest` green.
   methods conforming to the shared `ToolOutcome` contract; APIs for intake
   (find/create patient), services directory, dashboard, referral timeline, and the
   scheduler-driven `run` / `inbound` (sim) endpoints; a mock DB for offline dev and a
-  Supabase adapter behind the same `ReferralDB` interface (flip via `SUPABASE_DB_URL`).
+  Supabase adapter behind the same `ReferralDB` interface (flip via `DATABASE_URL`).
 - **Frontend:** dashboard (home), services directory, initiate-referral flow, the
   split-screen form review screen, and a referral-timeline detail view. Demo
   simulation controls stand in for the real inbound webhooks so the whole loop is

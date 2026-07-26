@@ -34,7 +34,7 @@ from backend.tools.make_phone_call import make_phone_call
 from backend.tools.notify_patient import notify_patient
 from backend.tools.send_email import send_email
 
-try:  # optional: load .env so SUPABASE_DB_URL is picked up in local dev
+try:  # optional: load .env so DATABASE_URL is picked up in local dev
     from dotenv import load_dotenv
 
     load_dotenv()
@@ -69,19 +69,19 @@ def make_db():
     """One switch for the whole app (CLAUDE.md §5a, §9). Three backends, same
     ReferralDB interface — no tool/route code changes between them:
 
-      1. SUPABASE_URL + SUPABASE_SERVICE_KEY -> Supabase REST API (service_role).
+      1. SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY -> Supabase REST API (service_role).
          The stable demo path: HTTPS/IPv4, same auth the Voice arm uses, no DB
          password / IPv6 / pooler friction.
-      2. SUPABASE_DB_URL (and no service key) -> direct Postgres via asyncpg.
+      2. DATABASE_URL (and no service key) -> direct Postgres via asyncpg.
       3. neither -> fixture mock (offline dev + tests).
     """
     url = os.getenv("SUPABASE_URL")
-    service_key = os.getenv("SUPABASE_SERVICE_KEY")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     if url and service_key:
         from backend.db.supabase_api import SupabaseAPIReferralDB
 
         return SupabaseAPIReferralDB(url, service_key)
-    dsn = os.getenv("SUPABASE_DB_URL")
+    dsn = os.getenv("DATABASE_URL")
     if dsn:
         from backend.db.supabase import SupabaseReferralDB
 
@@ -90,9 +90,19 @@ def make_db():
 
 
 app = FastAPI(title="Catalyst-26")
+
+# The Vite dev server is the default so local dev needs no config. A deployed frontend
+# lives on another origin, so ALLOWED_ORIGINS (comma-separated) must list it or every
+# browser call fails CORS — which looks like a broken backend, not a config gap.
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+    if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Vite dev server
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )

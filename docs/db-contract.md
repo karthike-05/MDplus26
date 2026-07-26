@@ -1,12 +1,17 @@
 # DB contract — what the backend needs from Supabase
 
 This is the **minimal** set of tables/columns the form-fill + orchestration code
-reads and writes, so three teams (form / SMS / phone) can share one database
-without colliding. Adapt-don't-rewrite: our adapter (`backend/db/supabase.py`)
-translates *his* column names to our contract keys, so **rename freely** — just
-update the maps at the top of that file. The few things below genuinely have to
-*exist* are marked **REQUIRED**; everything else the adapter can map to whatever
-Data already has.
+reads and writes, so all four workstreams (form / SMS / phone / ranking) can share one
+database without colliding. Adapt-don't-rewrite: our adapter (`backend/db/supabase.py`)
+translates the shared schema's column names to our contract keys, so **rename freely** —
+just update the maps at the top of that file. The few things below that genuinely have to
+*exist* are marked **REQUIRED**; everything else the adapter maps to whatever the shared
+schema already has.
+
+> **Status (2026-07-26):** the maps are now aligned to the live schema, so `patients` and
+> `services` report clean. Three columns genuinely don't exist yet:
+> `referrals.current_state` and `attempts.attempt_id` / `from_state`. Verify anytime with
+> `python -m backend.scripts.db_introspect`.
 
 > The DB is the integration bus (CLAUDE.md §2, §5a). Nobody imports anybody's code;
 > everyone reads/writes rows. That's what ties form/SMS/phone back together.
@@ -76,12 +81,12 @@ its HTTP endpoints and consume the `service_id` a social worker chooses
 **Preferred path = the REST API (service_role key), not a Postgres DSN.** The direct
 DSN is IPv6-only/flaky and the DB password was unreliable; the API is HTTPS/IPv4 and
 uses the same auth the Voice arm uses. `make_db()` picks the API adapter when
-`SUPABASE_URL` + `SUPABASE_SERVICE_KEY` are set (falls back to DSN, then mock).
+`SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are set (falls back to DSN, then mock).
 
 1. Apply `contracts/migrations/001_orchestration_bus.sql` in the Supabase SQL Editor.
 2. Align `backend/db/supabase.py`'s `*_COLS` maps to Data's real column names
    (reconciled table below).
-3. Set `SUPABASE_URL` + `SUPABASE_SERVICE_KEY` in `.env`.
+3. Set `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` in `.env`.
 4. Smoke test: `python -m backend.scripts.db_introspect`, then one `get_patient` +
    one `record_attempt`. Until step 3, the backend stays on the mock.
 

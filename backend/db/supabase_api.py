@@ -11,7 +11,7 @@ so "rename freely, update the maps once" (docs/db-contract.md) still holds. This
 only swaps the *transport* (PostgREST vs asyncpg); everything upstream depends on the
 ``ReferralDB`` Protocol and never sees the difference.
 
-Activated by ``main.make_db()`` when ``SUPABASE_URL`` + ``SUPABASE_SERVICE_KEY`` are
+Activated by ``main.make_db()`` when ``SUPABASE_URL`` + ``SUPABASE_SERVICE_ROLE_KEY`` are
 set. The ``service_role`` key bypasses RLS — fine for the demo's synthetic tables
 (§10). Never expose that key to the frontend; it's backend-only.
 """
@@ -34,8 +34,10 @@ from backend.db.supabase import (  # single source of vendor naming (§5a)
 
 
 def _to_theirs(fields: dict, cols: dict[str, str]) -> dict:
-    """Our contract keys -> his column names (drop keys we don't map)."""
-    return {cols[k]: v for k, v in fields.items() if k in cols}
+    """Our contract keys -> live column names. Drops keys we don't map, and keys mapped
+    to None — those have no column in the live schema, so writing them would target a
+    column that doesn't exist (see the map annotations in supabase.py)."""
+    return {cols[k]: v for k, v in fields.items() if cols.get(k) is not None}
 
 
 class SupabaseAPIReferralDB(ReferralDB):

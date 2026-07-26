@@ -1,6 +1,9 @@
 // Thin API client for the backend (backend/main.py). One place for all fetches.
 
-const API = "http://localhost:8000";
+// Vite inlines import.meta.env.VITE_* at BUILD time, so a deployed bundle needs
+// VITE_API_BASE set in the build environment — setting it at runtime does nothing.
+// Defaults to the local backend so `npm run dev` needs no config.
+const API = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
 async function j(path, opts) {
   const r = await fetch(API + path, opts);

@@ -5,23 +5,27 @@ Supabase/Postgres appears here and nowhere else. Everything upstream depends on 
 Data's shared schema actually uses — means editing only this file.
 
     Owner: Data owns the schema + seed; this adapter is the seam that lets the
-    form-fill workstream read/write his tables without the rest of the codebase
-    knowing his column names. Three teams write to the same DB (form / sms / phone),
-    so the DB is the integration bus — nobody imports anybody (Golden rule).
+    form-fill workstream read/write those tables without the rest of the codebase
+    knowing their column names. Four services write to the same DB (form / sms /
+    phone / ranking), so the DB is the integration bus — nobody imports anybody
+    (Golden rule).
 
 TWO knobs, both at the top of this file:
-  - ``TABLES``  — table names, if Data named them differently.
-  - ``*_COLS``  — our-contract-key -> his-column-name. Reads translate his rows into
+  - ``TABLES``  — table names, where the shared schema names them differently.
+  - ``*_COLS``  — our-contract-key -> live-column-name. Reads translate live rows into
     our dict shape; writes translate the other way. If a column name differs, change
     it HERE; nothing upstream moves.
 
-Deliberately does NOT depend on a ``form_schemas`` table: schemas load from the
-authoritative JSON files (§5c), so we touch none of Data's form tables. Fewer DB
-modifications, which is the goal.
+Deliberately does NOT depend on a form-schema table: schemas load from the
+authoritative JSON files (§5c). Note the live DB now has a `form_templates` table
+(`schema_json`, `mapping_json`, versioned + verification provenance) that is a better
+home for them than our original `form_schemas` design — seeding it is a follow-up.
 
-Status: asyncpg adapter, lazy pool. Needs (1) Data's real column names confirmed in
-the maps below and (2) a live-DB smoke test before the demo. Until ``SUPABASE_DB_URL``
-is set, ``main.py`` uses the mock, so this file is inert.
+Status: asyncpg adapter, lazy pool. Column names below are aligned to the live schema
+(verified 2026-07-26), but the adapter still cannot be flipped: `referrals.current_state`
+and `attempts.attempt_id`/`from_state` do not exist yet, and `current_state` is blocked
+on a design call (the DB ships its own `advance_referral()` + `referral_actions` queue).
+Until `SUPABASE_URL`/`DATABASE_URL` are set, ``main.py`` uses the mock and this is inert.
 """
 
 from __future__ import annotations
@@ -33,73 +37,103 @@ from backend.db.interface import ReferralDB
 from backend.db.mock import SCHEMA_DIR, _load_schemas
 
 # --- Translation layer -------------------------------------------------------
-# The ONLY place vendor names live. Defaults assume his columns already match our
-# contract keys; edit the right-hand side to match Data's actual schema.
+# The ONLY place vendor names live. Right-hand sides are the REAL column names in the
+# shared Supabase schema, verified by introspection on 2026-07-26
+# (`python -m backend.scripts.db_introspect`). If they disagree with the live DB, the
+# live DB wins — re-run the dump and fix them here; nothing upstream moves.
+#
+# A `None` right-hand side means the live schema has NO such column. Reads simply omit
+# the key (`_to_ours` keeps only columns present in the row); nothing may WRITE one.
+# Each is annotated with where the value actually comes from instead.
 
 TABLES = {
     "patients": "patients",
     "referrals": "referrals",
-    "outreach_attempts": "outreach_attempts",
-    "social_services": "social_services",
+    "outreach_attempts": "attempts",     # SHARED outreach log — ranking's Layer-2
+                                         # responsiveness score reads it, and call_agent
+                                         # writes it. Never fork this into our own table.
+    "social_services": "services",       # HSDS naming; 58 rows of real services
 }
 
-# social_services is the toy directory (seed/services.py). Read-only from here.
+# Read-only from here. Our seed/services.py shape is richer than the live table: the
+# contact channel, phone, form and address all live in satellite tables instead.
 SERVICE_COLS = {
     "id": "id",
     "name": "name",
-    "category": "category",
-    "preferred_channel": "preferred_channel",
-    "form_id": "form_id",
-    "phone": "phone",
+    "category": "need_category",         # slug ("transportation"), not a display label
     "email": "email",
-    "website": "website",
-    "address": "address",
+    "website": "url",
     "description": "description",
+    # -- no column on `services`: --
+    "preferred_channel": None,           # service_application_channels, lowest `priority`
+    "phone": None,                       # service_application_channels.channel_contact
+                                         # where channel='phone' (also: phones.number)
+    "form_id": None,                     # form_templates.service_id -> its schema_json
+    "address": None,                     # service_at_location -> locations -> addresses
 }
-# outreach_attempts read: its created-at column -> our "at" timeline key.
+# attempts read: its created-at column -> our "at" timeline key.
 ATTEMPT_TIME_COL = "created_at"
 
-# our contract key -> his column name
+# our contract key -> live column name
 PATIENT_COLS = {
     "id": "id",
     "name": "name",
-    "dob": "dob",
+    "dob": "date_of_birth",
     "phone": "phone",
-    "address": "address",
-    "medicaid_id": "medicaid_id",
+    "medicaid_id": "insurance_member_id",
     "mobility_needs": "mobility_needs",
     "household_size": "household_size",
+    # -- no column on `patients`: --
+    "address": None,                     # has postal_code + county + lat/long instead
 }
 REFERRAL_COLS = {
     "id": "id",
     "patient_id": "patient_id",
-    "form_id": "form_id",
-    "current_state": "current_state",  # the scheduler's spine — must exist (§7)
-    "outreach_channel": "outreach_channel",  # form|email|phone; picks the submission method
-    "service_name": "service_name",
-    "referring_clinic": "referring_clinic",
-    "appointment_date": "appointment_date",
-    "appointment_time": "appointment_time",
+    "service_id": "service_id",
+    "need_category": "need_category",
+    # !! NEITHER OF THESE EXISTS YET — the adapter cannot be flipped until they do.
+    # `current_state` is the scheduler's spine (§7) and is blocked on a design call:
+    # the live DB already ships an `advance_referral()` function plus a
+    # `referral_actions` queue, so a second state field may be a competing owner of
+    # truth rather than a gap. Do NOT reuse their `status` (not_started / in_progress /
+    # waiting_for_consent) — overlapping meaning, different vocabulary.
+    "current_state": "current_state",
+    "form_id": "form_id",                # or drop entirely: derive via form_templates
+    # -- no column on `referrals`: --
+    "outreach_channel": None,            # derive from service_application_channels
+    "service_name": None,                # join services.name on service_id
+    "referring_clinic": None,            # patients.referring_clinic_name
+    "appointment_date": None,            # patients.appointment_date (timestamptz)
+    "appointment_time": None,            # folded into patients.appointment_date
 }
-# ToolOutcome field -> outreach_attempts column. This is the shared write contract
-# ALL three submission methods (form/sms/phone) must conform to (§5b).
+# ToolOutcome field -> `attempts` column. The shared write contract all three
+# submission methods (form/sms/phone) conform to (§5b).
+#
+# WARNING: `status` collides semantically. Ours is {success, needs_human, failed};
+# theirs holds {completed, ...} alongside an `outcome` ({scheduled, responded, ...})
+# that the ranker reads. Writing our vocabulary into their `status` would corrupt both
+# their reads and the ranking signal — a write path must set `outcome` for them AND
+# keep our status distinguishable.
 ATTEMPT_COLS = {
-    "attempt_id": "attempt_id",      # UNIQUE — idempotency key (§10)
     "referral_id": "referral_id",
     "channel": "channel",
-    "status": "status",
-    "from_state": "from_state",
-    "data": "data",                  # jsonb
-    "error": "error",
+    "status": "status",                  # see WARNING above
+    "data": "structured_result",         # jsonb, NOT NULL — never write None
+    "error": "notes",
+    # -- no column on `attempts` yet (additive migration): --
+    "attempt_id": None,                  # our idempotency key (§10); needs a UNIQUE
+                                         # index. Their nearest analogue is
+                                         # referral_actions.deduplication_key.
+    "from_state": None,
 }
 
 
 def _to_ours(row: dict | None, cols: dict[str, str]) -> dict | None:
-    """His row (their column names) -> our dict (our contract keys). Extra columns
-    we don't map are dropped; missing ones simply won't appear."""
+    """A live row (their column names) -> our dict (our contract keys). Unmapped columns
+    are dropped; keys mapped to None have no column and simply never appear."""
     if row is None:
         return None
-    rev = {their: ours for ours, their in cols.items()}
+    rev = {their: ours for ours, their in cols.items() if their is not None}
     return {rev.get(k, k): v for k, v in dict(row).items() if k in rev}
 
 
@@ -190,7 +224,9 @@ class SupabaseReferralDB(ReferralDB):
         return _to_ours(row, PATIENT_COLS)
 
     async def create_patient(self, patient: dict) -> str:
-        fields = {PATIENT_COLS[k]: v for k, v in patient.items() if k in PATIENT_COLS}
+        # `is not None` skips contract keys with no live column (e.g. address).
+        fields = {PATIENT_COLS[k]: v for k, v in patient.items()
+                  if PATIENT_COLS.get(k) is not None}
         cols = list(fields)
         placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))
         pool = await self._p()
@@ -247,7 +283,9 @@ class SupabaseReferralDB(ReferralDB):
             REFERRAL_COLS["current_state"]: "created",  # §7
         }
         for k, v in extra.items():
-            if k in REFERRAL_COLS:
+            # `is not None` skips contract keys with no live column (service_name,
+            # outreach_channel, referring_clinic, appointment_*) — they're derived.
+            if REFERRAL_COLS.get(k) is not None:
                 base[REFERRAL_COLS[k]] = v
         cols = list(base)
         placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))

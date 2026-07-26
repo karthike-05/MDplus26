@@ -211,7 +211,7 @@ our loop, with three concrete impacts on this plan:
    'need_category'`, `TABLES['social_services'] = 'services'`, etc.
 3. **Derive `form_id` + `preferred_channel`** from `need_category` in `supabase_api.py`
    (e.g. `transportation → transport_intake` / channel `form`) — no DB column needed.
-4. **Re-enable creds.** Uncomment `SUPABASE_URL` + `SUPABASE_SERVICE_KEY` in `.env`
+4. **Re-enable creds.** Uncomment `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` in `.env`
    (they're verified-working, kept inert). `make_db()` then returns the API adapter.
 5. **Smoke test.** `python -m backend.scripts.db_introspect` (should show `current_state`
    + `outreach_attempts` present), then one `get_patient` + one `record_attempt`

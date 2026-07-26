@@ -78,9 +78,9 @@ DB remains the shared read/write bus for state and outreach history.
 `ReferralDB` (`backend/db/interface.py`) is the seam, and `make_db()` in
 `backend/main.py` picks the implementation from env — three tiers, same interface:
 
-1. `SUPABASE_URL` + `SUPABASE_SERVICE_KEY` → **Supabase REST API** (`supabase_api.py`).
+1. `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` → **Supabase REST API** (`supabase_api.py`).
    The **preferred** path: HTTPS/IPv4, service_role key, no DB-password/IPv6 friction.
-2. `SUPABASE_DB_URL` → direct Postgres via asyncpg (`supabase.py`).
+2. `DATABASE_URL` → direct Postgres via asyncpg (`supabase.py`).
 3. neither → the fixture **mock** (default; offline dev + tests).
 
 Column names live only in the `*_COLS` maps at the top of `supabase.py` (shared by both
@@ -105,7 +105,7 @@ is **built and verified**: `backend/db/supabase_api.py` (Supabase REST API, the 
 path) plus the asyncpg `supabase.py`, both behind `ReferralDB` and selected by
 `make_db()`. **To go live:** apply `contracts/migrations/001_orchestration_bus.sql`,
 align the `*_COLS` maps to the canonical HSDS schema (`01_schema.sql`), set
-`SUPABASE_URL` + `SUPABASE_SERVICE_KEY` in `.env`, and smoke-test. The shared write
+`SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` in `.env`, and smoke-test. The shared write
 contract is the outreach log + the `channel`/`status` enums — spec in
 [`docs/db-contract.md`](docs/db-contract.md); converge on the existing `attempts` table
 (see integration-status). Waiting on the shared schema to freeze.

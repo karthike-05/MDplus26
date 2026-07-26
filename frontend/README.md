@@ -32,7 +32,7 @@ Open **http://localhost:5173/**.
 - The UI calls the backend at `http://localhost:8000` (set in `src/api.js`); the
   backend allows that origin via CORS.
 - The backend runs on the **fixture mock DB** by default — no database, no network,
-  fully offline. Set `SUPABASE_DB_URL` in `.env` to point at real Supabase instead
+  fully offline. Set `DATABASE_URL` in `.env` to point at real Supabase instead
   (nothing in the UI changes).
 - `npm run build` produces a static bundle in `dist/` if you need to serve it built.
 
@@ -148,7 +148,7 @@ your work around these; the shapes are frozen so nothing you build breaks the UI
 
 ### Data (database) — `backend/db/supabase.py`
 - **Currently the app runs on the in-memory mock** (`backend/db/mock.py`). To go live:
-  set `SUPABASE_DB_URL` in `.env` (the switch is in `backend/main.py` → `make_db()`),
+  set `DATABASE_URL` in `.env` (the switch is in `backend/main.py` → `make_db()`),
   then confirm the column-name maps (`TABLES`, `*_COLS`) at the top of `supabase.py`
   match the real schema. Reads adapt to your column names; the only shared write
   contract is `outreach_attempts` + the `channel`/`status` enums — see
