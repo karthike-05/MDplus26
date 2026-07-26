@@ -305,6 +305,56 @@ class SupabaseReferralDB(ReferralDB):
         )
         return str(rid)
 
+    async def set_referral_service(self, referral_id: str, service_id: str, **fields) -> None:
+        extra = {col: v for k, v in fields.items()
+                 if (col := REFERRAL_COLS.get(k)) is not None}
+        assignments = ", ".join(f"{c} = ${i + 3}" for i, c in enumerate(extra))
+        pool = await self._p()
+        await pool.execute(
+            f"UPDATE {TABLES['referrals']} SET {REFERRAL_COLS['service_id']} = $2"
+            f"{', ' + assignments if extra else ''} WHERE {REFERRAL_COLS['id']} = $1",
+            referral_id, service_id, *extra.values(),
+        )
+
+    # --- The shared action queue (see orchestrator/actions.py) ---------------
+    # Live column names verbatim — this is the DB scheduler's own vocabulary.
+
+    async def list_ready_actions(self, component: str) -> list[dict]:
+        pool = await self._p()
+        rows = await pool.fetch(
+            "SELECT * FROM referral_actions WHERE assigned_component = $1 "
+            "AND action_status = 'ready' ORDER BY created_at",
+            component,
+        )
+        return [dict(r) for r in rows]
+
+    async def set_action_status(self, action_id: str, status: str, *,
+                               result: dict | None = None, error: str | None = None) -> None:
+        pool = await self._p()
+        await pool.execute(
+            "UPDATE referral_actions SET action_status = $2, "
+            "result = COALESCE($3::jsonb, result), "
+            "error_message = COALESCE($4, error_message), "
+            "completed_at = CASE WHEN $2 IN ('completed','failed') THEN now() ELSE completed_at END, "
+            "updated_at = now() WHERE id = $1",
+            action_id, status, json.dumps(result) if result is not None else None, error,
+        )
+
+    async def record_shared_attempt(self, row: dict) -> None:
+        cols = list(row)
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))
+        values = [json.dumps(v) if isinstance(v, (dict, list)) else v for v in row.values()]
+        pool = await self._p()
+        await pool.execute(
+            f"INSERT INTO attempts ({', '.join(cols)}) VALUES ({placeholders})", *values
+        )
+
+    async def advance_referral(self, referral_id: str) -> dict:
+        """The DB's own scheduler decides the next step — we only ask it to run."""
+        pool = await self._p()
+        out = await pool.fetchval("SELECT advance_referral($1)", referral_id)
+        return json.loads(out) if isinstance(out, str) else (out or {})
+
     # --- service_requests ---------------------------------------------------
     # No *_COLS map here on purpose: the form schemas' `source` paths already name
     # these live columns directly (`service_request.pickup_address`), so there is

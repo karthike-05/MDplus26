@@ -141,3 +141,28 @@ def test_submit_writes_a_shared_attempt_and_hands_control_back(tmp_path):
     # the action is closed, and control returned to the DB scheduler
     assert [a["action_status"] for a in db._actions if a["id"] == aid] == ["completed"]
     assert "state" in report["advanced"]
+
+
+# --- Adapter conformance -----------------------------------------------------
+
+def test_no_adapter_silently_inherits_a_protocol_stub():
+    """Every adapter subclasses ReferralDB, so a method it forgets to implement is
+    INHERITED as the Protocol's `...` body and silently returns None instead of
+    raising — e.g. list_ready_actions() -> None would crash the worker on iteration,
+    and set_referral_service() would no-op a social worker's choice. Only the real-DB
+    adapters are affected (nothing exercises them offline), so this check is the only
+    thing standing between that and the flip.
+    """
+    from backend.db.interface import ReferralDB
+    from backend.db.supabase import SupabaseReferralDB
+    from backend.db.supabase_api import SupabaseAPIReferralDB
+
+    required = [m for m in ReferralDB.__dict__ if not m.startswith("_")]
+    for cls in (MockReferralDB, SupabaseReferralDB, SupabaseAPIReferralDB):
+        own: set[str] = set()
+        for klass in cls.__mro__:
+            if klass is ReferralDB:
+                break
+            own |= set(klass.__dict__)
+        missing = sorted(m for m in required if m not in own)
+        assert not missing, f"{cls.__name__} inherits Protocol stubs: {missing}"

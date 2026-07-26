@@ -182,6 +182,12 @@ class SupabaseAPIReferralDB(ReferralDB):
         await c.table(TABLES["service_requests"]).update(fields).eq(
             "referral_id", referral_id).execute()
 
+    async def set_referral_service(self, referral_id: str, service_id: str, **fields) -> None:
+        c = await self._c()
+        await c.table(TABLES["referrals"]).update({
+            REFERRAL_COLS["service_id"]: service_id, **_to_theirs(fields, REFERRAL_COLS),
+        }).eq(REFERRAL_COLS["id"], referral_id).execute()
+
     # --- The shared action queue --------------------------------------------
     # No *_COLS maps: these are the live column names verbatim, and this is the one
     # place we speak the DB scheduler's own vocabulary (see orchestrator/actions.py).
