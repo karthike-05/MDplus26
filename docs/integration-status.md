@@ -1,191 +1,263 @@
 # Integration status & next steps (pick-up doc)
 
-**Last updated:** 2026-07-23 · **On `main`** (merged via PR #3)
+**Last updated:** 2026-07-26 · branch `integration/voice-ranking-seams`
 
-This is the "where we are, how to resume" doc for the integration phase. Design
-rationale lives in [`integration-plan.md`](integration-plan.md); the DB contract in
-[`db-contract.md`](db-contract.md). Read this one first next session.
-
----
-
-## TL;DR
-- **Aug-2 demo runs today** on the mock DB — fully offline, `pytest` 40 green,
-  `python run_demo.py` closes the loop. This is the reliable recorded-take path.
-- **Inbound seam is built + on `main`** (PR #3): two adapter endpoints translate
-  Voice + Text events into our loop. Channel services integrate via a thin HTTP call
-  to these adapters; our backend translates to the shared contract.
-- **Real-DB (Supabase) path is built and proven, but parked.** The API adapter
-  connects and reads the live schema. It's inert behind commented `.env` creds.
-- **Decision: wait to wire our code to their columns until the shared schema is
-  frozen.** The shared schema is still evolving (see Findings), so hard-wiring
-  today's column names is premature. Re-aligning later is a ~20-min edit
-  of the `*_COLS` maps in one file — cheap by design, so waiting costs us ~nothing.
+**Read this first if you just pulled.** Then
+**[`whats-left.md`](whats-left.md)** — the prioritised list of what integration and the
+product still need, with owners. Design rationale is in
+[`integration-plan.md`](integration-plan.md); the DB contract in
+[`db-contract.md`](db-contract.md); conventions in [`../CLAUDE.md`](../CLAUDE.md).
 
 ---
 
-## What's built
+## TL;DR — what changed, and the one thing that matters
 
-| Piece | State | Where |
+All four workstreams are merged. The discovery that reframes everything: **the live
+database already contains a working scheduler**, `advance_referral()`, which dispatches
+work to components by name — and one of those names is **`karthik_form`**, us.
+
+So the integration shape is settled, and it isn't what this doc previously assumed:
+
+> **The DB owns the workflow. Each service is a worker that polls `referral_actions`
+> for jobs addressed to it, does the work, records an `attempts` row, and calls
+> `advance_referral()` to get the next step.**
+
+Messaging already works this way (`backend/patient_comms/poller.py` — *"Loop A: poll
+referral_actions assigned to twilio"*). As of this session, so do we
+([`backend/orchestrator/actions.py`](../backend/orchestrator/actions.py)).
+
+**Consequence: `referrals.current_state` must NOT be added.** Our
+`orchestrator/scheduler.py` is a parallel implementation of the same decisions, so a
+second state column would be a second owner of truth. The migration this doc used to
+tell you to apply (`001_orchestration_bus.sql`) is **obsolete — do not run it.** Their
+`referral_actions(referral_id, deduplication_key)` unique index already provides the
+idempotency we wanted `attempt_id` for.
+
+**Offline still works and is still the demo path.** `pytest` 76 green with no DB, no
+browser and no network; `python run_demo.py` closes the loop.
+
+---
+
+## The two orchestrators (know which one you're in)
+
+| | Offline / demo | Live / integrated |
 | --- | --- | --- |
-| State machine + scheduler (owns `current_state`) | done | `backend/orchestrator/` |
-| Form-fill (map→validate→review→inject real PDF) | done | `backend/tools/fill_form/` |
-| Inbound adapters (Voice + Text → `apply_inbound`) | **done, on `main` (PR #3)** | `backend/adapters/inbound.py` |
-| State-machine gap fix `(submitted, needs_human)→needs_human` | done, on `main` | `backend/orchestrator/state_machine.py` |
-| Supabase **API** adapter (service_role key) | **built + on `main`, parked (inert)** | `backend/db/supabase_api.py` |
-| `make_db()` 3-tier switch (API / asyncpg / mock) | done | `backend/main.py` |
-| Schema introspection tool (API + Postgres) | done | `backend/scripts/db_introspect.py` |
-| Additive migration SQL | written, **not yet applied** | `contracts/migrations/001_orchestration_bus.sql` |
+| Decides transitions | `orchestrator/scheduler.py` + `state_machine.py` | `advance_referral()` in Postgres |
+| State lives in | `referrals.current_state` (mock only) | `referrals.status` + `referral_actions` |
+| Entry point | `run_demo.py`, `/api/referrals/{id}/run` | `orchestrator/actions.py` worker |
+| Backed by | `MockReferralDB` | `SupabaseAPIReferralDB` |
 
-### The inbound adapters (the conformance layer)
-- `POST /api/voice/call-outcome` — Retell status → our `{success,needs_human,failed}`
-  (`VOICE_STATUS_MAP`), channel `phone`.
-- `POST /api/patient-comms/event` — Twilio consent/verification event → (status,
-  channel) (`PATIENT_COMMS_EVENT_MAP`), channel `whatsapp`.
-- Both call `scheduler.apply_inbound` then cascade. The scheduler stays the sole
-  owner of `current_state`. Tests: `tests/test_adapters.py` (L1, no network).
+Both are real and both are tested. `MockReferralDB` **mirrors** `advance_referral` in
+Python, so the same worker code runs either way — that mirror is what stops the two from
+drifting, and `tests/test_actions.py` covers it.
 
----
+### What `advance_referral()` does, in order
 
-## Supabase: what we found (live DB, 2026-07-23)
+1. Any action already open (`ready`/`in_progress`/`blocked`)? → `waiting`, queue nothing.
+   *This is what stops two pollers double-dispatching.*
+2. **Milestone 2** (added by us — below): `enrolled` + `patient_confirmed_utilization`.
+3. Terminal (`enrolled`/`failed`/`escalated`)? → return.
+4. Consent: declined → fail; not confirmed → queue `confirm_consent` to **twilio**.
+   Nothing gets past this gate.
+5. Any attempt with `outcome='enrolled'` → mark enrolled, queue `complete_referral`.
+6. No rows in `referral_service_candidates` → status `ranking`, queue `rank_resources`.
+   **⚠ Everything currently stops here — see Blockers.**
+7. No service chosen → take the best candidate by `rank`, mark it selected.
+8. An attempt in flight (`queued`/`started`/`sent`/`delivered`) → `waiting_for_response`.
+9. Service exhausted (3 attempts, or every channel tried) → queue `try_next_resource` and
+   move down the shortlist. *Our own scheduler has no equivalent.*
+10. Otherwise dispatch the next untried channel by
+    `service_application_channels.priority`:
+    `online_form`→**karthik_form**, `phone`→**retell**, `email`→**backend**.
 
-Connected via the **REST API + `service_role` key** (the stable path — HTTPS/IPv4,
-no DB-password/IPv6/pooler friction; same mechanism the Voice arm uses). The direct
-Postgres DSN (port 5432) is IPv6-only and flaky here, and the DB password we were
-given (`MDPlus123%`) was rejected — so **use the API path, not the DSN.**
+### Milestone 2 is now in the DB — `contracts/migrations/002_utilization_milestone.sql`
 
-**The live DB currently follows the Data/Voice schema, not our `db-contract.md`.**
-The schema is still evolving — some tables referenced by in-progress code aren't
-present yet — so column names may change before it's frozen.
+**Applied to the live DB (2026-07-26) and verified.** Two signals close a referral and
+they are different (CLAUDE.md §7): the service *accepting* (`enrolled`), and the patient
+*actually using* the resource. `advance_referral` previously knew only the first, so the
+milestone the pitch turns on never landed on the referral. One additive branch, placed
+before the terminal check (which returned early on `enrolled`, and is why the old
+function could never see it):
 
-### Reconciled column map (our contract key → live column)
-Data at time of reading: `services` 24 rows · `patients` 1 · `referrals` 1
-(`status='not_started'`, `need_category='transportation'`) · `attempts` 0.
+- `patient_confirmed_utilization` **true** → stamp `completion_outcome` + `completed_at`.
+- **false** → escalate to a social worker. The service accepted but the patient never got
+  the help — the one case a human must chase, so it must not read as success.
+- **NULL** → queue `confirm_service_utilization` to twilio, so the check-in runs on the
+  shared bus rather than only on Messaging's internal timers.
 
-**patients** (exists)
-| our key | live column | note |
-|---|---|---|
-| id | id | |
-| name | name | |
-| dob | **date_of_birth** | rename |
-| phone | phone | |
-| mobility_needs | mobility_needs | |
-| household_size | household_size | |
-| medicaid_id | insurance_member_id | approximate |
-| address | — | no column (has `postal_code`, `county`) |
-_Also present & useful:_ `referring_clinic_name`, `appointment_date`,
-`appointment_location`, `consent_status`.
-
-**referrals** (exists — missing our two spine fields)
-| our key | live column | note |
-|---|---|---|
-| id | id | |
-| patient_id | patient_id | |
-| service_id | service_id | |
-| **current_state** | — | **ADD (migration)**; their `status` is different, don't reuse |
-| **form_id** | — | ADD, or derive from `need_category` in code |
-| service_name | — | join `services.name` |
-_Also present:_ `need_category`, `urgency`, `consent_confirmed_at`,
-`patient_confirmed_utilization`, `completion_outcome`, `escalation_reason`.
-
-**services** (exists, as `services` — NOT `social_services`)
-| our key | live column | note |
-|---|---|---|
-| id | id | |
-| name | name | |
-| category | need_category | |
-| description | description | |
-| email | email | |
-| website | **url** | rename |
-| phone | — | **no contact-phone column — gap for the phone channel** |
-| preferred_channel | — | derive from `need_category`, or add |
-| form_id | — | derive from `need_category`, or add |
-
-**Gaps / missing tables:** `outreach_attempts` (does not exist — but see Ranking
-section: reconcile with `attempts` before creating a parallel table), `social_services`
-(is `services`), `form_schemas` (we load from JSON, don't need), `check_ins`,
-`patient_service_booking_details` (Voice expects it; absent). Voice's `attempts`
-table exists but is a different shape (no `attempt_id`/`from_state`/`data`/`error`;
-uses `attempt_number`/`structured_result`/`outcome`).
+No new `referrals.status` value on purpose: that column's CHECK constraint is switched on
+by other services, so widening it risks a component meeting a status it can't handle.
+Mirrored in `MockReferralDB` so the offline port can't drift.
 
 ---
 
-## Ranking system — how it fits (2026-07-23)
+## Our seam, concretely
 
-The Ranking workstream's "Database Usage Plan" (three-layer service ranking:
-hard-filter → objective → LLM subjective) is **additive and non-conflicting** with
-our loop, with three concrete impacts on this plan:
+| Piece | Where |
+| --- | --- |
+| The worker (`karthik_form`) | [`backend/orchestrator/actions.py`](../backend/orchestrator/actions.py) |
+| Offline mirror of the bus | `MockReferralDB.advance_referral` / `queue_action` / `list_ready_actions` |
+| Inbound adapters (Voice + Messaging → us) | [`backend/adapters/inbound.py`](../backend/adapters/inbound.py) |
+| Voice dispatch (`make_phone_call` → call_agent) | [`backend/tools/make_phone_call.py`](../backend/tools/make_phone_call.py) |
+| Ranking proxies | `backend/main.py` (`/rank`, `/ranking`, `/choose-service`) |
+| Real-DB adapters | `backend/db/supabase_api.py` (REST, preferred) · `supabase.py` (asyncpg) |
 
-1. **Canonical schema is `01_schema.sql` (HSDS-standard).** That file — not my live
-   introspection — is the source of truth. **Get it** and align the `*_COLS` maps to
-   it precisely. It already includes some of what we mapped (e.g. `patients.date_of_birth`).
-2. **`attempts` is the *shared* outreach log, not just Voice's.** The ranking system's
-   Layer-2 "responsiveness" score reads `attempts` (`outcome='responded'` vs
-   `created_at`). So creating a separate `outreach_attempts` would **fork** the outreach
-   history and starve the ranker. **Decision to revisit with the team:** converge our
-   `record_attempt` onto `attempts` (add `attempt_id`/`from_state` columns, map
-   `data→structured_result`, `error→notes`) instead of a parallel table. NOTE: `attempts`
-   already overloads `status`/`outcome` with channel-specific vocab (`confirmed`,
-   `responded`), which is NOT our frozen `{success,needs_human,failed}` — so the write
-   needs both: our status in a dedicated field + their `outcome` for the ranker.
-3. **Ranking is UPSTREAM of our loop.** Flow: referral created → **ranking picks the
-   service** (writes `ranking_results`, sets `referrals.service_id` / uses
-   `current_resource_rank`) → SW approves → *then our loop runs* (consent → outreach →
-   confirm → check-in). We consume the chosen `service_id`; we don't rank. `ranking_results`
-   / `sw_feedback` are new tables we don't touch. Our scheduler + state machine are
-   unaffected. The ranking plan does **not** define an orchestration state field, so our
-   `current_state` vs their `referrals.status` reconciliation is still open (below).
+**Vocabulary translation** lives only in `actions.py`. Their schema is richer than ours:
 
----
+- our single `status` → their **pair** (`attempts.status`, `attempts.outcome`); the
+  ranker's responsiveness score reads `outcome`, so it must be set.
+- `attempts.channel` has **no value for a filled PDF**. A `pdf` target records as `email`
+  (how it reaches the service), `web` as `online_form`. One constant,
+  `CHANNEL_FOR_TARGET` — change it there if Data adds a dedicated value.
+- we write `attempts.provider = 'karthik_form'`.
 
-## The flip procedure (do this when the schema is frozen)
-
-1. **Apply the migration.** Paste `contracts/migrations/001_orchestration_bus.sql`
-   into Supabase → SQL Editor → run. (DDL can't go through the API key.) Additive &
-   idempotent — teammates unaffected.
-2. **Align the maps.** Edit the `*_COLS` maps in `backend/db/supabase.py` (imported by
-   `supabase_api.py`) to the reconciled names above: `PATIENT_COLS['dob'] =
-   'date_of_birth'`, `SERVICE_COLS['website'] = 'url'`, `SERVICE_COLS['category'] =
-   'need_category'`, `TABLES['social_services'] = 'services'`, etc.
-3. **Derive `form_id` + `preferred_channel`** from `need_category` in `supabase_api.py`
-   (e.g. `transportation → transport_intake` / channel `form`) — no DB column needed.
-4. **Re-enable creds.** Uncomment `SUPABASE_URL` + `SUPABASE_SERVICE_KEY` in `.env`
-   (they're verified-working, kept inert). `make_db()` then returns the API adapter.
-5. **Smoke test.** `python -m backend.scripts.db_introspect` (should show `current_state`
-   + `outreach_attempts` present), then one `get_patient` + one `record_attempt`
-   round-trip. Confirm `run_demo.py` persists state to the real DB.
-6. **Keep the mock as the fallback** — with creds commented out, everything reverts.
+**Two form components, one seam.** Form-filling has two halves: the **PDF** component
+(built) and the **online application** component (not built yet). `prepare`/review/
+`submit` is target-agnostic — the Injector is chosen by `schema.target_type` — so both
+halves enter through the same action types.
 
 ---
 
-## Open decisions / to raise with the team
-- **Outreach log: converge on `attempts`, don't fork it.** The ranking system reads
-  `attempts` for responsiveness — so all three channels should land there (extend
-  `attempts` with `attempt_id`/`from_state`; keep their `outcome` for the ranker).
-  Revisit the `outreach_attempts` block in the migration before applying it.
-- **Orchestration state:** get `referrals.current_state` (our scheduler spine + what
-  the UI/all-3-agents read) into the shared schema. The ranking plan doesn't
-  define a state field, so this is ours to land. Decide `status` vs `current_state`
-  (dual is fine for now).
-- **Get `01_schema.sql`** — the canonical HSDS schema. Align `*_COLS` to it (not to
-  the live introspection). Ranking adds `ranking_results` + `sw_feedback` (we don't
-  touch those) and columns to `patients`/`services`.
-- **Service contact phone:** `services` has no phone column, but the phone (Voice)
-  channel needs one. Data to add it, or source it elsewhere.
-- **UI read path:** confirm the frontend reads Supabase directly via `supabase-js`
-  realtime (assumed) — that's why `current_state` lives on the `referrals` row.
+## Blockers (not ours to fix alone)
+
+1. **Nothing writes `referral_service_candidates`.** `advance_referral` reads it; the
+   ranking service writes `ranking_results` instead. The table is empty, so every
+   referral parks at `status='ranking'` forever, waiting for a `rank_resources` job
+   nobody services. **The bridge is nearly mechanical:** `ranking_results` rows with
+   `passed_hard_filter=true` → `referral_service_candidates` (`rank`, `score` ←
+   `combined_score`, `reasons` ← the breakdown/rationale; `eligibility_state` has no
+   source and can default to `'unknown'`, which `advance_referral` accepts). **Owner:
+   Ranking/Data** — only they know whether results map to candidates one-for-one.
+2. **IDs.** Live is all UUID; our fixtures use `pat_001` / `svc_capmetro` /
+   `transport_intake`. Decision taken: **drive the demo off the 3 live referrals.**
+3. **`patients` has no street-address column** — only `postal_code`/`county`/lat-long, and
+   the `addresses` table is keyed by `location_id` (service locations, not homes).
+   Transport addresses live on `service_requests`; `food_assistance_pdf.json` still
+   sources `home_address` from `patient.address` and will come back blank.
+
+---
+
+## Live schema facts worth knowing (verified 2026-07-26)
+
+Read it yourself anytime: `python -m backend.scripts.db_introspect` — read-only, dumps
+every table with row counts via PostgREST's OpenAPI spec, so even empty tables reveal
+their columns.
+
+**Already built — do not re-invent:**
+
+| Table | What it is |
+| --- | --- |
+| `service_application_channels` (47) | `preferred_channel` done properly: `channel` (online_form/phone/email) + `priority` + `application_url` + `channel_contact`. Also the form URL and the service's contact phone. |
+| `service_requests` (1) | **The trip payload a form fills** — `pickup_address`, `destination_address`, `requested_date`, `requested_start_time`, `mobility_requirements`, `insurance_member_id`, `contact_phone`. Voice reads the same row, so `fill_form` sources from it and writes reviewed values back. |
+| `form_templates` (0) | Our form-schema cache, better than the original design (`schema_json`, `mapping_json`, versioned, verification provenance). **Empty — seed from `contracts/schemas/*.json`.** |
+| `integration_events` (0) | Durable inbound-webhook log; our adapters should persist here. |
+| `attempts` | The **shared** outreach log. Never fork it — the ranker reads it. |
+| `referral_actions`, `agent_decisions`, `agent_memory` | The action bus + a decision audit trail. |
+
+**Naming** is aligned in `backend/db/supabase.py`'s `*_COLS` maps — the only place vendor
+names live: `services` not `social_services` · `attempts` not `outreach_attempts` ·
+`date_of_birth` not `dob` · `insurance_member_id` not `medicaid_id` · `need_category` not
+`category` · `url` not `website` · `structured_result` not `data` · `notes` not `error`.
+A `None` in those maps means **no such column**, annotated with where the value really
+comes from.
+
+**Inserting a patient** requires three columns that have no default: `name`, `phone`,
+`referring_clinic_name`. `NewPatient` and the intake UI enforce all three;
+`consent_status` defaults to `'pending'` and `synthetic_demo` to `true`.
+
+---
+
+## Environment
+
+Every service now uses the **same name for the same thing**, so one value pastes across
+all deploys. Renamed this session: `SUPABASE_SERVICE_KEY` → **`SUPABASE_SERVICE_ROLE_KEY`**
+and `SUPABASE_DB_URL` → **`DATABASE_URL`**.
+
+```bash
+# ours (backend)
+SUPABASE_URL=  SUPABASE_SERVICE_ROLE_KEY=   # set both -> real DB; unset -> mock
+DATABASE_URL=                               # asyncpg tier (Messaging has a working DSN)
+ANTHROPIC_API_KEY=  ALLOWED_ORIGINS=
+SUPABASE_ACCESS_TOKEN=                      # sbp_… Management API PAT; DDL only
+CALL_AGENT_BASE_URL=  SERVICE_RANKING_BASE_URL=
+# frontend
+VITE_API_BASE=                              # inlined at BUILD time, not runtime
+```
+
+We hold **no Twilio or Retell credential** — this backend never dials out.
+
+**Both legs of every seam must be set.** The inbound leg lives in *their* environments:
+`ORCHESTRATOR_BASE_URL` (call_agent → us) and `ORG_BACKEND_URL` (patient_comms → us).
+Unset, they **skip silently** — the referral parks and the loop looks stalled with no
+error. This is the most likely way a live run dies quietly.
+
+---
+
+## Deployment
+
+Three teammate services are **live on Railway** (probably on trial credit — check
+Dashboard → Usage/Billing, because services get suspended when it runs out):
+
+- `https://ptcomm-outreach-production.up.railway.app` — Messaging
+- `https://md-catalyst-call-agent-production.up.railway.app` — Voice
+- `https://md-catalyst-service-ranking-production.up.railway.app` — Ranking
+
+The last two are exactly the values for `CALL_AGENT_BASE_URL` and
+`SERVICE_RANKING_BASE_URL`.
+
+Our `Procfile` runs `uvicorn backend.main:app` from the **repo root**; theirs run
+`main:app` from **their own folders**. So each is a separate Railway service with its own
+**Root Directory** (`.`, `backend/call_agent`, `backend/patient_comms`,
+`backend/service_ranking`), plus a fifth deploy for the frontend — a static Vite build,
+which Vercel or Netlify hosts free.
+
+**For the Aug-2 recorded take, consider not deploying ours at all.** Only services
+*receiving* webhooks need public URLs; run locally and tunnel just those
+(`cloudflared tunnel --url http://localhost:8000`). No cold starts, no credit ceiling,
+and you can watch the logs.
+
+---
+
+## Verify after pulling
+
+```bash
+pip install -r requirements.txt
+python -m pytest -q                 # 76 green — no DB, no browser, no network
+python run_demo.py                  # headless loop closes (offline scheduler)
+python -c "import backend.main as m; print(type(m.db).__name__)"   # -> MockReferralDB
+python -m backend.scripts.db_introspect   # live schema (needs SUPABASE_* set)
+cd frontend && npm install && npm run dev
+```
+
+`tests/conftest.py` clears `CALL_AGENT_BASE_URL` / `SERVICE_RANKING_BASE_URL` for every
+test, so a populated `.env` can never turn a unit test into a live Retell call.
 
 ---
 
 ## Guardrails (don't regress these)
-- Never write our state vocabulary into their `referrals.status`, and never write our
-  attempts into their `attempts` table — both collide with columns they read/edit.
-- Adapters translate; the **scheduler alone** mutates `current_state`.
-- Supabase is cost-safe: no per-request billing; our reads are KB-scale; nothing
-  polls it. Creds live only in gitignored `.env`.
 
-## Verify the current state
-```bash
-pytest -q                 # 40 green, on the mock
-python run_demo.py        # headless loop closes, on the mock
-python -c "import backend.main as m; print(type(m.db).__name__)"   # -> MockReferralDB
-```
+- **Never add `referrals.current_state`**, and never write our vocabulary into their
+  `referrals.status`. One owner of transitions per mode.
+- **Never fork `attempts`** into a parallel table — the ranker reads it.
+- **A tool never calls another tool** and never mutates workflow state (CLAUDE.md §2).
+- **Never auto-submit `human_only` fields.** `prepare_online_form` stops at the review
+  gate and leaves its action open on purpose, so `advance_referral` keeps returning
+  `waiting` instead of racing ahead.
+- **Adapters subclass the `ReferralDB` Protocol**, so a method you forget is inherited as
+  `...` and silently returns `None` — `list_ready_actions()` → `None` would crash the
+  worker. `tests/test_actions.py::test_no_adapter_silently_inherits_a_protocol_stub` is
+  the guard; keep it passing.
+- **Cost:** no Twilio or Retell call without explicit sign-off. `make_phone_call` stubs
+  when `CALL_AGENT_BASE_URL` is unset and records `placed: false, stub: true`, so a
+  stubbed dispatch is never mistaken for a real one.
+
+## Open questions for the team
+
+1. Who writes `referral_service_candidates`? (blocker 1 — Ranking/Data)
+2. `attempts.channel` has no value for a filled PDF. Add one, or keep recording PDFs as
+   `email`?
+3. Should there be a first-class terminal `referrals.status` for "the patient used it", or
+   is `completion_outcome` enough?
+4. Ranking recomputes per referral. `distance` makes Layer 2 patient-specific and Layer 3
+   is already one batched Claude call, so caching buys little — worth confirming that's
+   intended.

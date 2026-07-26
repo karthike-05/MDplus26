@@ -20,6 +20,12 @@ RETELL_FROM_NUMBER = os.environ["RETELL_FROM_NUMBER"]
 RETELL_TRANSPORTATION_AGENT_ID = os.environ["RETELL_TRANSPORTATION_AGENT_ID"]
 RETELL_CREATE_CALL_URL = "https://api.retellai.com/v2/create-phone-call"
 
+# Optional (unlike the RETELL_* vars above): the orchestrator backend isn't deployed
+# anywhere yet, so this stays unset in production for now — see
+# integration_plan_call_agent.md. Forwarding is skipped, not a startup error, when
+# it's absent, so this service keeps running standalone either way.
+ORCHESTRATOR_BASE_URL = os.environ.get("ORCHESTRATOR_BASE_URL")
+
 
 # def _next_available_call_time(service_id: str) -> Optional[datetime]:
 #     """Returns None if the org is open right now; otherwise the next time the
@@ -149,6 +155,44 @@ class LogOutcomeRequest(BaseModel):
     cancellation_instructions: Optional[str] = None
 
 
+def _attempt_number_from(result: dict) -> int:
+    """save_call_outcome stashes the written/duplicate row under "attempt" — a dict
+    on the duplicate-call_id path, a list of inserted rows otherwise (db.py)."""
+    attempt = result.get("attempt")
+    if isinstance(attempt, list):
+        attempt = attempt[0] if attempt else {}
+    return (attempt or {}).get("attempt_number", 1)
+
+
+async def _forward_to_orchestrator(body: "LogOutcomeRequest", call_id: Optional[str], result: dict) -> None:
+    """Best-effort: tell the orchestrator's inbound adapter (backend/adapters/inbound.py
+    POST /api/voice/call-outcome) about this outcome so its scheduler can advance the
+    referral. Optional and non-fatal — the Supabase write in save_call_outcome above is
+    this service's own source of truth regardless of whether this forward succeeds.
+    See integration_plan_call_agent.md."""
+    if not ORCHESTRATOR_BASE_URL:
+        return
+    payload = {
+        "referral_id": body.case_id,
+        "status": body.status,          # same vocab as the orchestrator's VOICE_STATUS_MAP keys
+        "attempt_no": _attempt_number_from(result),
+        "confirmation_id": body.confirmation_id,
+        "pickup_window": body.pickup_window,
+        "offered_datetime": body.offered_datetime,
+        "call_id": call_id,
+        "notes": body.notes,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{ORCHESTRATOR_BASE_URL}/api/voice/call-outcome",
+                json={k: v for k, v in payload.items() if v is not None},
+            )
+            response.raise_for_status()
+    except httpx.HTTPError as e:
+        print(f"[log_outcome] orchestrator forward failed (non-fatal): {e}")
+
+
 @app.post("/log-call-outcome")
 async def log_outcome(request: Request):
     raw_body = await request.json()
@@ -172,6 +216,7 @@ async def log_outcome(request: Request):
         )
 
     result = db.save_call_outcome(body.model_dump(exclude_none=True), call_id)
+    await _forward_to_orchestrator(body, call_id, result)
     return {
         "success": True,
         "case_id": body.case_id,
@@ -187,8 +232,8 @@ def lookup_service_request_details(case_id: str = Query(...)):
 
 
 class PlaceReferralCallRequest(BaseModel):
-    booking_id: str
     referral_id: str
+    booking_id: Optional[str] = None
 
 
 @app.post("/place-referral-call")
@@ -196,5 +241,10 @@ async def place_referral_call_endpoint(request: PlaceReferralCallRequest):
     """HTTP entry point for triggering an outbound Retell call for a
     referral's transportation booking. Same underlying function
     trigger_call.py exercises directly for manual testing.
+
+    booking_id is optional — if omitted, the latest booking for referral_id is
+    looked up (db.get_latest_booking_id, mirrors trigger_call.py's manual lookup),
+    so callers only need referral_id (database_usage.md: "Receives: referral_id").
     """
-    return await place_referral_call(request.booking_id, request.referral_id)
+    booking_id = request.booking_id or db.get_latest_booking_id(request.referral_id)
+    return await place_referral_call(booking_id, request.referral_id)

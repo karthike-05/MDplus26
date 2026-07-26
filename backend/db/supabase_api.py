@@ -11,7 +11,7 @@ so "rename freely, update the maps once" (docs/db-contract.md) still holds. This
 only swaps the *transport* (PostgREST vs asyncpg); everything upstream depends on the
 ``ReferralDB`` Protocol and never sees the difference.
 
-Activated by ``main.make_db()`` when ``SUPABASE_URL`` + ``SUPABASE_SERVICE_KEY`` are
+Activated by ``main.make_db()`` when ``SUPABASE_URL`` + ``SUPABASE_SERVICE_ROLE_KEY`` are
 set. The ``service_role`` key bypasses RLS — fine for the demo's synthetic tables
 (§10). Never expose that key to the frontend; it's backend-only.
 """
@@ -34,8 +34,10 @@ from backend.db.supabase import (  # single source of vendor naming (§5a)
 
 
 def _to_theirs(fields: dict, cols: dict[str, str]) -> dict:
-    """Our contract keys -> his column names (drop keys we don't map)."""
-    return {cols[k]: v for k, v in fields.items() if k in cols}
+    """Our contract keys -> live column names. Drops keys we don't map, and keys mapped
+    to None — those have no column in the live schema, so writing them would target a
+    column that doesn't exist (see the map annotations in supabase.py)."""
+    return {cols[k]: v for k, v in fields.items() if cols.get(k) is not None}
 
 
 class SupabaseAPIReferralDB(ReferralDB):
@@ -162,6 +164,63 @@ class SupabaseAPIReferralDB(ReferralDB):
             d["at"] = str(r.get(ATTEMPT_TIME_COL)) if r.get(ATTEMPT_TIME_COL) else None
             out.append(d)
         return out
+
+    # --- service_requests ---------------------------------------------------
+    # No *_COLS map: the form schemas' `source` paths name these live columns directly
+    # (`service_request.pickup_address`), so there's nothing to translate.
+
+    async def get_service_request(self, referral_id: str) -> dict:
+        c = await self._c()
+        res = await c.table(TABLES["service_requests"]).select("*").eq(
+            "referral_id", referral_id).order("created_at", desc=True).limit(1).execute()
+        return dict(res.data[0]) if res.data else {}
+
+    async def save_service_request(self, referral_id: str, fields: dict) -> None:
+        if not fields:
+            return
+        c = await self._c()
+        await c.table(TABLES["service_requests"]).update(fields).eq(
+            "referral_id", referral_id).execute()
+
+    async def set_referral_service(self, referral_id: str, service_id: str, **fields) -> None:
+        c = await self._c()
+        await c.table(TABLES["referrals"]).update({
+            REFERRAL_COLS["service_id"]: service_id, **_to_theirs(fields, REFERRAL_COLS),
+        }).eq(REFERRAL_COLS["id"], referral_id).execute()
+
+    # --- The shared action queue --------------------------------------------
+    # No *_COLS maps: these are the live column names verbatim, and this is the one
+    # place we speak the DB scheduler's own vocabulary (see orchestrator/actions.py).
+
+    async def list_ready_actions(self, component: str) -> list[dict]:
+        c = await self._c()
+        res = await c.table("referral_actions").select("*").eq(
+            "assigned_component", component).eq(
+            "action_status", "ready").order("created_at").execute()
+        return [dict(r) for r in res.data or []]
+
+    async def set_action_status(self, action_id: str, status: str, *,
+                               result: dict | None = None, error: str | None = None) -> None:
+        fields: dict = {"action_status": status}
+        if result is not None:
+            fields["result"] = result
+        if error is not None:
+            fields["error_message"] = error
+        if status in ("completed", "failed"):
+            fields["completed_at"] = "now()"
+        c = await self._c()
+        await c.table("referral_actions").update(fields).eq("id", action_id).execute()
+
+    async def record_shared_attempt(self, row: dict) -> None:
+        c = await self._c()
+        await c.table("attempts").insert(row).execute()
+
+    async def advance_referral(self, referral_id: str) -> dict:
+        """Call the DB's own scheduler. It — not us — decides the next step (§7: one
+        owner of transitions; here that owner is the database)."""
+        c = await self._c()
+        res = await c.rpc("advance_referral", {"p_referral_id": referral_id}).execute()
+        return res.data if isinstance(res.data, dict) else {"result": res.data}
 
     def list_forms(self) -> list[dict]:
         """UI sugar (not on the Protocol; from the JSON schemas, like the mock)."""

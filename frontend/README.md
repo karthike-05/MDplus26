@@ -32,7 +32,7 @@ Open **http://localhost:5173/**.
 - The UI calls the backend at `http://localhost:8000` (set in `src/api.js`); the
   backend allows that origin via CORS.
 - The backend runs on the **fixture mock DB** by default — no database, no network,
-  fully offline. Set `SUPABASE_DB_URL` in `.env` to point at real Supabase instead
+  fully offline. Set `DATABASE_URL` in `.env` to point at real Supabase instead
   (nothing in the UI changes).
 - `npm run build` produces a static bundle in `dist/` if you need to serve it built.
 
@@ -40,7 +40,11 @@ Open **http://localhost:5173/**.
 
 ## The demo walkthrough
 
-1. **Dashboard** (home) — one row per referral with a live status badge.
+1. **Dashboard** (home) — referrals grouped the way a social worker triages: **Needs
+   you** (blocked, escalated, or awaiting a form review) → **In progress** → **Closed the
+   loop**. Each row shows the service's answer (*Confirmation*) and the patient's own
+   answers (*Patient response*: consent + whether they actually used the service) as
+   separate columns, plus which channels have been tried.
 2. **+ New referral** — find a patient by name + DOB (auto-populates on a match, e.g.
    `Maria Gonzalez` / `1958-03-12`; otherwise create one) → pick a service (its
    preferred contact mode prefills; you can override) → add clinic + appointment date
@@ -48,7 +52,10 @@ Open **http://localhost:5173/**.
 3. Back on the dashboard, the row's **action button** advances the loop:
    `Request consent → Patient opts in → Review & submit → Service accepts →
    Schedule check-in → Patient replies "Y" → Completed`.
-4. Click a patient name to open the **timeline** of every outreach attempt.
+4. Click a patient name to open the **timeline** of every outreach attempt, decoded per
+   service (form fields, Voice's call/confirmation details, Messaging's patient replies).
+5. **↻ Refresh** re-reads the board. The **data-source pill** shows whether you're on the
+   fixture mock or live Supabase, and flips between them.
 
 > **Sim buttons.** The ghost buttons ("Patient opts in", "Service accepts", "Patient
 > replies Y") stand in for the real inbound webhooks (patient texts, the service's
@@ -64,12 +71,26 @@ Open **http://localhost:5173/**.
 | File | Screen | Notes |
 | --- | --- | --- |
 | `main.jsx` | Router + top nav | View state (`dashboard`/`services`/`initiate`/`detail`/`review`); `?referral=<id>` deep-links to a detail. |
-| `Dashboard.jsx` | Home | Table of referrals; per-row action; realtime-ish (refetches after each action). |
+| `Dashboard.jsx` | Home | Grouped board (Needs you / In progress / Closed the loop); patient-response + channels-tried columns; refresh button; mock↔Supabase switch. Refetches after each action — **not** realtime (see below). |
 | `Services.jsx` | Toy directory | Services grouped by category; "Start referral" launches initiate. |
 | `Initiate.jsx` | New referral | Find/create patient → pick service + mode → create. |
 | `ReviewUI.jsx` | Form review | Split-screen: fields left, PDF right, click-to-highlight; submit. |
 | `ReferralDetail.jsx` | Timeline | Patient/service facts + every outreach attempt. |
-| `ui.jsx` | Shared | Palette, `Badge`, `Btn`, and `RowActions` — the widget that advances the loop. |
+| `ui.jsx` | Shared | Palette, `Badge`, `Btn`, `RowActions` (the widget that advances the loop), plus `PatientResponse` and `ChannelsTried`. |
+
+> **Two milestones, never collapsed.** "The service accepted" and "the patient actually
+> used it" are different facts (`CLAUDE.md` §7), so they render in different columns. A
+> referral an org approved but the patient never used is a *failure* — it reads as a
+> success everywhere else in this industry, and not conflating them is the product.
+
+> **Not realtime.** The board refetches after each action and on **↻ Refresh**; there is
+> no `supabase-js` subscription (the frontend has no Supabase dependency at all — every
+> read goes through our backend API). Realtime would mean adding `supabase-js` and
+> pointing the UI at Supabase directly.
+
+> **Live mode is read-mostly.** With Supabase selected, `advance_referral()` in the
+> database owns the workflow (`CLAUDE.md` §7a), so the per-row action buttons are replaced
+> with "driven by the DB scheduler" — offering them would imply control we don't have.
 | `api.js` | API client | One place for every backend call. |
 
 ### The one thing to understand: `RowActions` + `actionFor` (in `ui.jsx`)
@@ -103,10 +124,21 @@ workstreams be built independently (see `../docs/db-contract.md`).
 
 ### Backend endpoints it uses
 
-`GET /api/dashboard` · `GET /api/services` · `GET /api/referrals/{id}` (detail +
-timeline) · `POST /api/referrals` (create) · `POST /api/patients` + `GET
-/api/patients/find` · `POST /api/referrals/{id}/run` · `POST /api/referrals/{id}/inbound`
-· `GET /api/review/{id}` + `POST /api/submit/{id}` + `GET /api/form/{form_id}/page/{n}.png`.
+`GET /api/dashboard` (rows + the active data source) · `GET /api/services` · `GET
+/api/referrals/{id}` (detail + timeline + patient response) · `POST /api/referrals`
+(create) · `POST /api/patients` + `GET /api/patients/find` · `POST
+/api/referrals/{id}/run` · `POST /api/referrals/{id}/inbound` · `GET /api/review/{id}` +
+`POST /api/submit/{id}` + `GET /api/form/{form_id}/page/{n}.png` · `GET`/`POST /api/db`
+(read + flip the data source).
+
+**Creating a patient requires `phone` and `referring_clinic`** — both are NOT NULL with no
+default on the shared `patients` table, and Messaging renders the clinic name into the
+consent message. The create button stays disabled until they're filled, because a missing
+value would come back as an opaque 500.
+
+**Backend base URL** comes from `VITE_API_BASE` (default `http://localhost:8000`). Vite
+inlines it at **build** time, so a deployed bundle needs it set in the build environment —
+setting it at runtime does nothing.
 
 ---
 
@@ -148,7 +180,7 @@ your work around these; the shapes are frozen so nothing you build breaks the UI
 
 ### Data (database) — `backend/db/supabase.py`
 - **Currently the app runs on the in-memory mock** (`backend/db/mock.py`). To go live:
-  set `SUPABASE_DB_URL` in `.env` (the switch is in `backend/main.py` → `make_db()`),
+  set `DATABASE_URL` in `.env` (the switch is in `backend/main.py` → `make_db()`),
   then confirm the column-name maps (`TABLES`, `*_COLS`) at the top of `supabase.py`
   match the real schema. Reads adapt to your column names; the only shared write
   contract is `outreach_attempts` + the `channel`/`status` enums — see

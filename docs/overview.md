@@ -54,7 +54,7 @@ contract) and **one scheduler** that owns every state transition.
 | Workstream | Responsibility |
 | --- | --- |
 | **Form-fill** | Auto-fill + review + submit forms; the orchestration glue (state machine + scheduler); shared contracts; the social-worker frontend. |
-| **Data** | The database schema (HSDS, `01_schema.sql`), seed data, and the one vendor-facing DB layer. |
+| **Data** | The shared Supabase schema (HSDS-shaped), seed data, the DB-side orchestrator (`advance_referral()`), and the one vendor-facing DB layer. There is no `01_schema.sql` file — the live database is the source of truth; read it with `python -m backend.scripts.db_introspect`. |
 | **Ranking** (Data) | Three-layer service ranking (hard-filter → objective → LLM subjective) that picks *which* service a referral targets. Runs **upstream** of outreach; writes `ranking_results` / `sw_feedback`. Does not touch the scheduler. |
 | **Messaging** | Patient texting — consent opt-in and the utilization check-in (SMS/WhatsApp). |
 | **Voice** | Outbound phone calls to social services. |
@@ -74,7 +74,7 @@ Merged to `main` (PR #1). Runs offline on the in-memory mock DB; `pytest` green.
   methods conforming to the shared `ToolOutcome` contract; APIs for intake
   (find/create patient), services directory, dashboard, referral timeline, and the
   scheduler-driven `run` / `inbound` (sim) endpoints; a mock DB for offline dev and a
-  Supabase adapter behind the same `ReferralDB` interface (flip via `SUPABASE_DB_URL`).
+  Supabase adapter behind the same `ReferralDB` interface (flip via `DATABASE_URL`).
 - **Frontend:** dashboard (home), services directory, initiate-referral flow, the
   split-screen form review screen, and a referral-timeline detail view. Demo
   simulation controls stand in for the real inbound webhooks so the whole loop is
@@ -93,18 +93,28 @@ of `current_state`:
 - So Voice/Text integrate via **one HTTP call**, not by conforming their DB writes.
 
 A **Supabase real-DB path** (`backend/db/supabase_api.py`, REST API + service_role key)
-is also built and verified, but **parked** — the app defaults to the mock until the
-shared schema is frozen. Full state, findings, and the flip procedure live in
+is also built and verified. The app **defaults to the mock**, which is deliberately the
+Aug-2 recorded-take path: fully offline, no cold starts, nothing to bill. Full state,
+findings, and the live architecture live in
 **[`integration-status.md`](integration-status.md)** (read this first).
 
 ## Where to resume
 
-1. **Database convergence (next):** align to the canonical HSDS schema (`01_schema.sql`);
-   land `referrals.current_state` (our scheduler spine); **converge the outreach log on
-   the shared `attempts` table** (the ranking system reads it for responsiveness) rather
-   than a separate `outreach_attempts`. Then flip on the API path. See
-   [`integration-status.md`](integration-status.md) and [`db-contract.md`](db-contract.md).
-2. **Outbound triggers + UI:** fire our tools at the teammate services; render the
-   channel-specific fields in the referral detail view.
-3. **Deferred:** email provider behind `send_email`; upload-a-PDF → auto-extract schema
-   (`CLAUDE.md` §13); realtime dashboard via `supabase-js`.
+**Read [`integration-status.md`](integration-status.md) first** — it is the pick-up doc.
+The short version, updated 2026-07-26:
+
+1. **The architecture question is settled.** The live DB owns a scheduler,
+   `advance_referral()`, which dispatches work to components via `referral_actions`; we
+   are `karthik_form` and now poll it (`backend/orchestrator/actions.py`). So
+   `referrals.current_state` is **not** added and `001_orchestration_bus.sql` is
+   obsolete — our own state machine remains the *offline* orchestrator only, and
+   `MockReferralDB` mirrors `advance_referral` so one worker serves both.
+2. **One blocker, upstream of us:** nothing writes `referral_service_candidates`, which
+   `advance_referral` reads, so live referrals park at `status='ranking'`. Ranking writes
+   `ranking_results`; the bridge is nearly mechanical but belongs to Ranking/Data.
+3. **UI + deployment:** surface all three channels and the closed-loop view; set both
+   legs of every seam (`ORCHESTRATOR_BASE_URL` / `ORG_BACKEND_URL` live in *their*
+   environments and fail silently when unset).
+4. **Deferred:** the online-application form component (the PDF half is built); seeding
+   `form_templates` from our schema JSON; persisting inbound events to
+   `integration_events`; upload-a-PDF → auto-extract schema (`CLAUDE.md` §13).

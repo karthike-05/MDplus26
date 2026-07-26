@@ -23,7 +23,8 @@ class FormField(BaseModel):
 
     name: str
     fill_policy: FillPolicy = "review"
-    source: str | None = None            # dotted path into the patient record, e.g. "patient.dob"
+    source: str | None = None            # dotted path into the record bundle the mapper
+                                         # resolves: patient.* / referral.* / service_request.*
     required: bool = False
     maxlength: int | None = None
     format: str | None = None            # e.g. "date", "phone", "email"
@@ -56,8 +57,8 @@ class FormSchema(BaseModel):
 
 
 class ToolOutcome(BaseModel):
-    """Uniform tool result (§5b). Every tool returns this and writes an
-    ``outreach_attempts`` row. The scheduler only ever sees this.
+    """Uniform tool result (§5b). Every tool returns this and writes an ``attempts``
+    row (the shared outreach log). The scheduler only ever sees this.
 
     Also used to record *inbound* signals (an email back from the service, a
     patient "Y" reply): the webhook handler writes a ToolOutcome and the scheduler
@@ -71,7 +72,7 @@ class ToolOutcome(BaseModel):
 
     # Idempotency (§10). The scheduler generates one key per dispatch, deterministic
     # per (referral_id, from_state, attempt_no), and record_attempt upserts on it —
-    # so a re-run does not create a duplicate outreach_attempts row.
+    # so a re-run does not create a duplicate `attempts` row.
     attempt_id: str
 
     # The state this outcome was produced *for*. Lets the dashboard and the

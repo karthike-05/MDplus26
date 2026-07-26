@@ -53,3 +53,23 @@ def test_instances_are_isolated():
     asyncio.run(db1.create_patient({"id": "pat_ghost", "name": "Ghost", "dob": "2000-01-01"}))
     db2 = MockReferralDB()
     assert asyncio.run(db2.find_patient("Ghost", "2000-01-01")) is None
+
+
+def test_new_patient_requires_the_not_null_columns():
+    """`patients.phone` and `patients.referring_clinic_name` are NOT NULL with no
+    default in the shared schema, so the API must reject a payload missing either
+    rather than letting Postgres refuse the insert as an opaque 500."""
+    from pydantic import ValidationError
+    from backend.main import NewPatient
+
+    ok = NewPatient(name="Ada", dob="1815-12-10", phone="5125550000",
+                    referring_clinic="CommUnityCare Hancock")
+    assert ok.phone and ok.referring_clinic
+
+    for missing in ({"phone": "5125550000"}, {"referring_clinic": "X"}):
+        try:
+            NewPatient(name="Ada", dob="1815-12-10", **missing)
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError(f"expected rejection when omitting one of {missing}")

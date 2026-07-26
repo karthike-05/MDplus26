@@ -14,7 +14,9 @@ import fitz  # PyMuPDF — L2 text-extraction assertion
 from contracts.models import FormField, FormSchema
 from backend.mapping import mapper
 from backend.tools.fill_form.validation import validate_field
-from backend.tools.fill_form.fill_form import prepare_from_records, build_sources
+from backend.tools.fill_form.fill_form import (
+    prepare_from_records, build_sources, service_request_writeback,
+)
 from backend.db.mock import MockReferralDB
 from backend.tools.fill_form.fill_form import prepare, submit
 
@@ -121,3 +123,85 @@ def test_submit_missing_required_is_needs_human_no_injection(tmp_path):
     assert outcome.status == "needs_human"                    # validation gate before inject
     assert "appointment_time" in outcome.data["problems"]
     assert not out.exists()                                    # nothing injected
+
+
+# --- service_requests: the shared trip row form-fill reads and writes back ----
+# Request-specific values (pickup/destination, requested date+time) live on the shared
+# `service_requests` row that Voice reads too, instead of being duplicated onto the
+# referral. Each field's own `source` declares the correspondence, used in both
+# directions — so these tests pin the mapping, not a hand-maintained column list.
+
+def test_writeback_maps_via_each_field_source():
+    schema = FormSchema(
+        form_id="f", target_type="pdf", source_ref="x.pdf",
+        fields=[
+            FormField(name="pickup_address", fill_policy="auto",
+                      source="service_request.pickup_address"),
+            FormField(name="client_name", fill_policy="auto", source="patient.name"),
+        ],
+    )
+    out = service_request_writeback(schema, {"pickup_address": "12 Oak St", "client_name": "Ada"})
+    assert out == {"pickup_address": "12 Oak St"}       # patient.* is not a writeback target
+
+
+def test_writeback_skips_blanks_and_human_only():
+    """A blank must never overwrite a stored value, and human_only fields are not ours
+    to write at all (§2) — fillable_fields() already excludes them."""
+    schema = FormSchema(
+        form_id="f", target_type="pdf", source_ref="x.pdf",
+        fields=[
+            FormField(name="pickup_address", fill_policy="auto",
+                      source="service_request.pickup_address"),
+            FormField(name="requested_note", fill_policy="human_only",
+                      source="service_request.request_notes"),
+        ],
+    )
+    assert service_request_writeback(schema, {"pickup_address": "", "requested_note": "x"}) == {}
+
+
+def test_prepare_sources_trip_values_from_the_service_request():
+    db = MockReferralDB()
+    payload = asyncio.run(prepare("ref_1002", db))
+    sr = asyncio.run(db.get_service_request("ref_1002"))
+    assert payload.values["pickup_address"] == sr["pickup_address"]
+    assert payload.values["destination"] == sr["destination_address"]
+    # provenance tells the review UI where each value came from
+    assert payload.provenance["appointment_time"] == "service_request.requested_start_time"
+
+
+def test_submit_writes_reviewed_values_back_to_the_service_request(tmp_path):
+    db = MockReferralDB()
+    payload = asyncio.run(prepare("ref_1002", db))
+    values = dict(payload.values)
+    values["pickup_address"] = "999 Corrected Ave, Austin TX"   # the reviewer fixes it
+
+    outcome = asyncio.run(
+        submit("ref_1002", values, db, attempt_id="att_sr",
+               from_state="outreach_in_progress", out_path=tmp_path / "out.pdf")
+    )
+    assert outcome.status == "success"
+
+    row = asyncio.run(db.get_service_request("ref_1002"))
+    assert row["pickup_address"] == "999 Corrected Ave, Austin TX"
+    # and a re-prepare reads the corrected row back (read-your-writes)
+    assert asyncio.run(prepare("ref_1002", db)).values["pickup_address"] == \
+        "999 Corrected Ave, Austin TX"
+
+
+def test_failed_submit_does_not_touch_the_shared_row(tmp_path):
+    """A failed injection must not leave the shared row claiming values that were
+    never submitted — Voice reads that row."""
+    db = MockReferralDB()
+    payload = asyncio.run(prepare("ref_1002", db))
+    values = dict(payload.values)
+    values["pickup_address"] = "SHOULD NOT PERSIST"
+    before = asyncio.run(db.get_service_request("ref_1002"))["pickup_address"]
+
+    blocker = tmp_path / "blocker"      # a FILE where a directory would have to be,
+    blocker.write_text("x")             # so creating the output path cannot succeed
+    outcome = asyncio.run(
+        submit("ref_1002", values, db, attempt_id="att_fail",
+               from_state="outreach_in_progress", out_path=blocker / "out.pdf")
+    )
+    assert outcome.status == "failed"
+    assert asyncio.run(db.get_service_request("ref_1002"))["pickup_address"] == before

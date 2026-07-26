@@ -8,7 +8,10 @@ uvicorn[standard]>=0.29
 pydantic>=2.6
 
 # --- DB (the single vendor-facing layer: backend/db/supabase.py) ---
-asyncpg>=0.29
+asyncpg>=0.29             # tier 2 of make_db(): direct Postgres via DATABASE_URL
+supabase>=2.31            # tier 1 of make_db(): the REST/service_role path (supabase_api.py).
+                          # Imported lazily inside the adapter, so a missing install shows up
+                          # ONLY on a real-DB deploy — every test passes on the mock without it.
 
 # --- Agent / LLM ---
 anthropic>=0.40

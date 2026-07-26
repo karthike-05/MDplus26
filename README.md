@@ -15,8 +15,19 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 python run_demo.py      # headless end-to-end (PDF)
-pytest -q               # layered test suite (no DB / no browser needed)
+pytest -q               # layered suite — 81 tests, no DB / browser / network needed
+
+uvicorn backend.main:app --reload            # backend on :8000
+cd frontend && npm install && npm run dev    # UI on :5173
 ```
+
+Everything runs offline out of the box: with no `.env`, `make_db()` returns the fixture
+mock and `make_phone_call` records a visibly stubbed dispatch rather than dialing. Copy
+`.env.example` to `.env` only when you want the real DB or the live channel services.
+
+> **Cost guardrail:** Twilio and Retell calls cost money and are billed to the team.
+> Nothing in the test suite or `run_demo.py` can trigger one — `tests/conftest.py` clears
+> the channel-service URLs so an ambient `.env` can't turn a unit test into a live call.
 
 ## Layout
 
@@ -52,7 +63,7 @@ A referral can be submitted to a service by **form**, **email**, or **phone**. T
 are interchangeable because of two shared contracts — not shared code:
 
 - **Every tool returns the same `ToolOutcome`** (`contracts/models.py`) and writes one
-  `outreach_attempts` row. Signature for all of them:
+  row to the shared `attempts` log. Signature for all of them:
   `tool(referral_id, db, *, attempt_id, from_state) -> ToolOutcome`.
 - **One scheduler** (`backend/orchestrator/scheduler.py`) reads `referrals.current_state`,
   picks the method (`outreach_channel` → `OUTREACH_TOOLS`), runs it, and advances state
@@ -78,15 +89,33 @@ DB remains the shared read/write bus for state and outreach history.
 `ReferralDB` (`backend/db/interface.py`) is the seam, and `make_db()` in
 `backend/main.py` picks the implementation from env — three tiers, same interface:
 
-1. `SUPABASE_URL` + `SUPABASE_SERVICE_KEY` → **Supabase REST API** (`supabase_api.py`).
+1. `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` → **Supabase REST API** (`supabase_api.py`).
    The **preferred** path: HTTPS/IPv4, service_role key, no DB-password/IPv6 friction.
-2. `SUPABASE_DB_URL` → direct Postgres via asyncpg (`supabase.py`).
+2. `DATABASE_URL` → direct Postgres via asyncpg (`supabase.py`).
 3. neither → the fixture **mock** (default; offline dev + tests).
 
 Column names live only in the `*_COLS` maps at the top of `supabase.py` (shared by both
-Supabase impls) — rename there to match the real schema; nothing upstream changes. The
-app **defaults to the mock** today; the real-DB path is built but parked pending schema
-freeze — see [`docs/integration-status.md`](docs/integration-status.md).
+Supabase impls) — rename there to match the real schema; nothing upstream changes. Those
+maps are **already aligned to the live schema** (verified 2026-07-26); a `None` value
+means the column doesn't exist and is annotated with where the value really comes from.
+
+The app **defaults to the mock**, which is also the Aug-2 demo path. Two things to know
+before flipping, both in [`docs/integration-status.md`](docs/integration-status.md):
+
+- **The live DB owns its own scheduler.** `advance_referral()` dispatches work to
+  components via `referral_actions`, and we are `karthik_form`
+  (`backend/orchestrator/actions.py`). So there are **two orchestrators** — ours offline,
+  theirs live. `MockReferralDB` mirrors `advance_referral` in Python so the same worker
+  code runs both ways.
+- **The live flow is currently blocked** upstream of us: nothing writes
+  `referral_service_candidates`, so referrals park at `status='ranking'`.
+
+### If you're picking this up fresh
+
+1. [`docs/integration-status.md`](docs/integration-status.md) — the pick-up doc:
+   architecture, the seam, blockers, env vars, deploy URLs, what to verify.
+2. [`docs/whats-left.md`](docs/whats-left.md) — **what's still required**, split into what
+   integration needs and what the product needs, each item with an owner.
 
 ## Scope
 
@@ -98,17 +127,22 @@ the tracking loop + check-in. See [`CLAUDE.md` §12](CLAUDE.md#12-demo-scope-rem
 
 ## Future tasks
 
-**Database integration** *(built, parked — pick-up in [`docs/integration-status.md`](docs/integration-status.md))*.
+**Database integration** *(built; the mock is the deliberate demo default — see [`docs/integration-status.md`](docs/integration-status.md))*.
 The app still defaults to the in-memory mock (`backend/db/mock.py`) — no DB, no network,
 resets on restart — which is the reliable path for the Aug-2 take. The real-DB adapter
 is **built and verified**: `backend/db/supabase_api.py` (Supabase REST API, the preferred
 path) plus the asyncpg `supabase.py`, both behind `ReferralDB` and selected by
-`make_db()`. **To go live:** apply `contracts/migrations/001_orchestration_bus.sql`,
-align the `*_COLS` maps to the canonical HSDS schema (`01_schema.sql`), set
-`SUPABASE_URL` + `SUPABASE_SERVICE_KEY` in `.env`, and smoke-test. The shared write
-contract is the outreach log + the `channel`/`status` enums — spec in
-[`docs/db-contract.md`](docs/db-contract.md); converge on the existing `attempts` table
-(see integration-status). Waiting on the shared schema to freeze.
+`make_db()`. The `*_COLS` maps are **already aligned** to the live schema.
+
+**To go live:** set `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` in `.env`, restart, and
+use the dashboard's **Use Supabase** button (or just start with them set). Then
+`python -m backend.scripts.db_introspect` to confirm what you're pointed at.
+
+> **Do NOT apply `contracts/migrations/001_orchestration_bus.sql`** — it is obsolete and
+> would damage the integration (a second owner of workflow state, and a forked outreach
+> log that starves the ranker). The file carries a banner explaining why. The only
+> migration we applied is `002_utilization_milestone.sql`. There is no `01_schema.sql`;
+> the live database is the source of truth, so read it with `db_introspect`.
 
 **Other open tasks** (details in [`CLAUDE.md` §13](CLAUDE.md#13-future-directions-post-aug-2),
 [`docs/integration-status.md`](docs/integration-status.md), and

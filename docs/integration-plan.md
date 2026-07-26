@@ -1,10 +1,21 @@
 # Integration plan — wiring Voice + Messaging into the loop
 
+> **⚠ Superseded in part (2026-07-26).** This document records the *HTTP-seam* design,
+> which is built and still how the Aug-2 offline demo runs. But the DB-bus convergence it
+> anticipates in its last section **already exists in the shared database**:
+> `advance_referral()` dispatches work to components through `referral_actions`, and we
+> are `karthik_form`. That is now the live integration path, implemented in
+> [`../backend/orchestrator/actions.py`](../backend/orchestrator/actions.py).
+>
+> **Read [`integration-status.md`](integration-status.md) for the current architecture.**
+> Keep this file for the HTTP-seam detail and the resolved decisions below, which remain
+> accurate.
+
 **Status:** inbound seam **built** (`backend/adapters/inbound.py`, tested in
 `tests/test_adapters.py`). Both teammate services are vendored into the tree as
 snapshots (`backend/call_agent/`, `backend/patient_comms/`) so everything runs from
 one repo; we import none of their code and edit none of their files. Remaining:
-outbound triggers (our tools → their HTTP endpoints) and DB-bus convergence.
+Messaging's outbound trigger, and seeding `form_templates`.
 
 ## What's built (the highest-value step)
 Two thin inbound adapter endpoints, both mapping a teammate's status vocab → our
@@ -45,32 +56,46 @@ in our frozen `{success, needs_human, failed}` set**, so a translation layer at 
 seam is mandatory (this is the #1 risk — without it, referrals stall or diverge).
 
 ## Voice — `origin/call_agent` (Retell, phone)
-- **What it is:** a stateless FastAPI receiver for a Retell voice agent. Routes:
+- **What it is:** a FastAPI service for a Retell voice agent, vendored into this repo
+  and deployed on Railway
+  (`https://md-catalyst-call-agent-production.up.railway.app`). Routes:
   `POST /log-call-outcome` (post-call webhook, unwraps Retell `args`), `GET
-  /lookup-patient-appointment`. Keyed on **`case_id`, not `referral_id`**. `db.py` is a
-  mock (TODO: Supabase). Retry/close/escalate logic is only specced in
-  `transportation_caller.md`, **unbuilt**. Deps: just fastapi/uvicorn (no Retell SDK,
-  no Procfile yet).
+  /lookup-service-request-details` (mid-call lookup), `POST /place-referral-call`
+  (places the outbound call — `booking_id` optional, resolved from `referral_id`
+  alone if omitted, 2026-07-24). Keyed on **`case_id`**, which carries our
+  `referral_id`'s value end-to-end. `db.py` talks to **real Supabase** via
+  `supabase-py` — not a mock. The 3-attempt retry cap + auto-escalation on
+  exhaustion is built (`db.py`'s `MAX_ATTEMPTS`, `next_attempt_number`,
+  `create_escalation`); the business-hours call-scheduling logic from
+  `transportation_caller.md` is still commented out / unbuilt (`main.py`'s
+  `_next_available_call_time` / `_delayed_call`). Deps: `fastapi`, `uvicorn`,
+  `httpx`, `python-dotenv`, `supabase`; has a `Procfile`.
 - **Status vocab:** `confirmed | ineligible | unavailable | callback_required |
   escalation_needed | alt_slot_offered` (the doc also uses `no_answer`, absent from the
-  code `Literal` — reconcile).
-- **INBOUND seam:** add `POST /api/voice/call-outcome` → map → `apply_inbound(channel="phone")`:
-  | voice status | our status | transition |
+  code `Literal` — our adapter 422s on it rather than silently swallowing it, see
+  `test_voice_unknown_status_is_422`).
+- **INBOUND seam — built:** `POST /api/voice/call-outcome` → `VOICE_STATUS_MAP`
+  (`backend/adapters/inbound.py`) → `apply_inbound(channel="phone")`:
+  | voice status | our status | transition (from `submitted`) |
   |---|---|---|
-  | `confirmed` | `success` | `outreach_in_progress → submitted` (see gap) |
-  | `alt_slot_offered` | `needs_human` | → `needs_human` |
-  | `ineligible` / `unavailable` / `escalation_needed` | `needs_human` / `failed` | → needs_human / escalated |
-  | `callback_required` / `no_answer` | `failed` (after retries) | → `escalated` |
-- **STATE-MACHINE GAP:** a phone `confirmed` is really the *org accepting* (our
-  `confirmed` milestone), but our machine lands phone outcomes at `submitted`. Decide:
-  add a phone-specific transition `outreach_in_progress + success → confirmed`, or accept
-  the extra hop.
-- **OUTBOUND seam:** our `make_phone_call` must dispatch the call — the Retell trigger is
-  unbuilt in the branch. Demo: call Retell directly. Prod: DB-bus.
+  | `confirmed` | `success` | → `confirmed` |
+  | `alt_slot_offered` / `ineligible` / `unavailable` / `callback_required` | `needs_human` | → `needs_human` |
+  | `escalation_needed` | `failed` | → `escalated` |
+- **STATE-MACHINE GAP — resolved** (see "Resolved open decisions" #1 above): phone
+  `confirmed` reuses the org-email path, `submitted → confirmed`, no phone-special
+  transition; `(submitted, needs_human) → needs_human` was added to `state_machine.py`
+  to cover the four `needs_human` statuses above.
+- **OUTBOUND seam — built (2026-07-24):** `make_phone_call` POSTs `{referral_id}` to
+  `call_agent`'s `POST /place-referral-call` (`CALL_AGENT_BASE_URL`); `booking_id` is
+  resolved server-side from `referral_id` alone. Unit-tested against a mocked HTTP
+  response (`tests/test_tools.py`); not yet run live (needs the same DB convergence as
+  the inbound seam — see `docs/integration-status.md`). Full writeup:
+  `backend/call_agent/integration_plan_call_agent.md`.
 - **Adapter:** `case_id → referral_id`, synthesize our deterministic `attempt_id`, pack
   `confirmation_id` / `pickup_window` / `offered_datetime` / transcript into `data`
   (jsonb — no new `outreach_attempts` columns needed).
-- **UI:** extend `frontend/src/ReferralDetail.jsx` `summarize()` for phone fields.
+- **UI:** extend `frontend/src/ReferralDetail.jsx` `summarize()` for phone fields —
+  still open, cosmetic only (`backend/call_agent/integration_plan_call_agent.md` §5).
 
 ## Messaging — `origin/patient_comms` (Twilio, Railway)
 - **What it is:** a **fully self-contained** patient SMS/WhatsApp microservice — own DB
@@ -108,6 +133,37 @@ seam is mandatory (this is the #1 risk — without it, referrals stall or diverg
 - **UI:** `summarize()` for SMS body / `stage` / `verification_response_raw`; optionally
   deep-link the message thread from their `GET /outreach/{id}`.
 
+## Ranking — `origin/service_ranking` (Data, upstream service selection)
+- **What it is:** a FastAPI service (three-layer scorer: hard filter → objective →
+  LLM subjective), vendored into this repo and deployed on Railway
+  (`https://md-catalyst-service-ranking-production.up.railway.app`). Routes:
+  `POST /rank-referral/{referral_id}` (runs all three layers, upserts
+  `ranking_results`, returns the SW-facing ranked list), `GET
+  /ranking-results/{referral_id}` (cached results, no re-run), `POST /sw-feedback`
+  (records the SW's chosen service + a label). Full algorithm writeup:
+  `backend/service_ranking/ranking_system_plan.md`.
+- **Fundamentally different shape than Voice/Messaging:** it's not an outreach
+  channel and never writes a `ToolOutcome` or touches `current_state` — it runs
+  **upstream**, before outreach begins (see "Ranking system — how it fits" in
+  `docs/integration-status.md`). So there's no inbound adapter / status-mapping
+  table here the way there is for Voice/Messaging above.
+- **PROXY seam — built (2026-07-24):** `backend/main.py` proxies three endpoints
+  (`POST /api/referrals/{id}/rank`, `GET /api/referrals/{id}/ranking`,
+  `POST /api/referrals/{id}/choose-service`) so our backend is the sole HTTP client
+  — the frontend never calls the Railway service directly, same pattern as
+  `make_phone_call` → `call_agent`. `choose-service` sets our own `service_id` via
+  the new `ReferralDB.set_referral_service(...)` and best-effort forwards the SW's
+  label to ranking's own `/sw-feedback`. Unit-tested against mocks
+  (`tests/test_service_ranking.py`); not yet run live (same DB convergence blocker
+  as Voice/Messaging above). Full writeup:
+  `backend/service_ranking/integration_plan_service_ranking.md`.
+- **CONTRACT TOUCH:** `referrals.need_category` (auto-derived from the chosen
+  service's `category` at creation, `backend/main.py`'s `_slugify_category`) — a
+  real column in the live HSDS schema that ranking reads directly, not previously
+  modeled in our mock/contract. See `docs/db-contract.md`.
+- **UI:** no frontend change this pass. The natural next step is a ranked-candidate
+  picker screen calling `choose-service` — deferred, not built.
+
 ## Highest-value next step
 Define the **two thin inbound adapter endpoints** (`/api/voice/call-outcome`,
 `/api/patient-comms/event`) with explicit status-mapping tables into
@@ -115,9 +171,23 @@ Define the **two thin inbound adapter endpoints** (`/api/voice/call-outcome`,
 keeping our scheduler the sole owner of `current_state`. Then: outbound triggers → UI
 `summarize()` rendering → DB-bus convergence with the Data workstream.
 
-## Open decisions (need a team call)
-1. **Phone `confirmed`:** jump straight to `confirmed`, or stay at `submitted`? (state machine)
-2. **Channel enum:** fold `sms` into `whatsapp`, or extend the frozen set?
-3. **Shared key:** reconcile `case_id` (Voice) / UUID (Messaging) ↔ our `referral_id`.
-4. **Outbound coupling:** HTTP calls (demo) vs. DB-as-bus (prod) — both services currently
-   use their own tables, so HTTP is the Aug-2 path, DB-bus the convergence.
+> **Update (2026-07-24):** Voice's outbound trigger is done (see the OUTBOUND seam
+> bullet above). Messaging's outbound trigger (`notify_patient` → `patient_comms`'s
+> `POST /outreach/start`) is still a stub — that's the remaining piece of "outbound
+> triggers" above. UI `summarize()` rendering and DB-bus convergence are both still open.
+
+## Open decisions
+
+Items 1–4 below are **resolved** (see "Resolved open decisions" above and, for 4, the
+banner at the top of this file: the DB bus turned out to already exist, so it is the live
+path and HTTP remains the offline one).
+
+The live open questions have moved to
+[`integration-status.md`](integration-status.md#open-questions-for-the-team). In short:
+
+1. **Who writes `referral_service_candidates`?** — `advance_referral()` reads it, Ranking
+   writes `ranking_results`, and nothing bridges them, so the live flow parks at
+   `status='ranking'`. This is the one blocker holding up an end-to-end live run.
+2. **`attempts.channel` has no value for a filled PDF** — we record PDFs as `email`.
+3. **Terminal status for "the patient used it"** — currently `completion_outcome`, since
+   widening the `referrals.status` CHECK constraint would affect every service.

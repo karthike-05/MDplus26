@@ -31,7 +31,56 @@ export const STATE_META = {
   escalated: { label: "Escalated", color: C.danger },
 };
 
-export const CHANNEL_LABEL = { form: "📄 Form", phone: "📞 Phone", text: "💬 Text", email: "✉️ Email" };
+// Covers BOTH vocabularies: ours (form/text) and the shared DB's (online_form/sms/
+// whatsapp), because attempt rows can come from either orchestrator (§7a).
+export const CHANNEL_LABEL = {
+  form: "📄 Form", online_form: "📄 Form", phone: "📞 Phone", email: "✉️ Email",
+  text: "💬 Text", sms: "💬 Text", whatsapp: "💬 WhatsApp", escalation: "⚠ Escalation",
+};
+
+// The PATIENT's own answers, kept visually separate from the service's (§7). Two
+// independent questions, and "not asked yet" is a real third answer for each — never
+// render a missing answer as a "no".
+const CONSENT_META = {
+  confirmed: { text: "Opted in ✓", color: C.ok },
+  pending: { text: "Awaiting opt-in", color: C.warn },
+  not_sent: { text: "Not asked", color: C.sub },
+  declined: { text: "Declined ✕", color: C.danger },
+};
+
+export function PatientResponse({ response }) {
+  if (!response) return <span style={{ color: C.sub }}>—</span>;
+  const consent = CONSENT_META[response.consent] || { text: response.consent, color: C.sub };
+  const used =
+    response.used_service === true ? { text: "Used it ✓", color: C.ok }
+    : response.used_service === false ? { text: "Didn’t use ✕", color: C.danger }
+    : { text: response.asked ? "Awaiting reply" : "Not asked yet", color: C.sub };
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 12 }}>
+      <span style={{ color: consent.color, fontWeight: 600 }}>{consent.text}</span>
+      <span style={{ color: used.color }}>{used.text}</span>
+    </div>
+  );
+}
+
+// Which channels were actually attempted — this is where all three services become
+// visible in one place: a failed phone attempt followed by a form attempt reads as two
+// chips, not one opaque status.
+export function ChannelsTried({ channels, count }) {
+  if (!channels?.length) return <span style={{ color: C.sub, fontSize: 12 }}>—</span>;
+  return (
+    <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
+      {channels.map((c) => (
+        <span key={c} style={{ border: `1px solid ${C.border}`, borderRadius: 999, padding: "2px 7px", fontSize: 11, color: C.ink, background: "#fff" }}>
+          {CHANNEL_LABEL[c] || c}
+        </span>
+      ))}
+      {count > channels.length && (
+        <span style={{ fontSize: 11, color: C.sub }}>·{count} attempts</span>
+      )}
+    </div>
+  );
+}
 
 export function Badge({ state }) {
   const m = STATE_META[state] || { label: state, color: C.sub };

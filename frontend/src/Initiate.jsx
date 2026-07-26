@@ -53,7 +53,7 @@ export default function Initiate({ preselectedServiceId, onDone, onCancel }) {
     call(async () => {
       const d = await api.findPatient(name, dob);
       if (d.found) { setPatient(d.patient); setDraft(null); }
-      else setDraft({ name, dob, phone: "", address: "", medicaid_id: "" });
+      else setDraft({ name, dob, phone: "", referring_clinic: "", address: "", medicaid_id: "" });
     });
 
   const createPatient = () =>
@@ -99,7 +99,11 @@ export default function Initiate({ preselectedServiceId, onDone, onCancel }) {
               <Field label="Medicaid ID"><input style={s.input} value={draft.medicaid_id} onChange={(e) => setDraft({ ...draft, medicaid_id: e.target.value })} /></Field>
             </Row>
             <Field label="Address"><input style={s.input} value={draft.address} onChange={(e) => setDraft({ ...draft, address: e.target.value })} /></Field>
-            <Btn disabled={busy} onClick={createPatient}>{busy ? "Saving…" : "Create patient"}</Btn>
+            {/* Phone + referring clinic are NOT NULL on the shared patients table, so
+                the button stays disabled until both are filled — a rejected insert
+                here would surface as an opaque 500. */}
+            <Field label="Referring clinic"><input style={s.input} value={draft.referring_clinic} onChange={(e) => setDraft({ ...draft, referring_clinic: e.target.value })} /></Field>
+            <Btn disabled={busy || !draft.phone.trim() || !draft.referring_clinic.trim()} onClick={createPatient}>{busy ? "Saving…" : "Create patient"}</Btn>
           </>
         )}
 

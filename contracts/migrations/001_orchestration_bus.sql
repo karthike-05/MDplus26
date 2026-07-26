@@ -1,4 +1,27 @@
--- 001_orchestration_bus.sql
+-- ############################################################################
+-- ##  OBSOLETE — DO NOT RUN THIS.  Kept only as a record of a wrong turn.    ##
+-- ############################################################################
+--
+-- Superseded 2026-07-26. This migration was written before we discovered that the
+-- shared DB **already owns an orchestrator**: `advance_referral()` decides each next
+-- step and queues work into `referral_actions` addressed to a component (we are
+-- `karthik_form`). See docs/integration-status.md and CLAUDE.md §7a.
+--
+-- Running it would actively damage the integration:
+--   * `referrals.current_state` would become a SECOND owner of workflow truth,
+--     competing with the `status` column advance_referral() maintains.
+--   * `outreach_attempts` would FORK the outreach history away from the shared
+--     `attempts` table, which the ranking system reads for its responsiveness score —
+--     starving the ranker of exactly the data it needs.
+--   * `attempt_id` + a UNIQUE index are unnecessary: their
+--     `referral_actions(referral_id, deduplication_key)` index already provides that
+--     idempotency (§10).
+--
+-- The only migration we actually applied is 002_utilization_milestone.sql.
+--
+-- ############################################################################
+--
+-- 001_orchestration_bus.sql  (original header follows, for context)
 -- Additive migration to make the shared Supabase DB the integration bus for the
 -- three agents (form / voice / text) + the UI, per docs/db-contract.md and
 -- docs/integration-status.md. Run once in the Supabase SQL Editor.

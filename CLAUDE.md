@@ -89,7 +89,9 @@ Incumbents (findhelp, Unite Us) *generate* referrals; our differentiator is **co
 │   ├─ models.py                   # FormSchema / FormField / ToolOutcome (Pydantic)
 │   └─ schemas/                    # one verified schema per form (web XOR pdf)
 │       ├─ transport_intake_pdf.json
-│       └─ transport_intake_web.json
+│       └─ food_assistance_pdf.json
+│                                  # NOTE: no *_web.json yet — the online-application
+│                                  # component is unbuilt (docs/whats-left.md B1)
 ├─ backend/
 │   ├─ main.py                     # FastAPI app + routes (to build)
 │   ├─ orchestrator/
@@ -147,6 +149,14 @@ class ReferralDB(Protocol):
     async def get_form_schema(self, form_id: str) -> FormSchema: ...
     async def record_attempt(self, outcome: ToolOutcome) -> None: ...
 ```
+
+> This has grown past three methods — [`backend/db/interface.py`](backend/db/interface.py)
+> is authoritative. Added since: intake (`find_patient`/`create_*`),
+> `set_referral_service`, the `service_requests` pair (§6a), and the action-queue four
+> (§7a). **Announce any addition**, and implement it on *all three* adapters: the
+> adapters subclass the Protocol, so a method you forget is inherited as `...` and
+> silently returns `None` instead of raising. `tests/test_actions.py::
+> test_no_adapter_silently_inherits_a_protocol_stub` is the guard against exactly that.
 
 > Methods are `async` to match the async-throughout backend (§3). The mock
 > satisfies the same signatures with no `await` inside — that's fine. Supabase
@@ -227,6 +237,32 @@ Boxes are positioned as `rect / pageSize * 100%`; `human_only` fields render as 
 
 **Cold path** (once per form: get the selectors/rects for an unseen form, human-verify) vs **warm path** (every fill: map → validate → review → inject) is unchanged by target. For the demo, schemas are hand-authored; extraction is the Aug 17 stretch.
 
+### 6a. Where a field's value comes from — `service_requests`
+
+A field's `source` resolves against three roots: `patient.*`, `referral.*`, and
+`service_request.*`. That third one is the shared **`service_requests`** row —
+`pickup_address`, `destination_address`, `requested_date`, `requested_start_time`,
+`mobility_requirements` — which **Voice reads too**. Trip-specific values live there
+rather than being duplicated onto the referral, and `submit()` writes the reviewed
+values *back* to it, so a reviewer's correction is visible to every other component and
+not trapped in the PDF.
+
+The write-back maps values using each field's own `source` **in reverse**, so the schema
+JSON stays the single place the correspondence is declared and a new field needs no code
+change. It only writes on a *successful* injection — a failed submit must never leave the
+shared row claiming values that were never sent.
+
+Two traps this avoids: `patients` has **no street-address column** (only
+`postal_code`/`county`/lat-long; the `addresses` table is keyed by `location_id`, i.e.
+service locations), and `referrals` has no appointment columns. Sourcing from either
+would have produced silently **blank** fields, not errors.
+
+**Two form components.** The **PDF** half is built; the **online application** half
+(filling a service's real web form) is not. Both enter through the same
+`prepare` → review → `submit` flow because the Injector is chosen by
+`schema.target_type` — the only thing that differs is which `attempts.channel` the
+result is recorded under (§7a).
+
 ---
 
 ## 7. The state machine (how it all connects)
@@ -259,6 +295,33 @@ The second is the referral-completion loop closing — the differentiator (§12)
 
 The **scheduler** is the only place transitions happen: read `current_state` + latest outcomes → pick one tool (or none, if waiting) → run it → advance via `next_state(from_state, status)`. Transitions key on **(from_state, status)** — the scheduler already knows `from_state`, so the generic status vocabulary is enough to disambiguate one tool serving several states (e.g. `notify_patient` for both consent and check-in). Keep this loop small and readable; it's the spine of the demo.
 
+### 7a. TWO orchestrators — know which one you're in
+
+Everything above describes the **offline** path. The shared Supabase DB ships its own
+scheduler, the `advance_referral()` plpgsql function, which decides the next step and
+queues a job into `referral_actions` addressed to a **component**. One of those
+components is **`karthik_form`** — us. Messaging already works this way
+(`backend/patient_comms/poller.py` polls for `twilio`), and so do we
+([`backend/orchestrator/actions.py`](backend/orchestrator/actions.py)).
+
+| | Offline / demo | Live / integrated |
+| --- | --- | --- |
+| Owns transitions | `orchestrator/scheduler.py` | `advance_referral()` in Postgres |
+| State | `referrals.current_state` (mock only) | `referrals.status` + `referral_actions` |
+| Entry point | `run_demo.py`, `/run` | the `actions.py` worker |
+
+`MockReferralDB` **mirrors** `advance_referral` in Python so the same worker code runs
+both ways — that mirror is what keeps them from drifting (`tests/test_actions.py`).
+
+> **Never add `referrals.current_state` to the shared DB, and never write our
+> vocabulary into their `referrals.status`.** Our state machine and theirs are parallel
+> implementations of the same decisions; a second state field would be a second owner
+> of truth. Their `referral_actions(referral_id, deduplication_key)` unique index
+> already gives us the idempotency `attempt_id` was for.
+
+Full walkthrough, the vocabulary translation, and the current blockers:
+[`docs/integration-status.md`](docs/integration-status.md).
+
 ---
 
 ## 8. How to add a new tool
@@ -284,11 +347,14 @@ You can finish a workstream before its dependencies exist.
 **Two fixtures, one pipeline.** Develop web and PDF simultaneously off the same `prepare()` / `submit()` flow:
 
 - **PDF:** `sample_forms/transport_intake_blank.pdf` (generated by `make_sample_pdf.py`) + `transport_intake_pdf.json`.
-- **Web:** `frontend/mock_form/index.html`, served locally, + `transport_intake_web.json`.
+- **Web:** ⚠ **not built yet.** `frontend/mock_form/` is empty and there is no
+  `transport_intake_web.json`, so `WebInjector` currently has no fixture and the L3 layer
+  below has nothing to run against. The plan is unchanged — a local page plus a web
+  schema, swapped for a real form later by editing `source_ref` + selectors with no code
+  change — but building it is open work (docs/whats-left.md B1):
   ```bash
-  python -m http.server 8000 --directory frontend/mock_form
+  python -m http.server 8000 --directory frontend/mock_form   # once it has an index.html
   ```
-  When Voice's real Vercel form exists, swap the web schema's `source_ref` + selectors — no code change.
 
 **Test in layers** (`tests/test_fill_form.py`):
 
@@ -326,7 +392,7 @@ uvicorn backend.main:app --reload           # backend
 python -m backend.scripts.make_sample_pdf   # regenerate the PDF fixture
 python run_demo.py                          # headless end-to-end
 pytest -q                                   # tests
-python -m http.server 8000 --directory frontend/mock_form   # serve the mock web form
+python -m http.server 8000 --directory frontend/mock_form   # mock web form (EMPTY — see §9)
 cd frontend && npm run dev                  # frontend
 supabase db push                            # apply contracts/db_schema.sql (when using the CLI)
 ```
@@ -335,8 +401,16 @@ supabase db push                            # apply contracts/db_schema.sql (whe
 
 | Scope | Keys |
 | --- | --- |
-| Backend | `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `ANTHROPIC_API_KEY`, `TWILIO_*`, `RETELL_API_KEY` |
-| Frontend | `SUPABASE_ANON_KEY` |
+| Backend | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `DATABASE_URL`, `ANTHROPIC_API_KEY`, `ALLOWED_ORIGINS`, `CALL_AGENT_BASE_URL`, `SERVICE_RANKING_BASE_URL` |
+| DDL only | `SUPABASE_ACCESS_TOKEN` (`sbp_…` Management API PAT — account-scoped, revocable) |
+| Frontend | `VITE_API_BASE` (inlined at **build** time), `SUPABASE_ANON_KEY` |
+| Theirs, not ours | `TWILIO_*` / `RETELL_*` live in Messaging's and Voice's own deploys — this backend never dials out |
+
+> Names match the sibling services deliberately, so one value pastes across all four
+> deploys: it's `SUPABASE_SERVICE_ROLE_KEY` (not `..._SERVICE_KEY`) and `DATABASE_URL`
+> (not `SUPABASE_DB_URL`). The **inbound** leg of each seam lives in *their* env —
+> `ORCHESTRATOR_BASE_URL`, `ORG_BACKEND_URL` — and unset they skip silently, which is
+> the most likely way a live run dies quietly. See `.env.example`.
 
 > The mapping step runs without `ANTHROPIC_API_KEY` (deterministic fallback) so the pipeline works offline.
 
@@ -365,9 +439,20 @@ Deferred on purpose — build only after the Aug-2 warm path is solid.
   `form_schemas`. This is the Aug-17 extraction stretch (§6 cold path, §3 Stagehand).
   Everything downstream (map → validate → review → inject) is already target-agnostic,
   so extraction only has to *produce a `FormSchema`* — no warm-path code changes.
-- **Real Supabase behind `ReferralDB`.** Swap `mock.py` for `supabase.py` (Data);
-  no tool code changes (§5a, §9).
-- **Web hero form + `WebInjector` live** against a self-hosted form (§6). No CAPTCHA,
-  no live third-party portal.
-- **Inbound webhooks for real** (org email parse, Twilio "Y") replacing the
-  simulated `apply_inbound` in `run_demo.py` (§7).
+- **Real Supabase behind `ReferralDB`.** ✅ Built — `supabase_api.py` (REST +
+  `service_role`, the stable path) and `supabase.py` (asyncpg). Column maps are aligned
+  to the live schema. Flip by setting `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`;
+  unset, `make_db()` returns the mock. Still gated on one blocker outside our control —
+  nothing writes `referral_service_candidates`, so the live flow parks at
+  `status='ranking'` (see [`docs/integration-status.md`](docs/integration-status.md)).
+- **The online-application form component.** The PDF half is built; filling a service's
+  real web form is not (§6a). `WebInjector` exists and works against
+  `frontend/mock_form/`. No CAPTCHA, no live third-party portal.
+- **Seed `form_templates`** from `contracts/schemas/*.json`. The live DB provisioned a
+  better-designed home for our schemas than the original `form_schemas` idea —
+  versioned, with verification provenance — and it's empty.
+- **Persist inbound events to `integration_events`.** Our adapters currently apply and
+  forget; that table is the durable webhook log.
+- **Inbound webhooks for real** (org email parse, Twilio "Y") replacing the simulated
+  `apply_inbound` in `run_demo.py` (§7). The Twilio leg already works in Messaging's
+  deploy; what's missing is `ORG_BACKEND_URL` pointing at us.

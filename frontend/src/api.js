@@ -1,6 +1,9 @@
 // Thin API client for the backend (backend/main.py). One place for all fetches.
 
-const API = "http://localhost:8000";
+// Vite inlines import.meta.env.VITE_* at BUILD time, so a deployed bundle needs
+// VITE_API_BASE set in the build environment — setting it at runtime does nothing.
+// Defaults to the local backend so `npm run dev` needs no config.
+const API = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
 async function j(path, opts) {
   const r = await fetch(API + path, opts);
@@ -11,13 +14,12 @@ const post = (path, body) =>
   j(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
 
 export const api = {
-  base: API,
   dashboard: () => j("/api/dashboard"),
+  dbMode: () => j("/api/db"),
+  setDbMode: (mode) => post("/api/db", { mode }),
   services: () => j("/api/services"),
-  service: (id) => j(`/api/services/${id}`),
   referral: (id) => j(`/api/referrals/${id}`),
   review: (id) => j(`/api/review/${id}`),
-  forms: () => j("/api/forms"),
   run: (id) => post(`/api/referrals/${id}/run`),
   inbound: (id, signal) => post(`/api/referrals/${id}/inbound`, { signal }),
   findPatient: (name, dob) =>
