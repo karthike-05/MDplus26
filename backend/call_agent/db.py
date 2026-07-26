@@ -58,6 +58,23 @@ def next_attempt_number(referral_id: str, service_id: str) -> int:
     return existing[0]["attempt_number"] + 1 if existing else 1
 
 
+def get_latest_booking_id(referral_id: str) -> str:
+    """Resolves booking_id from referral_id alone (mirrors trigger_call.py's manual
+    lookup) so /place-referral-call callers only need to know referral_id, matching
+    this service's stated contract (database_usage.md: "Receives: referral_id")."""
+    booking = (
+        _supabase.table("service_bookings")
+        .select("id")
+        .eq("referral_id", referral_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .single()
+        .execute()
+        .data
+    )
+    return booking["id"]
+
+
 def create_escalation(referral_id: str, reason_code: str, handoff_summary: str) -> dict:
     escalation = {
         "referral_id": referral_id,

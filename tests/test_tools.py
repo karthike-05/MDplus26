@@ -9,6 +9,7 @@ drifting apart as three people build them in parallel.
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from backend.db.mock import MockReferralDB
 from backend.orchestrator import scheduler
@@ -29,8 +30,26 @@ def _run(tool, from_state="outreach_in_progress"):
     return outcome, db
 
 
-def test_stubs_return_conforming_outcomes_and_record_once():
-    for tool in (notify_patient, make_phone_call, send_email):
+def _mock_call_agent_response(json_body):
+    """A fake httpx.Response for call_agent's /place-referral-call, so make_phone_call
+    tests never hit the real (deployed) network (CLAUDE.md §9: layered tests, no I/O)."""
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.json = MagicMock(return_value=json_body)
+    return response
+
+
+def _run_phone(monkeypatch, call_agent_json, from_state="outreach_in_progress"):
+    monkeypatch.setenv("CALL_AGENT_BASE_URL", "http://call-agent.test")
+    with patch(
+        "httpx.AsyncClient.post",
+        new=AsyncMock(return_value=_mock_call_agent_response(call_agent_json)),
+    ):
+        return _run(make_phone_call, from_state)
+
+
+def test_stubs_return_conforming_outcomes_and_record_once(monkeypatch):
+    for tool in (notify_patient, send_email):
         outcome, db = _run(tool)
         assert outcome.status in VALID_STATUS, tool.__name__
         assert outcome.channel in VALID_CHANNEL, tool.__name__
@@ -38,12 +57,46 @@ def test_stubs_return_conforming_outcomes_and_record_once():
         assert outcome.referral_id == "ref_1001"
         assert db.attempts["att_x"] is outcome            # recorded exactly once (§8)
 
+    outcome, db = _run_phone(monkeypatch, {"call_id": "call_123"})
+    assert outcome.status in VALID_STATUS, "make_phone_call"
+    assert outcome.channel in VALID_CHANNEL, "make_phone_call"
+    assert outcome.attempt_id == "att_x"
+    assert outcome.referral_id == "ref_1001"
+    assert db.attempts["att_x"] is outcome
+
 
 def test_notify_patient_intent_depends_on_state():
     consent, _ = _run(notify_patient, from_state=sm.CREATED)
     checkin, _ = _run(notify_patient, from_state=sm.CONFIRMED)
     assert consent.data["intent"] == "consent_request"
     assert checkin.data["intent"] == "utilization_check_in"
+
+
+# --- make_phone_call: dispatch to call_agent (backend/call_agent/) over HTTP -----
+
+def test_make_phone_call_success_when_call_placed(monkeypatch):
+    outcome, _ = _run_phone(monkeypatch, {"call_id": "call_123"})
+    assert outcome.status == "success"
+    assert outcome.data["placed"] is True
+
+
+def test_make_phone_call_escalated_maps_to_failed(monkeypatch):
+    """call_agent's own 3-attempt cap already exhausted (backend/call_agent/db.py
+    MAX_ATTEMPTS) — nothing left to wait for, so this must not read as "success"."""
+    outcome, _ = _run_phone(monkeypatch, {"escalated": True, "reason": "max_attempts_exceeded"})
+    assert outcome.status == "failed"
+    assert outcome.data["escalated"] is True
+
+
+def test_make_phone_call_requires_base_url(monkeypatch):
+    monkeypatch.delenv("CALL_AGENT_BASE_URL", raising=False)
+    db = MockReferralDB()
+    try:
+        asyncio.run(make_phone_call("ref_1001", db, attempt_id="att_x", from_state="outreach_in_progress"))
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("expected KeyError when CALL_AGENT_BASE_URL is unset")
 
 
 # --- Channel selection: OUTREACH_IN_PROGRESS picks the right submission method ---
@@ -59,11 +112,16 @@ def test_outreach_channel_selects_tool():
     assert scheduler.tool_name_for(sm.CREATED, r_phone) == "notify_patient"
 
 
-def test_scheduler_dispatches_phone_method():
-    db = MockReferralDB()
-    rid = asyncio.run(db.create_referral("pat_001", "transport_intake", outreach_channel="phone"))
-    asyncio.run(db.set_state(rid, sm.OUTREACH_IN_PROGRESS))
-    tools = {"make_phone_call": make_phone_call}   # only the phone method registered
-    out = asyncio.run(scheduler.tick(rid, db, tools))
+def test_scheduler_dispatches_phone_method(monkeypatch):
+    monkeypatch.setenv("CALL_AGENT_BASE_URL", "http://call-agent.test")
+    with patch(
+        "httpx.AsyncClient.post",
+        new=AsyncMock(return_value=_mock_call_agent_response({"call_id": "call_123"})),
+    ):
+        db = MockReferralDB()
+        rid = asyncio.run(db.create_referral("pat_001", "transport_intake", outreach_channel="phone"))
+        asyncio.run(db.set_state(rid, sm.OUTREACH_IN_PROGRESS))
+        tools = {"make_phone_call": make_phone_call}   # only the phone method registered
+        out = asyncio.run(scheduler.tick(rid, db, tools))
     assert out is not None and out.channel == "phone"
     assert asyncio.run(db.get_referral(rid))["current_state"] == sm.SUBMITTED

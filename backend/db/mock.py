@@ -71,6 +71,10 @@ class MockReferralDB:
         # the stored dict is the single source of truth for current_state.
         self._referrals[referral_id]["current_state"] = state
 
+    async def set_referral_service(self, referral_id: str, service_id: str, **fields) -> None:
+        self._referrals[referral_id]["service_id"] = service_id
+        self._referrals[referral_id].update(fields)
+
     # --- Intake front door -------------------------------------------------
 
     async def find_patient(self, name: str, dob: str) -> dict | None:
