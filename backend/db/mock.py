@@ -203,6 +203,33 @@ class MockReferralDB:
             return {"state": "waiting", "reason": "An action is already open"}
 
         status = r.get("status", "not_started")
+
+        # MILESTONE 2 — mirrors contracts/migrations/002_utilization_milestone.sql.
+        # `enrolled` only means the service accepted; whether the patient actually used
+        # the resource is the separate, later signal (§7) and the one the pitch turns on.
+        # Must precede the terminal check, which would otherwise return early.
+        if status == "enrolled" and (r.get("completion_outcome") or "") not in (
+            "patient_confirmed_utilization", "patient_did_not_utilize"
+        ):
+            used = r.get("patient_confirmed_utilization")
+            if used is True:
+                r["completion_outcome"] = "patient_confirmed_utilization"
+                return {"state": "utilization_confirmed",
+                        "reason": "Patient confirmed they used the service"}
+            if used is False:
+                r.update(status="escalated", completion_outcome="patient_did_not_utilize",
+                         escalation_reason="Patient reported they did not use the service")
+                aid = await self.queue_action(
+                    referral_id, r.get("service_id"), "escalate_to_social_worker",
+                    "social_worker", f"escalate:not_utilized:{referral_id}",
+                    "Patient reported they did not use the service")
+                return {"state": "escalated", "action_id": aid}
+            aid = await self.queue_action(
+                referral_id, r.get("service_id"), "confirm_service_utilization", "twilio",
+                f"utilization:{referral_id}",
+                "Service accepted; confirm the patient actually used the resource")
+            return {"state": "awaiting_utilization", "action_id": aid}
+
         if status in ("enrolled", "failed", "escalated"):
             return {"state": status, "reason": "Terminal referral state"}
 

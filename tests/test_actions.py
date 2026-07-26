@@ -166,3 +166,49 @@ def test_no_adapter_silently_inherits_a_protocol_stub():
             own |= set(klass.__dict__)
         missing = sorted(m for m in required if m not in own)
         assert not missing, f"{cls.__name__} inherits Protocol stubs: {missing}"
+
+
+# --- Milestone 2: the patient actually used the service ----------------------
+# Mirrors contracts/migrations/002_utilization_milestone.sql, which is applied to the
+# live DB. These three cases were also verified against real Postgres inside a
+# rolled-back transaction; keeping them here is what stops the port from drifting.
+
+def _enrolled_db():
+    db = MockReferralDB()
+    db._patients["pat_001"]["consent_status"] = "confirmed"
+    db._referrals["ref_1001"].update(
+        status="enrolled", completion_outcome="resource_enrollment_confirmed")
+    return db
+
+
+def test_enrolled_without_a_utilization_answer_asks_the_patient():
+    """`enrolled` means the SERVICE accepted. Until the patient answers, the referral is
+    not closed — and the check-in is now driven by the shared bus, not only Messaging's
+    internal timers."""
+    db = _enrolled_db()
+    out = asyncio.run(db.advance_referral("ref_1001"))
+    assert out["state"] == "awaiting_utilization"
+    queued = asyncio.run(db.list_ready_actions("twilio"))
+    assert [a["action_type"] for a in queued] == ["confirm_service_utilization"]
+
+
+def test_confirmed_utilization_closes_the_referral():
+    db = _enrolled_db()
+    db._referrals["ref_1001"]["patient_confirmed_utilization"] = True
+    out = asyncio.run(db.advance_referral("ref_1001"))
+    assert out["state"] == "utilization_confirmed"
+    assert db._referrals["ref_1001"]["completion_outcome"] == "patient_confirmed_utilization"
+    # and it settles: a second pass reports the terminal state, doesn't re-fire
+    assert asyncio.run(db.advance_referral("ref_1001"))["state"] == "enrolled"
+
+
+def test_denied_utilization_escalates_to_a_human():
+    """The service accepted but the patient never got the help — exactly the case a
+    social worker must chase, so it must not read as a success."""
+    db = _enrolled_db()
+    db._referrals["ref_1001"]["patient_confirmed_utilization"] = False
+    out = asyncio.run(db.advance_referral("ref_1001"))
+    assert out["state"] == "escalated"
+    assert db._referrals["ref_1001"]["completion_outcome"] == "patient_did_not_utilize"
+    assert [a["action_type"] for a in asyncio.run(db.list_ready_actions("social_worker"))] == \
+        ["escalate_to_social_worker"]
