@@ -89,7 +89,9 @@ function ReviewLoader({ id, onBack }) {
           const d = await api.submit(id, vals);
           const o = d.outcome || {};
           if (o.status === "success") {
-            alert(`Submitted ✅  filled ${o.data?.filled_fields?.length ?? 0} fields → ${o.state}`);
+            // The new state is on the response, not the outcome — fill_form never
+            // mutates current_state (§7); the route advances it after submit.
+            alert(`Submitted ✅  filled ${o.data?.filled_fields?.length ?? 0} fields → ${d.state}`);
             onBack();
           } else {
             alert(`Not submitted (${o.status}). Check: ${Object.keys(o.data?.problems || {}).join(", ")}`);

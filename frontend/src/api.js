@@ -14,13 +14,10 @@ const post = (path, body) =>
   j(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
 
 export const api = {
-  base: API,
   dashboard: () => j("/api/dashboard"),
   services: () => j("/api/services"),
-  service: (id) => j(`/api/services/${id}`),
   referral: (id) => j(`/api/referrals/${id}`),
   review: (id) => j(`/api/review/${id}`),
-  forms: () => j("/api/forms"),
   run: (id) => post(`/api/referrals/${id}/run`),
   inbound: (id, signal) => post(`/api/referrals/${id}/inbound`, { signal }),
   findPatient: (name, dob) =>

@@ -7,13 +7,16 @@ missing an appointment time on purpose, so the review screen has a genuine
 
 from __future__ import annotations
 
-# Field keys match the schema `source` paths: patient.<key> / referral.<key>.
+# Field keys match the schema `source` paths: patient.<key> / referral.<key>. The trip
+# fields (address, appointment_*) are read via the `service_request` root instead — the
+# mock derives that row from these fixtures (backend/db/mock.py).
 
 PATIENTS: dict[str, dict] = {
     "pat_001": {
         "id": "pat_001",
         "name": "Maria Gonzalez",
         "dob": "03/12/1958",                       # non-ISO on purpose; mapper normalizes
+        "referring_clinic": "CommUnityCare Hancock",  # live: patients.referring_clinic_name
         "phone": "5127654321",                     # raw digits; mapper formats
         "address": "1420 E Cesar Chavez St, Austin, TX 78702",
         "medicaid_id": "TX-4471-9920",
@@ -24,6 +27,7 @@ PATIENTS: dict[str, dict] = {
         "id": "pat_002",
         "name": "James Whitfield",
         "dob": "1971-11-02",
+        "referring_clinic": "People's Community Clinic",
         "phone": "(512) 900-1188",
         "address": "907 W 21st St, Austin, TX 78705",
         "medicaid_id": "TX-8830-1145",

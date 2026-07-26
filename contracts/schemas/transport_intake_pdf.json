@@ -50,7 +50,7 @@
     {
       "name": "home_address",
       "fill_policy": "review",
-      "source": "service_request.pickup_address",
+      "source": "patient.address",
       "required": true,
       "maxlength": 80,
       "page": 1,
@@ -149,7 +149,7 @@
     {
       "name": "referring_clinic",
       "fill_policy": "auto",
-      "source": "referral.referring_clinic",
+      "source": "patient.referring_clinic",
       "required": true,
       "maxlength": 60,
       "page": 1,

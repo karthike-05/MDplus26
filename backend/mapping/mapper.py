@@ -14,7 +14,7 @@ from datetime import datetime
 
 from contracts.models import FormField
 
-Sources = dict[str, dict]  # {"patient": {...}, "referral": {...}}
+Sources = dict[str, dict]  # {"patient": {...}, "referral": {...}, "service_request": {...}}
 
 
 def resolve(source: str | None, sources: Sources):
