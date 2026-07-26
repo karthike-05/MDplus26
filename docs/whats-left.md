@@ -194,6 +194,57 @@ forgotten adapter method and a silent `None` in production.
 
 ---
 
+## Who has to do what
+
+Same items, grouped by owner. Roles per `CLAUDE.md` §4.
+
+### Data / Ranking
+| # | Task | Why it matters |
+| --- | --- | --- |
+| **A1** | Write `referral_service_candidates` from `ranking_results` (`passed_hard_filter=true`) | 🔴 **Nothing live moves without it.** Every referral parks at `status='ranking'`. |
+| A2 | Confirm what `assigned_component='backend'` means — your service, or ours? | We'd build the wrong thing, or duplicate yours. Blocks A2. |
+| A9 | Decide whether `attempts.channel` gets a value for a filled PDF | We record PDFs as `email`; the DB can't tell that from a plain email, which skews channel-exhaustion. |
+| B10 | Decide on a terminal `referrals.status` for "patient used it" | Today it's free-text `completion_outcome`; widening the CHECK constraint affects everyone. |
+| B11 | Wire `sw_feedback` embeddings + retrieval | Ranking can't learn from social-worker corrections until then. |
+
+### Voice
+| # | Task | Why it matters |
+| --- | --- | --- |
+| **A7** | Set `ORCHESTRATOR_BASE_URL` in call_agent's Railway env | 🔴 Unset it **skips silently** — the referral parks and the loop looks stalled with no error. |
+| A4 | Decide: poll `referral_actions` for `retell`, or keep our direct HTTP dispatch | Right now `contact_service_by_phone` actions are never claimed. If you stay on HTTP, write `attempts` rows so the DB's 3-attempt cap and `try_next_resource` can see the calls. |
+| A3 | Call `advance_referral(referral_id)` after finishing a call | Otherwise the chain stops dead after every phone step. |
+
+### Messaging
+| # | Task | Why it matters |
+| --- | --- | --- |
+| **A7** | Set `ORG_BACKEND_URL` in patient_comms' Railway env | 🔴 Same silent-skip failure as above. |
+| **A3** | Call `advance_referral(referral_id)` after completing an action | You claim and complete actions correctly but never advance — so the referral sits there. |
+| A10 | Confirm whether `notify_patient` should dispatch to you directly, or leave it to the bus | Doing both would double-message a patient. |
+| — | Check Railway billing (Usage/Billing) | Likely trial credit; **services suspend when it runs out.** |
+
+### Form-fill (us)
+| # | Task | Why it matters |
+| --- | --- | --- |
+| **A2** | Service `backend`-addressed actions, once ownership is confirmed | 🔴 One unserviced `select_resource` row **deadlocks** its referral via the open-action guard. |
+| **A5** | Give the worker a runner (background task or endpoint) + crash recovery | `run_once()` exists but nothing calls it on a loop; a crash leaves a row `in_progress` forever. |
+| A6 | Seed `form_templates` from `contracts/schemas/*.json` | The table is provisioned and empty. |
+| A8 | Make our backend reachable (Railway service or tunnel) | Inbound can't reach us otherwise. |
+| A11 | Verify the demo referral's service has an `online_form` channel | Or it never routes to us. |
+| A12 | Persist inbound events to `integration_events` | Dropped/duplicate webhooks are currently untraceable. |
+| B1 | Build the online-application component + its `mock_form` fixture and web schema | The PDF half is built; this half is what most services need. |
+| B2 | An escalations queue in the UI | `escalate_to_social_worker` actions are queued and **unclaimable** — a product hole. |
+| B3 | Wire a provider behind `send_email` | One of the three advertised channels. |
+| B4, B8, B9, B12 | Cold path; observability; retry/dead-letter; live-mode tests | Post-Aug-2 hardening. |
+
+### Whole team (decide together, quickly)
+| # | Decision |
+| --- | --- |
+| **A1+A2+A3** | *Who drives the queue, and who owns `backend`?* One conversation; nothing live works until it's answered, and each piece is cheap once it is. |
+| B5 | Where a patient's street address lives — no column exists, so `food_assistance`'s `home_address` renders blank. |
+| B7 | Auth / RBAC / audit before any real PHI touches this. |
+
+---
+
 ## Suggested order
 
 1. **A1 + A2 + A3 together** — they're one conversation ("who drives the queue, and who
