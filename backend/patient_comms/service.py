@@ -4,32 +4,43 @@ scheduler (scheduler.py). Keeping the send logic here -- instead of inline in
 the endpoints -- means the scheduler can fire reminders/verification without
 importing the FastAPI app, and every outbound message is logged the same way.
 
-Flow: consent -> [agent books] -> booking details -> reminder -> verification.
+Patient/clinic/resource/booking data is no longer stored on PatientOutreach --
+it's read live from Gyan's shared tables via repo.py (get_patient_for_referral,
+get_booking_details) and passed in here as a plain context dict at send time.
+This module never talks to the shared tables directly.
 """
 import os
-from datetime import datetime
 
-from models import ConsentStatus, Message, PatientOutreach
+from models import Message, PatientOutreach
 
-
-def _render(outreach: PatientOutreach, template_key: str, **extra: str) -> str:
-    from templates import render_template
-
-    return render_template(
-        template_key,
-        patient_name=outreach.patient_name,
-        org_name=outreach.org_name,
-        service_type=outreach.service_type,
-        **extra,
-    )
+# Templates that are the FIRST contact to a patient who hasn't messaged us.
+# On WhatsApp these must go out as a Meta-approved template (freeform first
+# contact is blocked); SMS/mock ignore this and send the plain body.
+_FIRST_CONTACT = {"consent"}
 
 
-def _send(outreach: PatientOutreach, template_key: str, **extra: str) -> str:
-    from providers import get_sms_provider
+def get_sms_provider():
+    from providers import get_sms_provider as _g
 
-    body = _render(outreach, template_key, **extra)
-    get_sms_provider().send_message(outreach.patient_phone, body)
-    return body
+    return _g()
+
+
+def compose_details(booking: dict | None) -> str:
+    """Deterministic booking string from the shared VIEW fields. No LLM."""
+    if not booking:
+        return "Details to follow."
+    parts: list[str] = []
+    start = booking.get("scheduled_start_at")
+    if start:
+        parts.append(f"Scheduled for {start.strftime('%a %b %-d, %-I:%M %p')}.")
+    if booking.get("pickup_address"):
+        parts.append(f"Pickup: {booking['pickup_address']}.")
+    if booking.get("patient_instructions"):
+        note = booking["patient_instructions"].strip()
+        parts.append(note if note.endswith(".") else note + ".")
+    if booking.get("confirmation_number"):
+        parts.append(f"Confirmation: {booking['confirmation_number']}.")
+    return " ".join(parts) if parts else "Details to follow."
 
 
 def log_message(session, outreach: PatientOutreach, direction: str, stage: str, body: str) -> None:
@@ -39,115 +50,35 @@ def log_message(session, outreach: PatientOutreach, direction: str, stage: str, 
     )
 
 
-def _compose_details(outreach: PatientOutreach) -> str:
-    """Assemble the human-readable booking details from the structured fields
-    the agentic layer provided. Deterministic string-building in code -- no LLM,
-    no freeform text. Only the fields that are present appear."""
-    parts: list[str] = []
-    if outreach.appointment_at:
-        # e.g. "Scheduled for Tue Mar 3, 2:00 PM."
-        parts.append(f"Scheduled for {outreach.appointment_at.strftime('%a %b %-d, %-I:%M %p')}.")
-    if outreach.appointment_location:
-        parts.append(f"Location: {outreach.appointment_location}.")
-    if outreach.confirmation_code:
-        parts.append(f"Confirmation: {outreach.confirmation_code}.")
-    if outreach.instructions:
-        note = outreach.instructions.strip()
-        parts.append(note if note.endswith(".") else note + ".")
-    return " ".join(parts) if parts else "Details to follow."
+def send_templated(session, outreach: PatientOutreach, template_key: str, ctx: dict, stage: str, **extra) -> str:
+    """Render `template_key` from the live context dict (patient/clinic/resource/
+    service_type pulled from `ctx`, plus any extra slots like `details`), send it
+    via the configured SMS provider, log it to the thread, and return the body.
+    Does not commit -- the caller decides transaction boundaries."""
+    from templates import render_template
 
-
-def start_outreach(
-    session,
-    *,
-    referral_id: str,
-    patient_phone: str,
-    patient_name: str,
-    org_name: str,
-    service_type: str,
-) -> PatientOutreach:
-    """Create the outreach row and send the consent request. Commits."""
-    outreach = PatientOutreach(
-        referral_id=referral_id,
-        patient_phone=patient_phone,
-        patient_name=patient_name,
-        org_name=org_name,
-        service_type=service_type,
-    )
-    # Consent is business-initiated first contact. On WhatsApp that requires an
-    # approved template for a recipient who hasn't messaged us (set
-    # WHATSAPP_CONSENT_CONTENT_SID). SMS/mock ignore the SID and send freeform.
-    from providers import get_sms_provider
-
-    body = _render(outreach, "consent")
-    get_sms_provider().send_template(
-        outreach.patient_phone,
-        os.environ.get("WHATSAPP_CONSENT_CONTENT_SID"),
-        {"1": outreach.patient_name, "2": outreach.org_name, "3": outreach.service_type},
-        body,
-    )
-    outreach.consent_status = ConsentStatus.SENT
-    outreach.consent_requested_at = datetime.utcnow()
-    session.add(outreach)
-    session.flush()  # populate outreach.id before logging the message
-    log_message(session, outreach, "outbound", "consent", body)
-    session.commit()
-    session.refresh(outreach)
-    return outreach
-
-
-def record_booking(
-    session,
-    outreach: PatientOutreach,
-    *,
-    appointment_at: datetime | None = None,
-    appointment_location: str | None = None,
-    confirmation_code: str | None = None,
-    instructions: str | None = None,
-) -> str:
-    """The agentic layer calls this once it has booked the resource: store the
-    details and text them to the patient. Commits."""
-    outreach.appointment_at = appointment_at
-    outreach.appointment_location = appointment_location
-    outreach.confirmation_code = confirmation_code
-    outreach.instructions = instructions
-    body = _send(outreach, "booking_details", details=_compose_details(outreach))
-    outreach.booking_notified_at = datetime.utcnow()
-    log_message(session, outreach, "outbound", "booking", body)
-    session.commit()
-    return body
-
-
-def send_reminder(session, outreach: PatientOutreach) -> str:
-    """Informational reminder ahead of the appointment. Commits."""
-    body = _send(outreach, "reminder", details=_compose_details(outreach))
-    outreach.reminder_sent_at = datetime.utcnow()
-    log_message(session, outreach, "outbound", "reminder", body)
-    session.commit()
-    return body
-
-
-def send_verification(session, outreach: PatientOutreach) -> str:
-    """The 'did you actually use it?' check-in after the appointment. Commits."""
-    body = _send(outreach, "verification")
-    outreach.verification_sent_at = datetime.utcnow()
-    log_message(session, outreach, "outbound", "verification", body)
-    session.commit()
-    return body
-
-
-def send_nudge(session, outreach: PatientOutreach) -> str:
-    """One retry if verification goes silent. Commits."""
-    body = _send(outreach, "no_response_nudge")
-    outreach.nudge_sent_at = datetime.utcnow()
-    log_message(session, outreach, "outbound", "nudge", body)
-    session.commit()
-    return body
-
-
-def send_ack(session, outreach: PatientOutreach, ack_key: str) -> str:
-    """Send a templated acknowledgment back after processing an inbound reply,
-    and log it to the thread. Does not commit -- the caller (webhook) does."""
-    body = _send(outreach, ack_key)
-    log_message(session, outreach, "outbound", "ack", body)
+    slots = {
+        "patient_name": ctx.get("patient_name", ""),
+        "clinic_name": ctx.get("clinic_name", ""),
+        "resource_name": ctx.get("resource_name", ""),
+        "service_type": ctx.get("service_type", ""),
+    }
+    slots.update(extra)
+    # render_template only consumes the slots the chosen template declares.
+    body = render_template(template_key, **slots)
+    provider = get_sms_provider()
+    if template_key in _FIRST_CONTACT:
+        # First contact -> send via the approved WhatsApp template (content_sid +
+        # variables). The variables map to the template's {{1}}/{{2}}/{{3}} =
+        # patient name / clinic / service type. Providers without a real template
+        # (SMS, mock) fall back to the freeform `body`.
+        provider.send_template(
+            outreach.patient_phone,
+            os.environ.get("WHATSAPP_CONSENT_CONTENT_SID"),
+            {"1": slots["patient_name"], "2": slots["clinic_name"], "3": slots["service_type"]},
+            body,
+        )
+    else:
+        provider.send_message(outreach.patient_phone, body)
+    log_message(session, outreach, "outbound", stage, body)
     return body

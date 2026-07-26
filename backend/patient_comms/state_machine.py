@@ -1,25 +1,34 @@
 """
-Turns an inbound SMS reply into a status update on the right
-PatientOutreach row. This is the closed-loop verification logic.
+Turns an inbound SMS reply into a routing decision for the webhook to apply.
+This is the closed-loop verification logic.
 
 Reply classification is pluggable (see classifiers.py): keyword-matching by
 default, or an LLM classifier (CLASSIFIER=llm) that understands replies the
 keyword set misses -- "I called but no one answered", "went yesterday", etc.
 Either way this module only ever consumes a ReplyClass label; it never sees a
 model prompt, and outbound text stays fully templated.
+
+`route_inbound` is a PURE function: given the outreach row's current `stage`
+and a classified reply, it returns a plain dict describing what to write and
+say back -- no DB access, no mutation. The webhook (main.py) is the only place
+that applies those writes, all on one transaction.
 """
-from datetime import datetime
 from enum import Enum
 
-from models import ConsentStatus, PatientOutreach, VerificationStatus
+from models import Stage
 
 
 class ReplyClass(str, Enum):
     STOP = "stop"
     YES = "yes"
     NO = "no"
-    NEEDS_HELP = "needs_help"  # tried but stuck / confused / asking for help
+    NEEDS_HELP = "needs_help"            # tried but stuck / confused
     UNCLEAR = "unclear"
+    RESCHEDULE = "reschedule"            # wants a different time
+    CANCEL = "cancel"                    # wants to cancel the service
+    APPOINTMENT_QUESTION = "appointment_question"  # asking when/where/details
+    ACCESSIBILITY_NEED = "accessibility_need"      # volunteers an access need
+    CHANNEL_PREFERENCE = "channel_preference"      # "call me instead"
 
 
 STOP_KEYWORDS = {"stop", "unsubscribe", "cancel", "end", "quit"}
@@ -48,84 +57,97 @@ def classify_response(text: str) -> ReplyClass:
     return get_classifier().classify(text)
 
 
-def current_stage(outreach: PatientOutreach) -> str:
-    """Figures out which stage an inbound reply should be routed to. Order
-    matters: the verification question (if open) wins; then consent; then the
-    'active' window (consent given, waiting on the appointment) so a reply like
-    'I can't make Tuesday' during booking/reminder still reaches a human."""
-    if outreach.verification_sent_at and not outreach.verification_response_at:
-        return "verification"
-    if outreach.consent_status == ConsentStatus.SENT:
+def routing_stage(outreach) -> str:
+    """Coarse reply-context derived from the fine patient_outreach.stage."""
+    s = outreach.stage
+    if s == Stage.CONSENT:
         return "consent"
-    if outreach.consent_status == ConsentStatus.CONFIRMED:
+    if s in (Stage.NOTIFIED, Stage.REMINDED):
         return "active"
-    return "none"  # nothing currently awaiting a reply
+    if s == Stage.VERIFYING:
+        return "verification"
+    return "none"  # awaiting_booking / done / escalated
 
 
-def handle_consent_reply(outreach: PatientOutreach, text: str) -> str:
-    """Returns the acknowledgment template key to send back."""
-    classification = classify_response(text)
-    if classification == ReplyClass.STOP:
-        outreach.consent_status = ConsentStatus.DECLINED
-        return "ack_declined"
-    if classification == ReplyClass.YES:
-        outreach.consent_status = ConsentStatus.CONFIRMED
-        outreach.consent_confirmed_at = datetime.utcnow()
-        return "ack_consent_confirmed"
-    # NO / NEEDS_HELP / UNCLEAR: leave as SENT and re-prompt. Consent is the one
-    # stage we shouldn't auto-resolve, so don't guess -- ask again.
-    return "ack_unclear"
+def _outcome(*, writeback=None, ack_key="ack_unclear", new_stage=None, finish_action=False,
+             escalation=None, escalation_reason=None, loop="continue", needs_booking_lookup=False):
+    return {"writeback": writeback, "ack_key": ack_key, "new_stage": new_stage,
+            "finish_action": finish_action, "escalation": escalation,
+            "escalation_reason": escalation_reason, "loop": loop,
+            "needs_booking_lookup": needs_booking_lookup}
 
 
-def handle_active_reply(outreach: PatientOutreach, text: str) -> str:
-    """Reply during the booking/reminder wait (before verification is sent).
-    These messages aren't a yes/no question -- an unprompted reply here is
-    usually a problem ('I can't make Tuesday', 'where is it again?'), so route
-    anything non-affirmative to a human."""
-    classification = classify_response(text)
-    if classification == ReplyClass.STOP:
-        outreach.consent_status = ConsentStatus.DECLINED
-        return "ack_declined"
-    if classification == ReplyClass.YES:
-        return "ack_received"  # "ok thanks" -- no action needed
-    # NO / NEEDS_HELP / UNCLEAR -> flag for a human to follow up.
-    outreach.verification_status = VerificationStatus.NEEDS_REVIEW
-    return "ack_needs_help"
+def route_inbound(outreach, reply_class, has_open_issue: bool = False) -> dict:
+    """Pure decision from (stage, intent, has_open_issue). No DB, no mutation.
 
+    E's BLOCKING INVARIANT: every terminal reply advances new_stage off
+    CONSENT/VERIFYING so Loop B doesn't double-message a responder.
+    """
+    stage = outreach.stage
+    rs = routing_stage(outreach)
+    ic = reply_class
 
-def handle_verification_reply(outreach: PatientOutreach, text: str) -> str:
-    classification = classify_response(text)
-    outreach.verification_response_raw = text
-    outreach.verification_response_at = datetime.utcnow()
+    # Opt-out always wins.
+    if ic == ReplyClass.STOP:
+        return _outcome(writeback="consent_declined", ack_key="ack_declined",
+                        new_stage=Stage.ESCALATED, finish_action=(stage == Stage.CONSENT),
+                        loop="stop")
 
-    if classification == ReplyClass.YES:
-        outreach.verification_status = VerificationStatus.VERIFIED_UTILIZED
-        return "ack_positive"
-    if classification == ReplyClass.NO:
-        outreach.verification_status = VerificationStatus.VERIFIED_NOT_UTILIZED
-        return "ack_received"
-    if classification == ReplyClass.STOP:
-        outreach.consent_status = ConsentStatus.DECLINED
-        outreach.verification_status = VerificationStatus.NEEDS_REVIEW
-        return "ack_declined"
-    if classification == ReplyClass.NEEDS_HELP:
-        outreach.verification_status = VerificationStatus.NEEDS_REVIEW
-        return "ack_needs_help"
-    # UNCLEAR -> a human should look, not an auto-verdict.
-    outreach.verification_status = VerificationStatus.NEEDS_REVIEW
-    return "ack_unclear"
+    # A positive reply while an issue is open clears the flag -- but ONLY at
+    # non-terminal stages. At consent/verification a YES is terminal (it must do
+    # the consent/utilization writeback + advance the stage, per E's invariant),
+    # so it must NOT be swallowed here as a flag-resolution.
+    if has_open_issue and ic == ReplyClass.YES and rs not in ("consent", "verification"):
+        return _outcome(ack_key="ack_resolved", escalation="resolve", loop="resume")
 
+    # Factual question at any stage -> answer from the booking.
+    if ic == ReplyClass.APPOINTMENT_QUESTION:
+        return _outcome(ack_key="answer_appointment", needs_booking_lookup=True)
 
-def route_inbound_reply(outreach: PatientOutreach, text: str) -> tuple[str, str | None]:
-    """Single entry point the webhook calls. Returns (stage, ack_key) -- the
-    stage that handled the reply (for logging) and the acknowledgment template
-    to send back (None if nothing was awaiting a reply)."""
-    stage = current_stage(outreach)
-    if stage == "consent":
-        return stage, handle_consent_reply(outreach, text)
-    if stage == "active":
-        return stage, handle_active_reply(outreach, text)
-    if stage == "verification":
-        return stage, handle_verification_reply(outreach, text)
-    # "none": nothing was awaiting a reply -- log and no-op upstream.
-    return stage, None
+    # Off-happy-path intents (stage-independent). Dedupe: don't re-open while one
+    # is already open -- just re-acknowledge.
+    _open = None if has_open_issue else "open"
+    if ic == ReplyClass.RESCHEDULE:
+        return _outcome(ack_key="ack_reschedule", escalation=_open,
+                        escalation_reason=(None if has_open_issue else "reschedule_requested"),
+                        loop="pause")
+    if ic == ReplyClass.CANCEL:
+        return _outcome(ack_key="ack_cancel", escalation=_open,
+                        escalation_reason=(None if has_open_issue else "cancel_requested"),
+                        loop="pause")
+    if ic == ReplyClass.ACCESSIBILITY_NEED:
+        return _outcome(ack_key="ack_accessibility", escalation=_open,
+                        escalation_reason=(None if has_open_issue else "accessibility_need"))
+    if ic == ReplyClass.CHANNEL_PREFERENCE:
+        return _outcome(writeback="channel_preference", ack_key="ack_channel_preference",
+                        escalation=_open,
+                        escalation_reason=(None if has_open_issue else "channel_preference"))
+    if ic == ReplyClass.NEEDS_HELP:
+        return _outcome(ack_key="ack_problem", escalation=_open,
+                        escalation_reason=(None if has_open_issue else "patient_reported_problem"))
+
+    # Stage-specific yes/no.
+    if rs == "consent":
+        if ic == ReplyClass.YES:
+            return _outcome(writeback="consent_confirmed", ack_key="ack_consent_confirmed",
+                            new_stage=Stage.AWAITING_BOOKING, finish_action=True)
+        if ic == ReplyClass.NO:
+            return _outcome(writeback="consent_declined", ack_key="ack_declined",
+                            new_stage=Stage.ESCALATED, finish_action=True, loop="stop")
+        return _outcome(ack_key="ack_unclear")
+
+    if rs == "verification":
+        if ic == ReplyClass.YES:
+            return _outcome(writeback="utilized", ack_key="ack_positive", new_stage=Stage.DONE)
+        if ic == ReplyClass.NO:
+            # Didn't use the service = the unmet need this loop exists to close.
+            # Record it, answer done, and escalate for a human to re-engage
+            # (dedup if an issue is already open). Empathetic ack.
+            return _outcome(writeback="not_utilized", ack_key="ack_not_utilized",
+                            new_stage=Stage.DONE,
+                            escalation=(None if has_open_issue else "open"),
+                            escalation_reason=(None if has_open_issue else "service_not_utilized"))
+        return _outcome(ack_key="ack_unclear")
+
+    # active / none with a bare yes/no/unclear: nothing to answer -> ask again.
+    return _outcome(ack_key="ack_unclear")
