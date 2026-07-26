@@ -15,6 +15,8 @@ const post = (path, body) =>
 
 export const api = {
   dashboard: () => j("/api/dashboard"),
+  dbMode: () => j("/api/db"),
+  setDbMode: (mode) => post("/api/db", { mode }),
   services: () => j("/api/services"),
   referral: (id) => j(`/api/referrals/${id}`),
   review: (id) => j(`/api/review/${id}`),
