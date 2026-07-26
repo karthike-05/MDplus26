@@ -1,10 +1,21 @@
 # Integration plan — wiring Voice + Messaging into the loop
 
+> **⚠ Superseded in part (2026-07-26).** This document records the *HTTP-seam* design,
+> which is built and still how the Aug-2 offline demo runs. But the DB-bus convergence it
+> anticipates in its last section **already exists in the shared database**:
+> `advance_referral()` dispatches work to components through `referral_actions`, and we
+> are `karthik_form`. That is now the live integration path, implemented in
+> [`../backend/orchestrator/actions.py`](../backend/orchestrator/actions.py).
+>
+> **Read [`integration-status.md`](integration-status.md) for the current architecture.**
+> Keep this file for the HTTP-seam detail and the resolved decisions below, which remain
+> accurate.
+
 **Status:** inbound seam **built** (`backend/adapters/inbound.py`, tested in
 `tests/test_adapters.py`). Both teammate services are vendored into the tree as
 snapshots (`backend/call_agent/`, `backend/patient_comms/`) so everything runs from
 one repo; we import none of their code and edit none of their files. Remaining:
-outbound triggers (our tools → their HTTP endpoints) and DB-bus convergence.
+Messaging's outbound trigger, and seeding `form_templates`.
 
 ## What's built (the highest-value step)
 Two thin inbound adapter endpoints, both mapping a teammate's status vocab → our
@@ -165,9 +176,18 @@ keeping our scheduler the sole owner of `current_state`. Then: outbound triggers
 > `POST /outreach/start`) is still a stub — that's the remaining piece of "outbound
 > triggers" above. UI `summarize()` rendering and DB-bus convergence are both still open.
 
-## Open decisions (need a team call)
-1. **Phone `confirmed`:** jump straight to `confirmed`, or stay at `submitted`? (state machine)
-2. **Channel enum:** fold `sms` into `whatsapp`, or extend the frozen set?
-3. **Shared key:** reconcile `case_id` (Voice) / UUID (Messaging) ↔ our `referral_id`.
-4. **Outbound coupling:** HTTP calls (demo) vs. DB-as-bus (prod) — both services currently
-   use their own tables, so HTTP is the Aug-2 path, DB-bus the convergence.
+## Open decisions
+
+Items 1–4 below are **resolved** (see "Resolved open decisions" above and, for 4, the
+banner at the top of this file: the DB bus turned out to already exist, so it is the live
+path and HTTP remains the offline one).
+
+The live open questions have moved to
+[`integration-status.md`](integration-status.md#open-questions-for-the-team). In short:
+
+1. **Who writes `referral_service_candidates`?** — `advance_referral()` reads it, Ranking
+   writes `ranking_results`, and nothing bridges them, so the live flow parks at
+   `status='ranking'`. This is the one blocker holding up an end-to-end live run.
+2. **`attempts.channel` has no value for a filled PDF** — we record PDFs as `email`.
+3. **Terminal status for "the patient used it"** — currently `completion_outcome`, since
+   widening the `referrals.status` CHECK constraint would affect every service.

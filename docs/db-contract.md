@@ -95,16 +95,38 @@ and the "wait until the schema is frozen" rationale.
 
 ---
 
-## Reconciled with the live DB (2026-07-23)
-The live DB differs from the defaults above. The seam absorbs this — update the
-`*_COLS` maps; no upstream code moves. Key deltas (full table in `integration-status.md`):
+## Reconciled with the live DB (updated 2026-07-26)
 
-- **`patients`**: `dob` → `date_of_birth`; no `address` column; `medicaid_id` ≈
-  `insurance_member_id`.
-- **`referrals`**: **no `current_state`** (their `status` is different — don't reuse)
-  and **no `form_id`** → both added by the migration / derived from `need_category`.
-- **`services`** (table is `services`, not `social_services`): `website` → `url`;
-  `category` → `need_category`; **no contact-`phone` column** (gap for the phone
-  channel); no `preferred_channel`/`form_id` (derive from `need_category`).
-- **`outreach_attempts`**: does not exist yet → created by the migration. Voice's
-  `attempts` table is a different shape; we do not write it.
+**The maps are now aligned** — `python -m backend.scripts.db_introspect` reports
+`patients: OK` and `services: OK`. The sections above describe our *contract keys*; the
+right-hand side of each `*_COLS` map holds the real column. A `None` there means the
+column doesn't exist, annotated with where the value actually comes from.
+
+- **`patients`**: `dob` → `date_of_birth`; `medicaid_id` → `insurance_member_id`;
+  `referring_clinic` → `referring_clinic_name`. **No `address` column at all** — only
+  `postal_code`/`county`/lat-long, and the `addresses` table is keyed by `location_id`
+  (service locations, not homes). An INSERT must supply `name`, `phone` and
+  `referring_clinic_name` (NOT NULL, no default).
+- **`referrals`**: their `status` is the live orchestration field.
+  **`current_state` is deliberately NOT added** — see below.
+- **`services`** (the table is `services`, not `social_services`): `website` → `url`;
+  `category` → `need_category`. No `preferred_channel`/`form_id`/`phone` columns because
+  better ones exist: **`service_application_channels`** (channel + priority +
+  `application_url` + `channel_contact`) and **`form_templates`**.
+- **`attempts`** *is* the shared outreach log — `data` → `structured_result`, `error` →
+  `notes`, and our one `status` becomes their (`status`, `outcome`) pair. Never fork it:
+  the ranker reads it for responsiveness.
+- **`service_requests`** holds the trip payload a form fills, and Voice reads the same
+  row (CLAUDE.md §6a).
+
+### ⚠ Two things this document used to say, now reversed
+
+1. **Do not add `referrals.current_state`, and do not create `outreach_attempts`.** The
+   live DB owns a scheduler (`advance_referral()`) that dispatches through
+   `referral_actions`; a second state field would be a second owner of truth.
+   `001_orchestration_bus.sql` is **obsolete — do not run it.**
+2. **`attempt_id` + a UNIQUE constraint are not needed.** Their
+   `referral_actions(referral_id, deduplication_key)` unique index already provides that
+   idempotency.
+
+Architecture and blockers: [`integration-status.md`](integration-status.md).

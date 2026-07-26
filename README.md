@@ -15,8 +15,19 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 python run_demo.py      # headless end-to-end (PDF)
-pytest -q               # layered test suite (no DB / no browser needed)
+pytest -q               # layered suite — 76 tests, no DB / browser / network needed
+
+uvicorn backend.main:app --reload            # backend on :8000
+cd frontend && npm install && npm run dev    # UI on :5173
 ```
+
+Everything runs offline out of the box: with no `.env`, `make_db()` returns the fixture
+mock and `make_phone_call` records a visibly stubbed dispatch rather than dialing. Copy
+`.env.example` to `.env` only when you want the real DB or the live channel services.
+
+> **Cost guardrail:** Twilio and Retell calls cost money and are billed to the team.
+> Nothing in the test suite or `run_demo.py` can trigger one — `tests/conftest.py` clears
+> the channel-service URLs so an ambient `.env` can't turn a unit test into a live call.
 
 ## Layout
 
@@ -84,9 +95,25 @@ DB remains the shared read/write bus for state and outreach history.
 3. neither → the fixture **mock** (default; offline dev + tests).
 
 Column names live only in the `*_COLS` maps at the top of `supabase.py` (shared by both
-Supabase impls) — rename there to match the real schema; nothing upstream changes. The
-app **defaults to the mock** today; the real-DB path is built but parked pending schema
-freeze — see [`docs/integration-status.md`](docs/integration-status.md).
+Supabase impls) — rename there to match the real schema; nothing upstream changes. Those
+maps are **already aligned to the live schema** (verified 2026-07-26); a `None` value
+means the column doesn't exist and is annotated with where the value really comes from.
+
+The app **defaults to the mock**, which is also the Aug-2 demo path. Two things to know
+before flipping, both in [`docs/integration-status.md`](docs/integration-status.md):
+
+- **The live DB owns its own scheduler.** `advance_referral()` dispatches work to
+  components via `referral_actions`, and we are `karthik_form`
+  (`backend/orchestrator/actions.py`). So there are **two orchestrators** — ours offline,
+  theirs live. `MockReferralDB` mirrors `advance_referral` in Python so the same worker
+  code runs both ways.
+- **The live flow is currently blocked** upstream of us: nothing writes
+  `referral_service_candidates`, so referrals park at `status='ranking'`.
+
+### If you're picking this up fresh
+
+Read [`docs/integration-status.md`](docs/integration-status.md) first — it's the pick-up
+doc: architecture, the seam, blockers, env vars, deploy URLs, and what to verify.
 
 ## Scope
 
