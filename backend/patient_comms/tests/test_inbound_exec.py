@@ -87,3 +87,53 @@ def test_appointment_question_looks_up_booking(db_session, monkeypatch):
     db_session.commit()
     body = db_session.query(Message).filter_by(direction="outbound").order_by(Message.created_at.desc()).first().body
     assert "5th & Main" in body  # answered from the real booking details
+
+
+def _run_consent_yes(db_session, monkeypatch):
+    """Shared setup: a patient at Stage.CONSENT replies YES. Returns whatever
+    execute_inbound returns, so both the old bare-ack assertions and the new
+    InboundResult assertions can share one setup."""
+    _prov(monkeypatch)
+    from state_machine import ReplyClass
+    o = _mk(db_session, stage=Stage.CONSENT)
+    r = _Repo()
+    result = inbound.execute_inbound(db_session, o, ReplyClass.YES, "yes", _PATIENT, None, repo=r)
+    db_session.commit()
+    return result
+
+
+def test_execute_inbound_returns_writeback_and_ack(db_session, monkeypatch):
+    # Mirror the existing consent-confirm test setup in this file, then assert
+    # the new return shape instead of a bare string.
+    from inbound import execute_inbound, InboundResult
+    result = _run_consent_yes(db_session, monkeypatch)  # existing helper in this file
+    assert isinstance(result, InboundResult)
+    assert result.writeback == "consent_confirmed"
+    assert result.received_stage == "consent"
+    assert isinstance(result.ack, str) and result.ack
+
+
+def _run_needs_help(db_session, monkeypatch):
+    """Shared setup: a patient at Stage.NOTIFIED sends a NEEDS_HELP reply with no
+    open issue -- opens a NEW escalation, produces no writeback. Mirrors
+    _run_consent_yes above."""
+    _prov(monkeypatch)
+    from state_machine import ReplyClass
+    o = _mk(db_session, stage=Stage.NOTIFIED)
+    r = _Repo()
+    result = inbound.execute_inbound(db_session, o, ReplyClass.NEEDS_HELP, "I'm stuck", _PATIENT, None, repo=r)
+    db_session.commit()
+    return result
+
+
+def test_execute_inbound_flags_escalation_opened(db_session, monkeypatch):
+    # A NEEDS_HELP / problem reply at an active stage opens a NEW escalation.
+    from inbound import execute_inbound, InboundResult
+    result = _run_needs_help(db_session, monkeypatch)
+    assert isinstance(result, InboundResult)
+    assert result.escalation_opened is True
+
+
+def test_execute_inbound_no_escalation_on_plain_consent_yes(db_session, monkeypatch):
+    result = _run_consent_yes(db_session, monkeypatch)
+    assert result.escalation_opened is False

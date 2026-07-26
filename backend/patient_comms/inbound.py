@@ -2,8 +2,19 @@
 that turns a `route_inbound` decision into DB writes + a templated ack. It runs
 every write on the session's connection so the webhook can commit them
 atomically; it never commits itself."""
+from dataclasses import dataclass
+
 from service import compose_details, log_message, send_templated
 from state_machine import route_inbound
+
+
+@dataclass
+class InboundResult:
+    ack: str
+    writeback: str | None
+    received_stage: str
+    escalation_opened: bool = False
+
 
 # Generic, PHI-free escalation summaries (no raw patient text echoed, even
 # internally). Keyed by escalation_reason.
@@ -17,7 +28,7 @@ _SUMMARY = {
 }
 
 
-def execute_inbound(session, outreach, reply_class, body, patient, open_escalation, *, repo) -> str:
+def execute_inbound(session, outreach, reply_class, body, patient, open_escalation, *, repo) -> InboundResult:
     received_stage = outreach.stage
     has_open = open_escalation is not None
     d = route_inbound(outreach, reply_class, has_open)
@@ -67,4 +78,6 @@ def execute_inbound(session, outreach, reply_class, body, patient, open_escalati
 
     repo.log_attempt(outreach.referral_id, channel="whatsapp", direction="inbound",
                      purpose=received_stage.value, status="delivered", conn=conn)
-    return send_templated(session, outreach, d["ack_key"], ctx, "ack", **extra)
+    ack = send_templated(session, outreach, d["ack_key"], ctx, "ack", **extra)
+    return InboundResult(ack=ack, writeback=wb, received_stage=received_stage.value,
+                         escalation_opened=(d["escalation"] == "open"))

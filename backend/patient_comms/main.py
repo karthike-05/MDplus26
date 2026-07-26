@@ -15,6 +15,7 @@ driven by referral_actions (Loop A, poller.py) and elapsed-time tracks
 module's job is: serve the dashboard/read endpoints, and apply the inbound
 webhook's writes atomically.
 """
+import asyncio
 import logging
 import os
 
@@ -28,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+import org_events
 import repo
 from classifiers import get_classifier
 from inbound import execute_inbound
@@ -111,6 +113,18 @@ def _valid_twilio_signature(request: Request, params: dict) -> bool:
     return RequestValidator(token).validate(url, params, signature)
 
 
+def emit_after_reply(*, referral_id, result, outreach_id, reply_text):
+    """Map an InboundResult to at most one org event (spec §5b). A terminal writeback
+    event wins; otherwise a newly-opened escalation emits needs_review; else no-op."""
+    event = org_events.WRITEBACK_TO_EVENT.get(result.writeback)
+    if event is None and result.escalation_opened:
+        event = "needs_review"
+    if event is None:
+        return
+    org_events.emit_patient_comms_event(
+        referral_id, event, outreach_id=outreach_id, reply_text=reply_text)
+
+
 @app.post("/webhook/sms-inbound")
 async def sms_inbound(request: Request):
     """Twilio/WhatsApp posts here on every inbound patient reply, as
@@ -149,10 +163,19 @@ async def sms_inbound(request: Request):
         patient = repo.get_patient_for_referral(outreach.referral_id) or {}
         open_esc = repo.find_open_escalation(outreach.referral_id)
 
-        ack = execute_inbound(session, outreach, reply_class, body, patient, open_esc, repo=repo)
+        result = execute_inbound(session, outreach, reply_class, body, patient, open_esc, repo=repo)
+        referral_id, outreach_id = outreach.referral_id, outreach.id
         session.commit()
+        # emit_after_reply does a synchronous urllib POST (up to a 3s timeout) --
+        # run it in a worker thread so a slow-but-reachable org backend can't
+        # stall this coroutine's event loop and block concurrent requests. It
+        # still runs after commit, off the pre-commit-captured locals, and
+        # emit_after_reply/emit_patient_comms_event already swallow their own
+        # exceptions (fire-and-forget, spec §9), so nothing propagates here.
+        await asyncio.to_thread(emit_after_reply, referral_id=referral_id, result=result,
+                                outreach_id=outreach_id, reply_text=body)
         logger.info("Routed inbound from %s reply=%s ack sent (%d chars)",
-                    from_phone, reply_class.value, len(ack))
+                    from_phone, reply_class.value, len(result.ack))
         return _twiml_ok()
     finally:
         session.close()

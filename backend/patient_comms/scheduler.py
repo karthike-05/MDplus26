@@ -36,6 +36,7 @@ import logging
 import os
 from datetime import datetime
 
+import org_events
 import repo as _repo
 from models import PatientOutreach, Stage
 from outreach_repo import claim_timed
@@ -43,6 +44,11 @@ from service import compose_details, send_templated
 from timescale import day, poll_seconds
 
 logger = logging.getLogger("scheduler")
+
+
+def emit_no_response(referral_id: str) -> None:
+    """Tell the scheduler the patient went silent (spec §5b). Fire-and-forget."""
+    org_events.emit_patient_comms_event(referral_id, "no_response")
 
 
 def _ctx(patient: dict, booking: dict | None) -> dict:
@@ -99,7 +105,9 @@ def run_due_batch(session, repo=_repo, now=None) -> dict:
                 if o.active_action_id:
                     repo.finish_action(o.active_action_id, {"consent": "no_response"}, ok=True, conn=conn)
                     o.active_action_id = None
+                rid = o.referral_id            # capture before commit (ORM expiry)
                 session.commit()
+                emit_no_response(rid)          # after commit: never announce a rolled-back escalation
                 counts["consent_escalate"] += 1
         except Exception:
             logger.exception("loop_b row %s failed", o.id)
@@ -196,7 +204,9 @@ def run_due_batch(session, repo=_repo, now=None) -> dict:
                                    "Patient did not confirm utilization after nudge.",
                                    conn=conn)
             o.stage = Stage.ESCALATED
+            rid = o.referral_id            # capture before commit (ORM expiry)
             session.commit()
+            emit_no_response(rid)          # after commit: never announce a rolled-back escalation
             counts["verify_escalate"] += 1
         except Exception:
             logger.exception("loop_b row %s failed", o.id)
