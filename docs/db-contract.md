@@ -83,15 +83,20 @@ DSN is IPv6-only/flaky and the DB password was unreliable; the API is HTTPS/IPv4
 uses the same auth the Voice arm uses. `make_db()` picks the API adapter when
 `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are set (falls back to DSN, then mock).
 
-1. Apply `contracts/migrations/001_orchestration_bus.sql` in the Supabase SQL Editor.
-2. Align `backend/db/supabase.py`'s `*_COLS` maps to Data's real column names
-   (reconciled table below).
-3. Set `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` in `.env`.
-4. Smoke test: `python -m backend.scripts.db_introspect`, then one `get_patient` +
-   one `record_attempt`. Until step 3, the backend stays on the mock.
+1. ~~Apply `001_orchestration_bus.sql`~~ — **do not.** That migration is **obsolete** and
+   would add a second owner of workflow state plus fork the outreach log away from the
+   `attempts` table the ranker reads. The file carries a banner explaining why. The only
+   migration applied is `002_utilization_milestone.sql`.
+2. Align `backend/db/supabase.py`'s `*_COLS` maps — **already done** (2026-07-26);
+   `db_introspect` reports `patients: OK` and `services: OK`.
+3. Set `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` in `.env`. Until you do, the backend
+   stays on the mock. The dashboard's **Use Supabase** button flips it at runtime.
+4. Smoke test: `python -m backend.scripts.db_introspect`, then one `get_patient`.
 
-See **[`integration-status.md`](integration-status.md)** for the full flip procedure
-and the "wait until the schema is frozen" rationale.
+> Expect the 3 live referrals to sit in "In progress": nothing writes
+> `referral_service_candidates`, which `advance_referral()` reads, so they cannot advance
+> yet. That blocker is upstream of us — see
+> **[`integration-status.md`](integration-status.md)**.
 
 ---
 

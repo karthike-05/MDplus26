@@ -54,7 +54,7 @@ contract) and **one scheduler** that owns every state transition.
 | Workstream | Responsibility |
 | --- | --- |
 | **Form-fill** | Auto-fill + review + submit forms; the orchestration glue (state machine + scheduler); shared contracts; the social-worker frontend. |
-| **Data** | The database schema (HSDS, `01_schema.sql`), seed data, and the one vendor-facing DB layer. |
+| **Data** | The shared Supabase schema (HSDS-shaped), seed data, the DB-side orchestrator (`advance_referral()`), and the one vendor-facing DB layer. There is no `01_schema.sql` file — the live database is the source of truth; read it with `python -m backend.scripts.db_introspect`. |
 | **Ranking** (Data) | Three-layer service ranking (hard-filter → objective → LLM subjective) that picks *which* service a referral targets. Runs **upstream** of outreach; writes `ranking_results` / `sw_feedback`. Does not touch the scheduler. |
 | **Messaging** | Patient texting — consent opt-in and the utilization check-in (SMS/WhatsApp). |
 | **Voice** | Outbound phone calls to social services. |

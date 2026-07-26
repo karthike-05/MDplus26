@@ -2,7 +2,9 @@
 
 **Last updated:** 2026-07-26 · branch `integration/voice-ranking-seams`
 
-**Read this first if you just pulled.** Design rationale is in
+**Read this first if you just pulled.** Then
+**[`whats-left.md`](whats-left.md)** — the prioritised list of what integration and the
+product still need, with owners. Design rationale is in
 [`integration-plan.md`](integration-plan.md); the DB contract in
 [`db-contract.md`](db-contract.md); conventions in [`../CLAUDE.md`](../CLAUDE.md).
 

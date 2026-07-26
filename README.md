@@ -15,7 +15,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 python run_demo.py      # headless end-to-end (PDF)
-pytest -q               # layered suite — 76 tests, no DB / browser / network needed
+pytest -q               # layered suite — 81 tests, no DB / browser / network needed
 
 uvicorn backend.main:app --reload            # backend on :8000
 cd frontend && npm install && npm run dev    # UI on :5173
@@ -63,7 +63,7 @@ A referral can be submitted to a service by **form**, **email**, or **phone**. T
 are interchangeable because of two shared contracts — not shared code:
 
 - **Every tool returns the same `ToolOutcome`** (`contracts/models.py`) and writes one
-  `outreach_attempts` row. Signature for all of them:
+  row to the shared `attempts` log. Signature for all of them:
   `tool(referral_id, db, *, attempt_id, from_state) -> ToolOutcome`.
 - **One scheduler** (`backend/orchestrator/scheduler.py`) reads `referrals.current_state`,
   picks the method (`outreach_channel` → `OUTREACH_TOOLS`), runs it, and advances state
@@ -112,8 +112,10 @@ before flipping, both in [`docs/integration-status.md`](docs/integration-status.
 
 ### If you're picking this up fresh
 
-Read [`docs/integration-status.md`](docs/integration-status.md) first — it's the pick-up
-doc: architecture, the seam, blockers, env vars, deploy URLs, and what to verify.
+1. [`docs/integration-status.md`](docs/integration-status.md) — the pick-up doc:
+   architecture, the seam, blockers, env vars, deploy URLs, what to verify.
+2. [`docs/whats-left.md`](docs/whats-left.md) — **what's still required**, split into what
+   integration needs and what the product needs, each item with an owner.
 
 ## Scope
 
@@ -125,17 +127,22 @@ the tracking loop + check-in. See [`CLAUDE.md` §12](CLAUDE.md#12-demo-scope-rem
 
 ## Future tasks
 
-**Database integration** *(built, parked — pick-up in [`docs/integration-status.md`](docs/integration-status.md))*.
+**Database integration** *(built; the mock is the deliberate demo default — see [`docs/integration-status.md`](docs/integration-status.md))*.
 The app still defaults to the in-memory mock (`backend/db/mock.py`) — no DB, no network,
 resets on restart — which is the reliable path for the Aug-2 take. The real-DB adapter
 is **built and verified**: `backend/db/supabase_api.py` (Supabase REST API, the preferred
 path) plus the asyncpg `supabase.py`, both behind `ReferralDB` and selected by
-`make_db()`. **To go live:** apply `contracts/migrations/001_orchestration_bus.sql`,
-align the `*_COLS` maps to the canonical HSDS schema (`01_schema.sql`), set
-`SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` in `.env`, and smoke-test. The shared write
-contract is the outreach log + the `channel`/`status` enums — spec in
-[`docs/db-contract.md`](docs/db-contract.md); converge on the existing `attempts` table
-(see integration-status). Waiting on the shared schema to freeze.
+`make_db()`. The `*_COLS` maps are **already aligned** to the live schema.
+
+**To go live:** set `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` in `.env`, restart, and
+use the dashboard's **Use Supabase** button (or just start with them set). Then
+`python -m backend.scripts.db_introspect` to confirm what you're pointed at.
+
+> **Do NOT apply `contracts/migrations/001_orchestration_bus.sql`** — it is obsolete and
+> would damage the integration (a second owner of workflow state, and a forked outreach
+> log that starves the ranker). The file carries a banner explaining why. The only
+> migration we applied is `002_utilization_milestone.sql`. There is no `01_schema.sql`;
+> the live database is the source of truth, so read it with `db_introspect`.
 
 **Other open tasks** (details in [`CLAUDE.md` §13](CLAUDE.md#13-future-directions-post-aug-2),
 [`docs/integration-status.md`](docs/integration-status.md), and
