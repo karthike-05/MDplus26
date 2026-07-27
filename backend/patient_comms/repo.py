@@ -26,7 +26,14 @@ _engine = None
 OUR_COMPONENT = "twilio"
 CONSENT_ACTION = "confirm_consent"
 NOTIFY_ACTION = "notify_patient"
-OUR_ACTION_TYPES = (CONSENT_ACTION, NOTIFY_ACTION)
+# The live advance_referral() (002_utilization_milestone.sql) emits this to twilio
+# at the `enrolled` milestone. It's the post-enrollment patient touch, so the poller
+# routes it to the SAME handler as notify_patient (send booking details + schedule
+# our own utilization verify) — it is NOT a distinct "verify now" send. This re-adds
+# a type the 07-21 rewire retired, because that retirement assumed the DB function
+# would stop emitting it; it never did.
+UTILIZATION_ACTION = "confirm_service_utilization"
+OUR_ACTION_TYPES = (CONSENT_ACTION, NOTIFY_ACTION, UTILIZATION_ACTION)
 
 
 def get_engine():

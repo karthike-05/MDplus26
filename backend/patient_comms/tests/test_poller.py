@@ -6,6 +6,7 @@ from models import PatientOutreach, Stage
 class _FakeRepo:
     CONSENT_ACTION = "confirm_consent"
     NOTIFY_ACTION = "notify_patient"
+    UTILIZATION_ACTION = "confirm_service_utilization"
     def __init__(self, actions, patient, booking):
         self._actions = actions; self._patient = patient; self._booking = booking
         self.notified = []; self.finished = []; self.attempts = []
@@ -61,6 +62,27 @@ def test_notify_patient_sends_and_schedules(db_session, monkeypatch):
     assert counts["notify"] == 1 and r.notified == ["r-2"] and r.finished == ["a-2"]
     row = db_session.query(PatientOutreach).filter_by(referral_id="r-2").one()
     assert row.stage == Stage.NOTIFIED and row.next_reminder_at is not None
+
+
+def test_confirm_service_utilization_routes_to_notify(db_session, monkeypatch):
+    # advance_referral() emits `confirm_service_utilization` (to twilio) at the
+    # `enrolled` milestone (contracts/migrations/002_utilization_milestone.sql). It
+    # is the post-enrollment patient touch, so we route it to the SAME handler as
+    # notify_patient: send booking details + schedule our own utilization verify
+    # (which our scheduler fires). It is NOT a distinct "verify now" send.
+    _patch_provider(monkeypatch)
+    booking = {"scheduled_start_at": datetime(2026, 8, 1, 14, 0),
+               "organization_name": "ModivCare", "confirmation_number": "ABC",
+               "pickup_address": "123 Main", "patient_instructions": "Bring ID"}
+    db_session.add(PatientOutreach(referral_id="r-5", patient_phone="+15551230003",
+                                   stage=Stage.AWAITING_BOOKING)); db_session.commit()
+    r = _FakeRepo([{"id": "a-5", "referral_id": "r-5", "service_id": "svc-1",
+                    "action_type": "confirm_service_utilization", "input_payload": {}}],
+                  {**_PATIENT, "phone": "+15551230003"}, booking)
+    counts = poller.run_action_poll(db_session, repo=r)
+    assert counts["notify"] == 1 and r.notified == ["r-5"] and r.finished == ["a-5"]
+    row = db_session.query(PatientOutreach).filter_by(referral_id="r-5").one()
+    assert row.stage == Stage.NOTIFIED and row.next_verify_at is not None
 
 
 class _FlakyFinishRepo(_FakeRepo):
