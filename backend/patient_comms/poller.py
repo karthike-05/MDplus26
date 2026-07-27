@@ -1,6 +1,9 @@
 """Loop A: poll referral_actions assigned to twilio and act on them.
-confirm_consent -> create outreach row, send consent, hold action in_progress.
-notify_patient  -> read booking, send details, mark notified, finish, schedule."""
+confirm_consent             -> create outreach row, send consent, hold action in_progress.
+notify_patient /            -> read booking, send details, mark notified, finish, schedule.
+  confirm_service_utilization  (the live advance_referral() emits the latter at the
+                                `enrolled` milestone; both are the same post-enrollment
+                                patient touch, so they share _handle_notify.)"""
 import logging
 from datetime import datetime
 
@@ -83,7 +86,7 @@ def run_action_poll(session, repo=_repo) -> dict:
         try:
             if action["action_type"] == repo.CONSENT_ACTION:
                 _handle_consent(session, action, repo); counts["consent"] += 1
-            elif action["action_type"] == repo.NOTIFY_ACTION:
+            elif action["action_type"] in (repo.NOTIFY_ACTION, repo.UTILIZATION_ACTION):
                 _handle_notify(session, action, repo); counts["notify"] += 1
         except Exception:  # noqa: BLE001
             logger.exception("action %s failed", action["id"])
