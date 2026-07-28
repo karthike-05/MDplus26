@@ -100,6 +100,9 @@ Incumbents (findhelp, Unite Us) *generate* referrals; our differentiator is **co
 │   │   ├─ actions.py              # the `karthik_form` worker on the shared bus (§7a)
 │   │   ├─ backend_component.py    # the `backend` worker — bookkeeping + email (§7a)
 │   │   └─ worker.py               # the runner: drains both, recovers crashed actions
+│   ├─ scripts/
+│   │   ├─ demo_driver.py          # read-only verdict on every LIVE referral (+ demo setup)
+│   │   └─ seed_form_templates.py  # contracts/schemas/*.json -> form_templates
 │   ├─ tools/
 │   │   └─ fill_form/
 │   │       ├─ fill_form.py        # prepare() for review UI; submit() injects + records
@@ -343,6 +346,29 @@ that and "every component advances itself".
 > implementations of the same decisions; a second state field would be a second owner
 > of truth. Their `referral_actions(referral_id, deduplication_key)` unique index
 > already gives us the idempotency `attempt_id` was for.
+
+### 7b. The social worker picks the service — `003_sw_selection_gate.sql`
+
+**Applied to the live DB (2026-07-27).** `advance_referral` used to take the top-ranked
+candidate itself and dispatch outreach. That is a different product from the one we're
+building: the SW seeing the options and choosing is what feeds `sw_feedback`, and
+`sw_feedback` is the *only* signal ranking's subjective layer ever learns from.
+Auto-selecting doesn't just remove a safeguard — it starves the feedback loop.
+
+So: candidates exist and none is `selected` → queue `select_resource` to
+**`social_worker`** and return `awaiting_sw_selection`. Nothing polls that component
+because a human is the poller. `POST /api/referrals/{id}/choose-service` completes it,
+and it must do **four** things or the gate breaks silently: flag the candidate, point the
+referral, **close the action** (else the open-action guard freezes the referral on the
+choice just made), and record the label.
+
+A candidate already flagged `selected` is *adopted*, not re-ranked. Without that branch
+the function falls through to the old auto-picker, which only considers `available`
+rows — so the SW's own pick is the one row it would skip.
+
+> Ranking's handoff assumed the opposite (auto-select + override) because **our** doc
+> still recommended it after we'd decided otherwise. Their code needs no change; only
+> their "zero open actions afterwards" check moves to expecting one.
 
 Full walkthrough, the vocabulary translation, and the current blockers:
 [`docs/integration-status.md`](docs/integration-status.md).

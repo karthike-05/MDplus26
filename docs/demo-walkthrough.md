@@ -1,6 +1,6 @@
 # Running the demo — for a group walkthrough
 
-**Written 2026-07-27.** How to actually show this working when four people own four
+**Updated 2026-07-28.** How to actually show this working when four people own four
 different pieces, and not all of them are ready.
 
 The short version: **there are two demos, and you should know which one you're running.**
@@ -13,7 +13,7 @@ else's unset environment variable in front of the room.
 | Depends on | Nobody. Our repo alone. | Ranking, Voice and Messaging all being ready |
 | Data | Synthetic fixtures | The live Supabase |
 | Orchestrator | Our `scheduler.py` | The DB's `advance_referral()` |
-| Works today | ✅ yes | ⚠️ blocked on A1 (see below) |
+| Works today | ✅ yes | ✅ with three setup commands (see below) |
 | Use it for | The pitch, the recording, the story | The engineering conversation |
 
 **Run Demo A as the main event.** It is the one that shows the differentiator — a
@@ -41,7 +41,7 @@ works and is better while editing the UI.)
 Sanity check before anyone is watching:
 
 ```bash
-python -m pytest tests -q          # 103 green, no DB / browser / network
+python -m pytest tests -q          # 112 green, no DB / browser / network
 python run_demo.py                 # headless: prints the loop closing
 curl -s localhost:8000/health      # ok + db mode + worker state
 ```
@@ -97,12 +97,10 @@ cause instead.
 
 What you'll see today, and what to say about each:
 
-- **Blocker A1 (red).** *Nothing writes `referral_service_candidates`.* Ranking writes
-  `ranking_results`; `advance_referral()` reads a different table. Every live referral
-  parks at `status='ranking'`. This is the one thing standing between here and a working
-  live loop, it's specified for Ranking in
-  [`handoff-ranking-candidates.md`](handoff-ranking-candidates.md), and the bridge is
-  about fifteen lines of SQL.
+- **Blockers, named in red.** Today the live one is that nothing has *triggered* a
+  ranking run: Ranking now writes `referral_service_candidates` correctly, but their
+  Railway service still runs the old build and they built no poller by design
+  ([`handoff-ranking-candidates.md`](handoff-ranking-candidates.md), whats-left A1b).
 - **Components on the bus.** Five, with who polls each. `karthik_form` and `backend` are
   ours and both have pollers as of today — `backend` had none at all until this week,
   which meant a single `select_resource` row permanently deadlocked its referral.
@@ -119,29 +117,32 @@ python -m backend.scripts.demo_driver
 ```
 
 Today it reports: one referral held at the consent gate, and two that will park at
-`ranking` — one of which already has four passing `ranking_results` rows waiting to be
-bridged.
+`ranking` — one of which already has four passing `ranking_results` rows ready to bridge.
 
-### If Ranking ships the bridge before the meeting
+### Setting up a live demo tonight (Ranking shipped, but hasn't redeployed)
 
-Nothing to do — and as of 2026-07-27 it routes **to us**. The rank-1 service now has an
-`online_form` channel and a seeded `form_templates` row (A11), so within one poll interval
-the worker claims a `prepare_online_form` action and the referral appears under *Needs
-you* with a review screen. Verified in a rolled-back transaction: `advance_referral`
-returns `{"state":"in_progress","channel":"online_form"}`.
-
-### If they don't, and you want the live loop moving anyway
-
-There's a shim. It's dry-run by default and it is **not ours to own** — delete it the day
-Ranking ships:
+Ranking's code writes candidates properly as of 2026-07-28, but **their Railway service
+still runs the old build**, and they deliberately built no poller — so nothing produces
+or triggers candidates on the live DB yet. Three commands get you a working live demo in
+about a minute. All three are dry-run without `--yes`:
 
 ```bash
-python -m backend.scripts.demo_driver --bridge-candidates          # shows what it WOULD write
-python -m backend.scripts.demo_driver --bridge-candidates --yes    # writes to the SHARED db
+python -m backend.scripts.demo_driver --bridge-candidates --yes   # 4 already-scored rows
+python -m backend.scripts.demo_driver --reset-selection --yes     # so the SW gate fires
+python -m backend.scripts.demo_driver                             # confirm
 ```
 
-Talk to whoever owns Ranking before running the second one. It writes to everyone's
-database.
+The bridge is not inventing a ranking — those four rows are already in `ranking_results`,
+scored and filtered by their pipeline. It's moving data their new code *would* write.
+The reset clears a `service_id` that was seeded, not chosen by a social worker; the gate
+only asks when nothing is chosen.
+
+Then the live board shows the referral under **Needs you** with **Choose service →**.
+Pick one, and it dispatches `prepare_online_form` to us — the rank-1 service has an
+`online_form` channel and a seeded `form_templates` row (A11), so the review screen
+opens. Verified end-to-end in a rolled-back transaction.
+
+**Delete the bridge once Ranking redeploys.**
 
 ---
 

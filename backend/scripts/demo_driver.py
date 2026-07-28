@@ -8,16 +8,25 @@ Two jobs, in order of how often you should use them:
    isn't moving" into "referral X is parked at step 6 because Ranking hasn't written
    candidates, and referral Y's service has no channel row".
 
-2. **`--bridge-candidates` — a SHIM. Not ours, and off by default.** Copies
-   `ranking_results` (the rows that passed the hard filter) into
-   `referral_service_candidates`, which is blocker A1. **This is Ranking's job**, it's
-   specified for them in `docs/handoff-ranking-candidates.md`, and they are expected to
-   do it properly — including deciding whether results map to candidates one-for-one.
-   This exists only so a demo isn't hostage to another team's timing. **Delete it the
-   day they ship.** It refuses to run without `--yes`.
+2. **`--bridge-candidates` — a SHIM, off by default.** Copies `ranking_results` rows
+   that passed the hard filter into `referral_service_candidates`.
+
+   Ranking SHIPPED this properly on 2026-07-28 (`rank_referral()` writes candidates,
+   closes the action, advances) — but their Railway service still runs the old code
+   until they redeploy, and they built no poller, so nothing triggers a run either way.
+   Until both land, this bridges data their pipeline has *already computed*: the rows
+   exist in `ranking_results`, scored, ranked and filtered. It isn't inventing a
+   ranking. **Delete it once they redeploy.**
+
+3. **`--enable-form-channel` / `--reset-selection` — demo setup.** Give a service an
+   `online_form` channel so referrals can route to the form component (A11), and clear a
+   referral's pre-seeded `service_id` so the SW selection gate actually fires. The gate
+   only asks when nothing is chosen, and the live transport referral was seeded with a
+   service already attached — not chosen by a social worker — so clearing it restores
+   the state the flow is meant to start from.
 
 Every write is dry-run first. `--yes` is the only thing that makes this touch the shared
-database, and it prints each row before writing it.
+database, and it prints what it would write before writing it.
 
     python -m backend.scripts.demo_driver                       # diagnose (read-only)
     python -m backend.scripts.demo_driver --bridge-candidates   # show what it WOULD write
@@ -95,13 +104,29 @@ def diagnose(c) -> None:
             print("  → will queue confirm_consent -> twilio (consent gate)")
             continue
         if not candidates:
-            print("  → ⛔ will park at status='ranking' and queue rank_resources -> backend")
-            print(f"     BLOCKER A1: referral_service_candidates is empty"
-                  + (f", but {len(ranked)} ranking_results rows passed the hard filter "
-                     f"and could be bridged" if ranked else " and ranking hasn't run"))
+            print("  → will park at status='ranking' and queue rank_resources -> backend")
+            print("     Ranking writes candidates now (03e21fc), but nothing TRIGGERS a run:"
+                  " no poller by design, and BACKEND_CLAIM_RANKING is off (whats-left A1b).")
+            if ranked:
+                print(f"     {len(ranked)} ranking_results rows already passed the hard "
+                      f"filter and can be bridged with --bridge-candidates.")
             continue
+
+        # The SW gate (003_sw_selection_gate.sql) answers before the old auto-picker.
         if not r.get("service_id"):
-            print("  → will select the top candidate and queue select_resource -> backend")
+            chosen = [c for c in candidates if c.get("selected")]
+            if chosen:
+                print(f"  → SW chose rank {chosen[0]['rank']}; will adopt it and dispatch")
+                continue
+            usable = [c for c in candidates if c["candidate_status"] == "available"
+                      and c["eligibility_state"] in
+                      ("eligible", "potentially_eligible", "unknown")]
+            if usable:
+                print(f"  → ⏸ AWAITING SOCIAL WORKER: {len(usable)} option(s) ranked, none "
+                      f"chosen. Queues select_resource -> social_worker; the dashboard's "
+                      f"\"Choose service\" screen completes it.")
+            else:
+                print("  → no candidate available -> will escalate to a social worker")
             continue
 
         chans = _rows(c, "service_application_channels", service_id=r["service_id"])
@@ -280,6 +305,46 @@ def enable_form_channel(c, service_id: str | None, apply: bool) -> None:
               f"        --form transport_intake --service-id {service_id}")
 
 
+def reset_selection(c, referral_id: str | None, apply: bool) -> None:
+    """Clear a referral's chosen service so the SW gate fires (demo only).
+
+    A referral that already has `referrals.service_id` skips the gate entirely — the
+    gate only asks when nothing is chosen — so it dispatches straight to outreach and
+    the selection screen never appears. The live transport referral was seeded with a
+    service already attached, not chosen by a social worker, so clearing it restores the
+    state the flow is actually meant to start from.
+
+    Only touches synthetic referrals, and only the two selection columns.
+    """
+    if referral_id is None:
+        with_request = {r["referral_id"] for r in _rows(c, "service_requests")}
+        pick = next((r for r in _rows(c, "referrals")
+                     if r["id"] in with_request and r.get("service_id")), None)
+        if pick is None:
+            sys.exit("No suitable referral — pass --referral-id.")
+        referral_id = pick["id"]
+
+    r = (_rows(c, "referrals", id=referral_id) or [None])[0]
+    if r is None:
+        sys.exit(f"referral '{referral_id}' does not exist.")
+    print(f"referral {referral_id}")
+    print(f"  status={r['status']}  service_id={r.get('service_id')}  "
+          f"rank={r.get('current_resource_rank')}")
+    print("\nWOULD SET service_id=NULL, current_resource_rank=NULL, status='ranking'")
+    print("  (and release any candidate previously flagged selected)")
+
+    if not apply:
+        print("\nDRY RUN — nothing written. Re-run with --yes to apply.")
+        return
+    c.table("referral_service_candidates").update(
+        {"selected": False, "candidate_status": "available"},
+    ).eq("referral_id", referral_id).eq("candidate_status", "selected").execute()
+    c.table("referrals").update(
+        {"service_id": None, "current_resource_rank": None, "status": "ranking"},
+    ).eq("id", referral_id).execute()
+    print("\n✔ reset. Run --diagnose; it should now report AWAITING SOCIAL WORKER.")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -290,6 +355,9 @@ def main() -> None:
                    help="give a service an `online_form` channel so it routes to us (A11)")
     p.add_argument("--service-id", help="target for --enable-form-channel "
                                         "(default: the transport referral's service)")
+    p.add_argument("--reset-selection", action="store_true",
+                   help="clear a referral's chosen service so the SW gate fires (demo only)")
+    p.add_argument("--referral-id", help="target for --reset-selection")
     p.add_argument("--yes", action="store_true", help="actually write (default is dry-run)")
     args = p.parse_args()
 
@@ -305,6 +373,8 @@ def main() -> None:
         bridge_candidates(c, apply=args.yes)
     elif args.enable_form_channel:
         enable_form_channel(c, args.service_id, apply=args.yes)
+    elif args.reset_selection:
+        reset_selection(c, args.referral_id, apply=args.yes)
     else:
         diagnose(c)
 

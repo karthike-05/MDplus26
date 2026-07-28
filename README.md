@@ -15,7 +15,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 python run_demo.py      # headless end-to-end (PDF) — always the fixture mock
-pytest tests -q         # layered suite — 105 tests, no DB / browser / network needed
+pytest tests -q         # layered suite — 112 tests, no DB / browser / network needed
 
 # The whole app on one port: the backend serves the built frontend (see the StaticFiles
 # mount at the bottom of backend/main.py), so this is the deployable shape too.
@@ -127,8 +127,13 @@ before flipping, both in [`docs/integration-status.md`](docs/integration-status.
   (`backend/orchestrator/actions.py`). So there are **two orchestrators** — ours offline,
   theirs live. `MockReferralDB` mirrors `advance_referral` in Python so the same worker
   code runs both ways.
-- **The live flow is currently blocked** upstream of us: nothing writes
-  `referral_service_candidates`, so referrals park at `status='ranking'`.
+- **The social worker picks the service, not the scheduler** (`003_sw_selection_gate.sql`,
+  CLAUDE.md §7b). A ranked referral parks at `awaiting_sw_selection` until someone
+  chooses on the dashboard; that choice is what triggers outreach and what trains the
+  ranker.
+- **Live is not self-starting yet:** Ranking writes `referral_service_candidates`
+  correctly as of 2026-07-28, but nothing *triggers* a ranking run — they built no
+  poller by design (`docs/whats-left.md` A1b).
 
 ### If you're picking this up fresh
 
