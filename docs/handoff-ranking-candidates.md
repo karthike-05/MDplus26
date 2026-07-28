@@ -11,6 +11,33 @@ immediately behind it.
 
 ---
 
+> ## ⚠️ Update 2026-07-27 — we wrote the change for you
+>
+> Rather than leave you blocked, we made the edit in the vendored copy of your service.
+> **We changed none of your ranking logic** — no filter, no scorer, no weights. It's one
+> new function and one new call, both writing data your pipeline had already computed:
+>
+> - `backend/service_ranking/db.py` — added `upsert_referral_service_candidates()`,
+>   mirroring your `upsert_ranking_results()` directly above it.
+> - `backend/service_ranking/ranking.py` — after the existing
+>   `db.upsert_ranking_results(rows)` in `rank_referral()`, the same run is now also
+>   written to `referral_service_candidates` (survivors only).
+>
+> Verified against the live DB inside a rolled-back transaction: with those rows present,
+> `advance_referral()` returns
+> `{"state":"in_progress","channel":"online_form","attempt_number":2}` — it dispatches
+> straight to the form component. Nothing was left behind.
+>
+> **Two things this does NOT do:**
+> 1. Your **Railway service still runs the old code**. Pull and redeploy, or the live DB
+>    keeps getting `ranking_results` only.
+> 2. **Re-ranking is still unsafe** — see the `UNIQUE (referral_id, rank)` note in §2.
+>
+> Take it, rewrite it, or throw it away — you own this service. The rest of this document
+> is the original spec and the reasoning, which still stands.
+
+---
+
 ## TL;DR
 
 1. **Write `referral_service_candidates`.** It is the *only* table the orchestrator reads

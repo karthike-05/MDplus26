@@ -282,6 +282,34 @@ def rank_referral(referral_id: str) -> list[dict]:
     ]
     db.upsert_ranking_results(rows)
 
+    # Blocker A1 — the same run, written for the orchestrator. `advance_referral()`
+    # reads `referral_service_candidates`, never `ranking_results`, so without this the
+    # referral parks at status='ranking' no matter how well it ranked. Survivors only:
+    # rejected candidates carry rank=None, and the target column is NOT NULL with
+    # CHECK (rank > 0), so including them fails the whole insert.
+    db.upsert_referral_service_candidates(
+        [
+            {
+                "referral_id": referral_id,
+                "service_id": c["service"]["id"],
+                "rank": c["rank"],
+                "score": c.get("combined_score") or 0,   # NOT NULL
+                # No source for real eligibility yet; 'unknown' is in the CHECK list and
+                # is accepted by advance_referral's candidate select.
+                "eligibility_state": "unknown",
+                "candidate_status": "available",
+                "reasons": {
+                    "combined_score": c.get("combined_score"),
+                    "objective_score": c.get("objective_score"),
+                    "objective_breakdown": c.get("objective_breakdown"),
+                    "subjective_score": c.get("subjective_score"),
+                    "subjective_rationale": c.get("subjective_rationale"),
+                },
+            }
+            for c in survivors
+        ]
+    )
+
     return db.get_ranking_results(referral_id)
 
 

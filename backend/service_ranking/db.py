@@ -144,6 +144,29 @@ def upsert_ranking_results(rows: list[dict]) -> list[dict]:
     )
 
 
+def upsert_referral_service_candidates(rows: list[dict]) -> list[dict]:
+    """The ORCHESTRATOR-facing half of a ranking run (blocker A1).
+
+    `ranking_results` is this service's own record and nothing else reads it.
+    `advance_referral()` — the plpgsql scheduler that drives every referral — reads
+    `referral_service_candidates` instead, and with that table empty it parks every
+    referral at `status='ranking'` forever. So a ranking run has to write both: one for
+    us, one for the bus.
+
+    NOTE for a re-rank: this table has `UNIQUE (referral_id, rank)` on top of
+    `(referral_id, service_id)`, so re-ranking a referral whose services swap positions
+    collides mid-statement. Safe on a first write; a genuine re-rank should delete and
+    reinsert, and must not clobber a candidate that has already left 'available'
+    (selected / exhausted / enrolled are progress the orchestrator relies on).
+    """
+    return (
+        _supabase.table("referral_service_candidates")
+        .upsert(rows, on_conflict="referral_id,service_id")
+        .execute()
+        .data
+    )
+
+
 def get_ranking_results(referral_id: str) -> list[dict]:
     """GET /ranking-results/{referral_id}. SW-facing ranked list for a
     referral: survivors only, ordered by rank, with service_name and
