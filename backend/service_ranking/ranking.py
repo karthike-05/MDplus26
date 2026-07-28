@@ -1,3 +1,4 @@
+import logging
 import os
 from datetime import date
 from math import atan2, cos, radians, sin, sqrt
@@ -8,6 +9,8 @@ from dotenv import load_dotenv
 import db
 
 load_dotenv()
+
+logger = logging.getLogger("ranking")
 
 ANTHROPIC_MODEL = "claude-sonnet-5"
 _anthropic = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -223,10 +226,30 @@ def run_subjective_scoring(patient: dict, survivors: list[dict]) -> dict[str, di
     return {row["service_id"]: row for row in tool_use.input["scores"]}
 
 
+def _candidate_reasons(c: dict) -> list[dict]:
+    """Array of {type, text} for the (future) SW selection screen. Not read by
+    advance_referral() -- display only (handoff-ranking-candidates.md §2)."""
+    breakdown = c.get("objective_breakdown") or {}
+    breakdown_text = ", ".join(f"{key}={value:.0f}" for key, value in breakdown.items())
+    subjective_score = c.get("subjective_score")
+    return [
+        {"type": "combined_score", "text": f"{c['combined_score']:.1f}"},
+        {"type": "objective_score", "text": f"{c['objective_score']:.1f}"},
+        {"type": "objective_breakdown", "text": breakdown_text or "N/A"},
+        {"type": "subjective_score", "text": str(subjective_score) if subjective_score is not None else "N/A"},
+        {"type": "subjective_rationale", "text": c.get("subjective_rationale") or "N/A"},
+    ]
+
+
 def rank_referral(referral_id: str) -> list[dict]:
     """Backs POST /rank-referral/{referral_id}. Runs all three layers for a
     referral, writes ranking_results, and returns the SW-facing ranked list
     (plan §7).
+
+    Also writes referral_service_candidates -- the only table advance_referral()
+    reads to pick a service -- and hands control back to it, so a referral is never
+    left parked at status='ranking' just because ranking_results was written
+    (handoff-ranking-candidates.md §1-3).
     """
     referral = db.get_referral(referral_id)
     patient = db.get_patient(referral["patient_id"])
@@ -281,6 +304,35 @@ def rank_referral(referral_id: str) -> list[dict]:
         for c in candidates
     ]
     db.upsert_ranking_results(rows)
+
+    candidate_rows = [
+        {
+            "referral_id": referral_id,
+            "service_id": c["service"]["id"],
+            "rank": c["rank"],
+            "score": c["combined_score"],
+            "eligibility_state": "unknown",
+            "candidate_status": "available",
+            "reasons": _candidate_reasons(c),
+        }
+        for c in survivors
+    ]
+    db.upsert_referral_service_candidates(candidate_rows)
+
+    # Best-effort: an unrelated hiccup here shouldn't hide ranking results that
+    # already wrote successfully. The candidate write above is the actual
+    # blocker (handoff-ranking-candidates.md §1) and is allowed to raise; closing
+    # the action + advancing the referral is a courtesy to the orchestrator.
+    try:
+        open_action = db.get_open_rank_resources_action(referral_id)
+        if open_action is not None:
+            db.close_rank_resources_action(open_action["id"], len(candidate_rows))
+        db.advance_referral(referral_id)
+    except Exception:
+        logger.exception(
+            "closing rank_resources / advance_referral failed for referral_id=%s",
+            referral_id,
+        )
 
     return db.get_ranking_results(referral_id)
 
