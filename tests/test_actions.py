@@ -137,7 +137,12 @@ def test_submit_writes_a_shared_attempt_and_hands_control_back(tmp_path):
     assert report["status"] == "success"
     row = db.shared_attempts[0]
     assert row["provider"] == "karthik_form" and row["outcome"] == "submitted"
-    assert row["channel"] == "email"                    # transport_intake is a pdf target
+    # `online_form`, NOT `email`, even though transport_intake is a pdf: the attempt is
+    # recorded under the channel the scheduler DISPATCHED (the service is configured for
+    # online_form), because that is the value advance_referral's exhaustion test compares
+    # against. Recording the document format instead stalls the referral — see
+    # CHANNEL_FOR_TARGET and tests/test_worker.py.
+    assert row["channel"] == "online_form"
     # the action is closed, and control returned to the DB scheduler
     assert [a["action_status"] for a in db._actions if a["id"] == aid] == ["completed"]
     assert "state" in report["advanced"]

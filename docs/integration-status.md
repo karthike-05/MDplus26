@@ -1,6 +1,24 @@
 # Integration status & next steps (pick-up doc)
 
-**Last updated:** 2026-07-26 · branch `integration/voice-ranking-seams`
+**Last updated:** 2026-07-27
+
+> **2026-07-27 — what changed.** We now poll **two** components, not one: `karthik_form`
+> and **`backend`** (ownership confirmed; it previously had no poller anywhere, so a
+> single `select_resource` row deadlocked its referral). A real runner drives both —
+> [`orchestrator/worker.py`](../backend/orchestrator/worker.py), started in the FastAPI
+> lifespan, with crash recovery for actions stuck `in_progress`. Inbound webhooks persist
+> to `integration_events`. The backend serves the built frontend, so the product is one
+> deployable. A new **Integration** screen (`GET /api/system`) shows the queue, the
+> worker and the named blockers.
+>
+> Live mode also had three defects that offline could never surface, now fixed: the
+> referral column map silently dropped `status` (the live board showed everything as
+> `created`), `referrals` has no `form_id` column (resolved via `form_templates`), and
+> `attempts.attempt_number` is NOT NULL with no default.
+>
+> **Still blocked on A1** — nothing writes `referral_service_candidates`. Spec handed to
+> Ranking in [`handoff-ranking-candidates.md`](handoff-ranking-candidates.md). Run
+> `python -m backend.scripts.demo_driver` for a read-only verdict on every live referral.
 
 **Read this first if you just pulled.** Then
 **[`whats-left.md`](whats-left.md)** — the prioritised list of what integration and the

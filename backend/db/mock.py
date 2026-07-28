@@ -8,7 +8,7 @@ Swapping this for ``SupabaseReferralDB`` changes no tool code.
 from __future__ import annotations
 
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -57,6 +57,7 @@ class MockReferralDB:
         self._actions: list[dict] = []               # referral_actions
         self.shared_attempts: list[dict] = []        # attempts, in THEIR vocabulary
         self._candidates: dict[str, list[dict]] = {}  # referral_service_candidates
+        self.integration_events: list[dict] = []     # integration_events (A12)
 
     async def get_patient(self, patient_id: str) -> dict:
         return dict(self._patients[patient_id])
@@ -160,12 +161,16 @@ class MockReferralDB:
         for existing in self._actions:
             if existing["referral_id"] == referral_id and existing["deduplication_key"] == key:
                 return existing["id"]
+        now = datetime.now(timezone.utc)
         action = {
             "id": f"act_{uuid4().hex[:8]}", "referral_id": referral_id,
             "service_id": service_id, "action_type": action_type,
             "action_status": "ready", "assigned_component": component,
             "input_payload": payload or {}, "deduplication_key": key,
             "reason": reason, "result": None, "error_message": None,
+            # Live these are real columns; the mirror needs them so the worker's
+            # crash-recovery sweep (reclaim_stale_actions) has something to age off.
+            "created_at": now, "updated_at": now,
         }
         self._actions.append(action)
         return action["id"]
@@ -179,6 +184,7 @@ class MockReferralDB:
         for a in self._actions:
             if a["id"] == action_id:
                 a["action_status"] = status
+                a["updated_at"] = datetime.now(timezone.utc)
                 if result is not None:
                     a["result"] = result
                 if error is not None:
@@ -186,10 +192,56 @@ class MockReferralDB:
                 return
         raise KeyError(action_id)
 
+    async def reclaim_stale_actions(self, component: str, older_than_seconds: int) -> int:
+        """Mirror of the live sweep: `in_progress` rows older than the cutoff go back to
+        `ready`. Never touches `blocked` — that's the human-review gate, not a crash."""
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)
+        reclaimed = 0
+        for a in self._actions:
+            if (a["assigned_component"] == component
+                    and a["action_status"] == "in_progress"
+                    and a["updated_at"] <= cutoff):
+                a["action_status"] = "ready"
+                a["updated_at"] = datetime.now(timezone.utc)
+                reclaimed += 1
+        return reclaimed
+
     async def record_shared_attempt(self, row: dict) -> None:
         """`attempts` in THEIR vocabulary (status + outcome), which is what
         advance_referral reads to decide whether a channel has been tried."""
         self.shared_attempts.append(dict(row))
+
+    async def next_attempt_number(self, referral_id: str, service_id: str | None) -> int:
+        """Mirror of the live UNIQUE (referral_id, service_id, attempt_number)."""
+        return 1 + sum(1 for a in self.shared_attempts
+                       if a.get("referral_id") == referral_id
+                       and a.get("service_id") == service_id)
+
+    async def list_actions(self, referral_id: str | None = None,
+                           limit: int = 50) -> list[dict]:
+        rows = [dict(a) for a in self._actions
+                if referral_id is None or a["referral_id"] == referral_id]
+        return rows[-limit:][::-1]                # newest first, like the live order
+
+    async def list_integration_events(self, limit: int = 20) -> list[dict]:
+        return [dict(e) for e in self.integration_events[-limit:][::-1]]
+
+    async def list_candidates(self, referral_id: str) -> list[dict]:
+        referral = self._referrals.get(referral_id)
+        return [dict(c) for c in self._candidates_for(referral)] if referral else []
+
+    async def record_integration_event(self, event: dict) -> None:
+        """Append-only inbound log. Deduped on (provider, external_id, event_type) only
+        when external_id is set — matching Postgres, where NULLs never collide."""
+        key = (event.get("provider"), event.get("external_id"), event.get("event_type"))
+        if key[1] is not None:
+            for existing in self.integration_events:
+                if (existing.get("provider"), existing.get("external_id"),
+                        existing.get("event_type")) == key:
+                    existing.update(event)
+                    return
+        self.integration_events.append(
+            {"received_at": datetime.now(timezone.utc).isoformat(), **event})
 
     async def advance_referral(self, referral_id: str) -> dict:
         r = self._referrals.get(referral_id)

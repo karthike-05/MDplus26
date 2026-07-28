@@ -36,6 +36,10 @@ export const STATE_META = {
 export const CHANNEL_LABEL = {
   form: "📄 Form", online_form: "📄 Form", phone: "📞 Phone", email: "✉️ Email",
   text: "💬 Text", sms: "💬 Text", whatsapp: "💬 WhatsApp", escalation: "⚠ Escalation",
+  // A live service with no `service_application_channels` row is treated as instantly
+  // exhausted by advance_referral, so the referral dead-ends. Name it rather than
+  // letting it render as a confident channel it doesn't have.
+  none: "⚠ no channel configured",
 };
 
 // The PATIENT's own answers, kept visually separate from the service's (§7). Two

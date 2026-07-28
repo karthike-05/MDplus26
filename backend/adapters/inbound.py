@@ -23,6 +23,8 @@ change. Phone outcomes use ``phone``.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -91,6 +93,41 @@ class PatientCommsEvent(BaseModel):
     reply_text: str | None = None
 
 
+# --- The durable webhook log (A12) -------------------------------------------
+# `integration_events.provider` is CHECK-constrained to twilio / retell / karthik_form,
+# so an inbound event is logged under the SENDING service's provider name, not ours.
+PROVIDER_FOR_SEAM = {"voice": "retell", "patient_comms": "twilio"}
+
+
+async def _log_event(db: ReferralDB, *, provider: str, event_type: str, payload: dict,
+                     referral_id: str, external_id: str | None,
+                     status: str = "processed", error: str | None = None) -> None:
+    """Persist one inbound webhook. Best-effort by design: the event has already been
+    APPLIED by the time we get here, so failing the request because the audit write
+    failed would turn a bookkeeping problem into a lost referral transition. A failure
+    is printed and swallowed.
+
+    `external_id` is the sender's own id (Retell's call_id, Messaging's outreach_id),
+    which is what makes the live UNIQUE (provider, external_id, event_type) able to
+    collapse a retried webhook into one row. Without one the row still lands — Postgres
+    treats NULLs as distinct — it just won't dedupe.
+    """
+    try:
+        await db.record_integration_event({
+            "provider": provider,
+            "event_type": event_type,
+            "payload": payload,
+            "referral_id": referral_id,
+            "external_id": external_id,
+            "processing_status": status,
+            "error_message": error,
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as exc:                      # noqa: BLE001 — see docstring
+        print(f"[inbound] integration_events write failed (non-fatal): "
+              f"{type(exc).__name__}: {exc}")
+
+
 def build_router(db: ReferralDB, tools: Tools) -> APIRouter:
     """Return the inbound-adapter router bound to this app's ``db`` + tool map.
 
@@ -120,35 +157,59 @@ def build_router(db: ReferralDB, tools: Tools) -> APIRouter:
             "steps": [o.model_dump() for o in steps],
         }
 
+    async def _handle(body, *, provider: str, event_type: str, mapped,
+                      known: list[str], channel_for: str, data_key: str) -> dict:
+        """Shared shape for both seams: log the raw event, then apply it.
+
+        Every arrival is logged, including the two rejections — an unrecognised
+        vocabulary word and an unknown referral are exactly the failures you want a
+        durable trace of, since both are silent from the sender's side (A12).
+        """
+        payload = body.model_dump()
+        external_id = getattr(body, "call_id", None) or getattr(body, "outreach_id", None)
+
+        if mapped is None:
+            await _log_event(db, provider=provider, event_type=event_type, payload=payload,
+                             referral_id=body.referral_id, external_id=external_id,
+                             status="failed", error=f"unknown value; expected one of {known}")
+            raise HTTPException(422, f"unknown {provider} value; expected one of {known}")
+
+        try:
+            await db.get_referral(body.referral_id)
+        except KeyError:
+            # referral_id is a FK, so an unknown one cannot be stored — log it detached
+            # rather than losing the trace entirely.
+            await _log_event(db, provider=provider, event_type=event_type, payload=payload,
+                             referral_id=None, external_id=external_id,
+                             status="failed", error=f"unknown referral '{body.referral_id}'")
+            raise HTTPException(404, f"unknown referral '{body.referral_id}'")
+
+        status, channel = mapped if isinstance(mapped, tuple) else (mapped, channel_for)
+        data = body.model_dump(exclude_none=True, exclude={"referral_id", "attempt_no"})
+        data[data_key] = event_type          # keep the raw value for the UI / audit
+        result = await _apply_and_cascade(
+            body.referral_id, status=status, channel=channel,
+            attempt_no=body.attempt_no, data=data,
+        )
+        await _log_event(db, provider=provider, event_type=event_type, payload=payload,
+                         referral_id=body.referral_id, external_id=external_id)
+        return result
+
     @router.post("/api/voice/call-outcome")
     async def voice_call_outcome(body: VoiceCallOutcome) -> dict:
-        status = VOICE_STATUS_MAP.get(body.status)
-        if status is None:
-            raise HTTPException(
-                422, f"unknown voice status '{body.status}'; "
-                     f"expected one of {sorted(VOICE_STATUS_MAP)}",
-            )
-        data = body.model_dump(exclude_none=True, exclude={"referral_id", "attempt_no"})
-        data["voice_status"] = body.status   # keep the raw status for the UI / audit
-        return await _apply_and_cascade(
-            body.referral_id, status=status, channel="phone",
-            attempt_no=body.attempt_no, data=data,
+        return await _handle(
+            body, provider=PROVIDER_FOR_SEAM["voice"], event_type=body.status,
+            mapped=VOICE_STATUS_MAP.get(body.status), known=sorted(VOICE_STATUS_MAP),
+            channel_for="phone", data_key="voice_status",
         )
 
     @router.post("/api/patient-comms/event")
     async def patient_comms_event(body: PatientCommsEvent) -> dict:
-        mapped = PATIENT_COMMS_EVENT_MAP.get(body.event)
-        if mapped is None:
-            raise HTTPException(
-                422, f"unknown patient-comms event '{body.event}'; "
-                     f"expected one of {sorted(PATIENT_COMMS_EVENT_MAP)}",
-            )
-        status, channel = mapped
-        data = body.model_dump(exclude_none=True, exclude={"referral_id", "attempt_no"})
-        data["patient_comms_event"] = body.event
-        return await _apply_and_cascade(
-            body.referral_id, status=status, channel=channel,
-            attempt_no=body.attempt_no, data=data,
+        return await _handle(
+            body, provider=PROVIDER_FOR_SEAM["patient_comms"], event_type=body.event,
+            mapped=PATIENT_COMMS_EVENT_MAP.get(body.event),
+            known=sorted(PATIENT_COMMS_EVENT_MAP), channel_for="whatsapp",
+            data_key="patient_comms_event",
         )
 
     return router

@@ -4,6 +4,7 @@ import ReviewUI from "./ReviewUI.jsx";
 import Dashboard from "./Dashboard.jsx";
 import Services from "./Services.jsx";
 import Initiate from "./Initiate.jsx";
+import Integration from "./Integration.jsx";
 import ReferralDetail from "./ReferralDetail.jsx";
 import { api } from "./api.js";
 import { C } from "./ui.jsx";
@@ -19,6 +20,7 @@ function App() {
     ["dashboard", "Dashboard"],
     ["services", "Services"],
     ["initiate", "New referral"],
+    ["integration", "Integration"],
   ];
 
   return (
@@ -45,6 +47,7 @@ function App() {
           onNew={() => setView({ name: "initiate" })}
         />
       )}
+      {view.name === "integration" && <Integration />}
       {view.name === "services" && <Services onStart={(svc) => setView({ name: "initiate", serviceId: svc.id })} />}
       {view.name === "initiate" && (
         <Initiate

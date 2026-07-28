@@ -10,6 +10,8 @@ frontend/dist/
 
 # packages and venv
 .env
+.env.*
+!.env.example
 .venv/
 supabase/
 *.json

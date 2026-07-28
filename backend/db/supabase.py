@@ -99,20 +99,34 @@ REFERRAL_COLS = {
     "patient_id": "patient_id",
     "service_id": "service_id",
     "need_category": "need_category",
-    # !! NEITHER OF THESE EXISTS YET — the adapter cannot be flipped until they do.
-    # `current_state` is the scheduler's spine (§7) and is blocked on a design call:
-    # the live DB already ships an `advance_referral()` function plus a
-    # `referral_actions` queue, so a second state field may be a competing owner of
-    # truth rather than a gap. Do NOT reuse their `status` (not_started / in_progress /
-    # waiting_for_consent) — overlapping meaning, different vocabulary.
-    "current_state": "current_state",
-    "form_id": "form_id",                # or drop entirely: derive via form_templates
+    # THEIR workflow columns. These are reads for us — `advance_referral()` owns writing
+    # them (§7a) — but they must be mapped or `_to_ours` silently DROPS them, and the
+    # dashboard then renders every live referral as `created` because `_display_state`
+    # has no `status` to translate. That was the live board's actual behaviour until
+    # 2026-07-27; the omission is invisible offline, where the mock supplies its own.
+    "status": "status",
+    "completion_outcome": "completion_outcome",           # incl. milestone 2's answer
+    "patient_confirmed_utilization": "patient_confirmed_utilization",
+    "patient_confirmed_at": "patient_confirmed_at",
+    "consent_confirmed_at": "consent_confirmed_at",
+    "current_resource_rank": "current_resource_rank",
+    "escalation_reason": "escalation_reason",
+    "completed_at": "completed_at",
+    "assigned_to": "assigned_to",
+    "urgency": "urgency",
     # -- no column on `referrals`: --
+    # `current_state` is our scheduler's spine (§7) and MUST NOT be added: the live DB
+    # ships `advance_referral()` + `referral_actions`, so a second state column would be
+    # a second owner of truth. Their `status` is read above and translated for display
+    # only; nothing writes our vocabulary into it.
+    "current_state": None,
+    "form_id": None,                     # resolved via form_templates.service_id
+                                         # (see _resolve_form_id) — no column here
     "outreach_channel": None,            # derive from service_application_channels
     "service_name": None,                # join services.name on service_id
     "referring_clinic": None,            # patients.referring_clinic_name
-    "appointment_date": None,            # patients.appointment_date (timestamptz)
-    "appointment_time": None,            # folded into patients.appointment_date
+    "appointment_date": None,            # service_requests.requested_date
+    "appointment_time": None,            # service_requests.requested_start_time
 }
 # ToolOutcome field -> `attempts` column. The shared write contract all three
 # submission methods (form/sms/phone) conform to (§5b).
@@ -212,12 +226,16 @@ class SupabaseReferralDB(ReferralDB):
         )
 
     async def set_state(self, referral_id: str, state: str) -> None:
-        pool = await self._p()
-        await pool.execute(
-            f"UPDATE {TABLES['referrals']} SET {REFERRAL_COLS['current_state']} = $2 "
-            f"WHERE {REFERRAL_COLS['id']} = $1",
-            referral_id, state,
-        )
+        """No-op against the live DB, on purpose (§7a).
+
+        There is no `current_state` column and there must never be one: live,
+        `advance_referral()` owns transitions, and writing our vocabulary into their
+        `status` would corrupt the column every other service branches on. Our scheduler
+        still calls this — it's the offline driver — so this has to absorb the call
+        rather than raise, or every offline-shaped code path would break on the flip.
+        The live equivalent of "advance" is `advance_referral()`.
+        """
+        return None
 
     # --- Intake front door ----------------------------------------------------
 
@@ -285,11 +303,10 @@ class SupabaseReferralDB(ReferralDB):
         return out
 
     async def create_referral(self, patient_id: str, form_id: str, **extra) -> str:
-        base = {
-            REFERRAL_COLS["patient_id"]: patient_id,
-            REFERRAL_COLS["form_id"]: form_id,
-            REFERRAL_COLS["current_state"]: "created",  # §7
-        }
+        # `form_id` and `current_state` have no live column (see REFERRAL_COLS), so they
+        # are deliberately absent here: a new referral starts at their default
+        # `status='not_started'`, and the form is resolved via form_templates.
+        base = {REFERRAL_COLS["patient_id"]: patient_id}
         for k, v in extra.items():
             # `is not None` skips contract keys with no live column (service_name,
             # outreach_channel, referring_clinic, appointment_*) — they're derived.
@@ -354,6 +371,70 @@ class SupabaseReferralDB(ReferralDB):
         pool = await self._p()
         out = await pool.fetchval("SELECT advance_referral($1)", referral_id)
         return json.loads(out) if isinstance(out, str) else (out or {})
+
+    async def next_attempt_number(self, referral_id: str, service_id: str | None) -> int:
+        """`attempts.attempt_number` is NOT NULL with no default and carries a UNIQUE
+        (referral_id, service_id, attempt_number). `IS NOT DISTINCT FROM` so a NULL
+        service_id matches NULL rather than never matching."""
+        pool = await self._p()
+        n = await pool.fetchval(
+            "SELECT max(attempt_number) FROM attempts "
+            "WHERE referral_id = $1 AND service_id IS NOT DISTINCT FROM $2",
+            referral_id, service_id,
+        )
+        return (n or 0) + 1
+
+    async def reclaim_stale_actions(self, component: str, older_than_seconds: int) -> int:
+        """Crash recovery (A5): `in_progress` rows older than the cutoff go back to
+        `ready`. `blocked` is deliberately excluded — that's the human-review gate."""
+        pool = await self._p()
+        rows = await pool.fetch(
+            "UPDATE referral_actions SET action_status = 'ready', updated_at = now() "
+            "WHERE assigned_component = $1 AND action_status = 'in_progress' "
+            "AND updated_at < now() - make_interval(secs => $2::float) RETURNING id",
+            component, float(older_than_seconds),
+        )
+        return len(rows)
+
+    # --- Read-only diagnostics ------------------------------------------------
+
+    async def list_actions(self, referral_id: str | None = None,
+                           limit: int = 50) -> list[dict]:
+        pool = await self._p()
+        if referral_id is None:
+            rows = await pool.fetch(
+                "SELECT * FROM referral_actions ORDER BY created_at DESC LIMIT $1", limit)
+        else:
+            rows = await pool.fetch(
+                "SELECT * FROM referral_actions WHERE referral_id = $1 "
+                "ORDER BY created_at DESC LIMIT $2", referral_id, limit)
+        return [dict(r) for r in rows]
+
+    async def list_integration_events(self, limit: int = 20) -> list[dict]:
+        pool = await self._p()
+        rows = await pool.fetch(
+            "SELECT * FROM integration_events ORDER BY received_at DESC LIMIT $1", limit)
+        return [dict(r) for r in rows]
+
+    async def list_candidates(self, referral_id: str) -> list[dict]:
+        pool = await self._p()
+        rows = await pool.fetch(
+            "SELECT * FROM referral_service_candidates WHERE referral_id = $1 "
+            "ORDER BY rank", referral_id)
+        return [dict(r) for r in rows]
+
+    async def record_integration_event(self, event: dict) -> None:
+        cols = list(event)
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))
+        values = [json.dumps(v) if isinstance(v, (dict, list)) else v for v in event.values()]
+        updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols
+                            if c not in ("provider", "external_id", "event_type"))
+        pool = await self._p()
+        await pool.execute(
+            f"INSERT INTO integration_events ({', '.join(cols)}) VALUES ({placeholders}) "
+            f"ON CONFLICT (provider, external_id, event_type) DO UPDATE SET {updates}",
+            *values,
+        )
 
     # --- service_requests ---------------------------------------------------
     # No *_COLS map here on purpose: the form schemas' `source` paths already name

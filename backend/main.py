@@ -14,7 +14,10 @@ Uses MockReferralDB now; swapping in SupabaseReferralDB changes nothing here.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -26,8 +29,10 @@ from contracts.models import DashboardRow
 from backend.adapters.inbound import build_router as build_inbound_router
 from backend.db.interface import ReferralDB
 from backend.db.mock import MockReferralDB
+from backend.orchestrator import actions as act
 from backend.orchestrator import scheduler
 from backend.orchestrator import state_machine as sm
+from backend.orchestrator import worker
 from backend.tools.fill_form.fill_form import prepare, submit
 from backend.tools.fill_form.pdf_render import get_page_size, render_page_png
 from backend.tools.make_phone_call import make_phone_call
@@ -113,7 +118,31 @@ class DBSwitch:
         self._impl = impl
 
 
-app = FastAPI(title="Catalyst-26")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Own the `karthik_form` worker for the life of the process (A5).
+
+    The worker holds `db` — the DBSwitch, not the implementation — so flipping the data
+    source from the UI redirects the running worker too, rather than leaving it polling
+    the store you just switched away from.
+    """
+    task = None
+    worker.status.enabled = worker.enabled()
+    if worker.status.enabled:
+        task = asyncio.create_task(worker.run_forever(db))
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+            # Await the cancellation so the loop's `finally` runs before the process
+            # exits — otherwise a shutdown mid-tick can leave an action `in_progress`
+            # with nothing to reclaim it until the next deploy.
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+app = FastAPI(title="Catalyst-26", lifespan=lifespan)
 
 # The Vite dev server is the default so local dev needs no config. A deployed frontend
 # lives on another origin, so ALLOWED_ORIGINS (comma-separated) must list it or every
@@ -248,7 +277,10 @@ async def _dashboard_row(referral: dict) -> dict:
     row = DashboardRow(
         referral_id=referral["id"],
         patient_name=patient.get("name", ""),
-        service_name=referral.get("service_name", ""),
+        # `or ""` not `.get(k, "")`: live the key EXISTS and is None whenever the
+        # referral has no service yet (a shortlist that hasn't been chosen from), and
+        # DashboardRow.service_name is a plain str.
+        service_name=referral.get("service_name") or "",
         current_state=state,
         confirmation_source=_confirmation_source(state),
         needs_attention=state in (sm.NEEDS_HUMAN, sm.ESCALATED),
@@ -256,7 +288,13 @@ async def _dashboard_row(referral: dict) -> dict:
     ).model_dump()
     # Extra fields the UI needs to route actions (superset of the frozen contract).
     row.update({
-        "outreach_channel": referral.get("outreach_channel", "form"),
+        # `none` rather than defaulting to "form": live, a service with no
+        # `service_application_channels` row is instantly "exhausted" by
+        # advance_referral step 9 and the referral dead-ends. Showing a confident
+        # "via Form" there would hide the single most likely reason a live referral
+        # stops moving.
+        "outreach_channel": referral.get("outreach_channel")
+                            or ("form" if referral.get("current_state") else "none"),
         "form_id": referral.get("form_id"),
         "patient_id": referral["patient_id"],
         "service_id": referral.get("service_id"),
@@ -270,9 +308,31 @@ async def _dashboard_row(referral: dict) -> dict:
     return row
 
 
+def _owns_transitions() -> bool:
+    """True when OUR scheduler drives the loop, false when the DB's does (§7a).
+
+    Offline, `scheduler.py` + `referrals.current_state` are the spine. Live there is no
+    `current_state` column at all and `advance_referral()` owns every transition, so the
+    routes that push the loop have to behave differently — silently calling `set_state`
+    against the live DB is a no-op, which looks exactly like a working button that does
+    nothing.
+    """
+    return db.kind == "MockReferralDB"
+
+
 async def _advance_result(referral_id: str, steps) -> dict:
     referral = await db.get_referral(referral_id)
-    return {"state": referral["current_state"], "steps": [o.model_dump() for o in steps]}
+    return {"state": _display_state(referral), "steps": [o.model_dump() for o in steps]}
+
+
+def _require_our_scheduler() -> None:
+    if not _owns_transitions():
+        raise HTTPException(
+            409,
+            "This endpoint drives OUR offline scheduler, but the live DB's "
+            "advance_referral() owns transitions here (CLAUDE.md §7a). Use the worker "
+            "(GET /api/worker) — or switch the data source to `mock` — instead.",
+        )
 
 
 def _slugify_category(category: str) -> str:
@@ -303,9 +363,23 @@ def _service_backfill(svc: dict) -> dict:
 async def get_review(referral_id: str) -> dict:
     try:
         referral = await db.get_referral(referral_id)
-        schema = await db.get_form_schema(referral["form_id"])
     except KeyError:
         raise HTTPException(404, f"unknown referral '{referral_id}'")
+    form_id = referral.get("form_id")
+    if not form_id:
+        # Live, the form comes from `form_templates.service_id`, which starts empty
+        # (A6). Say so — the alternative is a bare KeyError that reads like a bug in the
+        # review screen rather than a table that hasn't been seeded.
+        raise HTTPException(
+            404,
+            f"referral '{referral_id}' has no form: no active `form_templates` row for "
+            f"service '{referral.get('service_id')}'. Seed one with "
+            f"`python -m backend.scripts.seed_form_templates --list`.",
+        )
+    try:
+        schema = await db.get_form_schema(form_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown form '{form_id}' for referral '{referral_id}'")
     payload = await prepare(referral_id, db)
     pdf = ROOT / schema.source_ref
     return {
@@ -334,15 +408,32 @@ async def post_submit(referral_id: str, body: ReviewedValues) -> dict:
         referral = await db.get_referral(referral_id)
     except KeyError:
         raise HTTPException(404, f"unknown referral '{referral_id}'")
-    from_state = referral["current_state"]
+    from_state = _display_state(referral)
     outcome = await submit(
         referral_id, body.values, db,
         attempt_id=scheduler.attempt_id_for(referral_id, from_state),
         from_state=from_state,
     )
-    await db.set_state(referral_id, sm.next_state(from_state, outcome.status))
+
+    if _owns_transitions():
+        await db.set_state(referral_id, sm.next_state(from_state, outcome.status))
+        advanced = None
+    else:
+        # Live, a submit is an `attempts` row plus a handoff back to the DB scheduler —
+        # the same two steps the worker takes (orchestrator/actions.py). Doing only our
+        # own `record_attempt` here would leave the shared log, and therefore the
+        # ranker's responsiveness score and advance_referral's channel bookkeeping,
+        # blind to a submission that really happened.
+        schema = await db.get_form_schema(referral["form_id"])
+        attempt_no = await db.next_attempt_number(referral_id, referral.get("service_id"))
+        await db.record_shared_attempt(
+            act.attempt_row(referral, outcome, schema.target_type, attempt_no,
+                            referral.get("outreach_channel")))
+        advanced = await db.advance_referral(referral_id)
+
     new = await db.get_referral(referral_id)
-    return {"outcome": outcome.model_dump(), "state": new["current_state"]}
+    return {"outcome": outcome.model_dump(), "state": _display_state(new),
+            "advanced": advanced}
 
 
 # --- Dashboard + detail ------------------------------------------------------
@@ -373,6 +464,143 @@ def _db_status() -> dict:
 @app.get("/api/db")
 async def get_db_mode() -> dict:
     return _db_status()
+
+
+@app.get("/api/worker")
+async def get_worker_status() -> dict:
+    """What the action-queue worker has actually done (A5). Live, the most common
+    failure is silence — nothing polls and nothing errors — so this is deliberately
+    rendered on the dashboard rather than left to logs."""
+    return worker.status.as_dict()
+
+
+# Who is meant to be listening on the shared bus, and who owns them. Rendered as the
+# integration panel — the point of the screen is that an component with no poller is
+# invisible in every other view, because an unserviced action raises nothing.
+COMPONENTS = [
+    {"name": "karthik_form", "owner": "Form-fill (us)", "polled_by_us": True},
+    {"name": "backend", "owner": "Form-fill (us) — confirmed 2026-07-27", "polled_by_us": True},
+    {"name": "twilio", "owner": "Messaging", "polled_by_us": False},
+    {"name": "retell", "owner": "Voice", "polled_by_us": False},
+    {"name": "social_worker", "owner": "the dashboard (B2: no screen yet)",
+     "polled_by_us": False},
+]
+
+OPEN_STATUSES = ("ready", "in_progress", "blocked")
+
+
+def _blockers(actions_by_component: dict, candidates_total: int, live: bool) -> list[dict]:
+    """Turn "nothing is happening" into a named cause.
+
+    Every live failure mode here is silent — an unserviced action, an empty shortlist, a
+    webhook URL nobody set. Left to logs they all present identically as a board that
+    stops updating, which is exactly the state you cannot debug in front of an audience.
+    """
+    out = []
+    if not live:
+        return out
+
+    if candidates_total == 0:
+        out.append({
+            "id": "A1", "severity": "blocker", "owner": "Ranking / Data",
+            "title": "Nothing writes referral_service_candidates",
+            "detail": "advance_referral() reads this table to pick a service. It is empty, "
+                      "so every referral parks at status='ranking'. See "
+                      "docs/handoff-ranking-candidates.md.",
+        })
+
+    for component in COMPONENTS:
+        if component["polled_by_us"]:
+            continue
+        open_rows = [a for a in actions_by_component.get(component["name"], [])
+                     if a["action_status"] in OPEN_STATUSES]
+        if open_rows:
+            out.append({
+                "id": "A3/A4", "severity": "warning", "owner": component["owner"],
+                "title": f"{len(open_rows)} open action(s) for `{component['name']}`",
+                "detail": "Queued and unclaimed. advance_referral's first guard is "
+                          "\"any open action -> waiting\", so each one freezes its referral "
+                          f"until {component['owner']} claims it.",
+            })
+
+    if not os.getenv("SERVICE_RANKING_BASE_URL"):
+        out.append({
+            "id": "env", "severity": "info", "owner": "us",
+            "title": "SERVICE_RANKING_BASE_URL is unset",
+            "detail": "The ranking proxy routes are inert without it.",
+        })
+    return out
+
+
+@app.get("/api/system")
+async def system_status() -> dict:
+    """Everything needed to see the four-service loop on one screen.
+
+    Deliberately one round trip: during a walkthrough you want the queue, the worker and
+    the blockers to be a consistent snapshot of the same instant, not three fetches that
+    disagree.
+    """
+    live = not _owns_transitions()
+    try:
+        all_actions = await db.list_actions(limit=100)
+    except Exception as exc:                      # noqa: BLE001 — panel must still render
+        return {"error": f"{type(exc).__name__}: {exc}", "db": _db_status(),
+                "worker": worker.status.as_dict()}
+
+    by_component: dict[str, list[dict]] = {}
+    for action in all_actions:
+        by_component.setdefault(action.get("assigned_component", "?"), []).append(action)
+
+    referrals = await db.list_referrals()
+    candidates_total = 0
+    for referral in referrals:
+        candidates_total += len(await db.list_candidates(referral["id"]))
+
+    return {
+        "db": _db_status(),
+        "worker": worker.status.as_dict(),
+        "components": [
+            {
+                **component,
+                "open": sum(1 for a in by_component.get(component["name"], [])
+                            if a["action_status"] in OPEN_STATUSES),
+                "total": len(by_component.get(component["name"], [])),
+            }
+            for component in COMPONENTS
+        ],
+        "queue": [
+            {
+                "id": str(a.get("id")),
+                "referral_id": str(a.get("referral_id")),
+                "action_type": a.get("action_type"),
+                "action_status": a.get("action_status"),
+                "component": a.get("assigned_component"),
+                "error": a.get("error_message"),
+                "created_at": str(a.get("created_at")) if a.get("created_at") else None,
+            }
+            for a in all_actions[:25]
+        ],
+        "events": [
+            {
+                "provider": e.get("provider"),
+                "event_type": e.get("event_type"),
+                "referral_id": str(e.get("referral_id")) if e.get("referral_id") else None,
+                "processing_status": e.get("processing_status"),
+                "error": e.get("error_message"),
+                "received_at": str(e.get("received_at")) if e.get("received_at") else None,
+            }
+            for e in await db.list_integration_events(limit=15)
+        ],
+        "candidates_total": candidates_total,
+        "blockers": _blockers(by_component, candidates_total, live),
+    }
+
+
+@app.get("/health")
+async def health() -> dict:
+    """Deploy health check. Reports the worker too: a process that answers HTTP while
+    its worker died is "up" by every naive check and completely broken in practice."""
+    return {"ok": True, "db": _db_status(), "worker": worker.status.as_dict()}
 
 
 class DBMode(BaseModel):
@@ -424,6 +652,7 @@ async def get_referral_detail(referral_id: str) -> dict:
 async def run_referral(referral_id: str) -> dict:
     """Dispatch auto-tools until the referral is terminal, waiting for inbound, or at
     the form-review gate. This is how the dashboard's action buttons push the loop."""
+    _require_our_scheduler()
     try:
         await db.get_referral(referral_id)
     except KeyError:
@@ -435,6 +664,7 @@ async def run_referral(referral_id: str) -> dict:
 @app.post("/api/referrals/{referral_id}/inbound")
 async def post_inbound(referral_id: str, body: Inbound) -> dict:
     """Record a (simulated) inbound signal, then cascade any push states it unblocks."""
+    _require_our_scheduler()
     if body.signal not in INBOUND:
         raise HTTPException(400, f"unknown signal '{body.signal}'")
     try:
@@ -586,3 +816,38 @@ async def get_ranking_endpoint(referral_id: str) -> dict:
 @app.post("/api/referrals/{referral_id}/choose-service")
 async def choose_service_endpoint(referral_id: str, body: ChooseService) -> dict:
     return await _choose_service(referral_id, body, db)
+
+
+# --- Serve the built frontend (one deployable, not two) -----------------------
+# MOUNTED LAST, deliberately: a StaticFiles mount at "/" swallows every path, so any
+# route declared after it is unreachable. Keep this the final statement in the file.
+#
+# WHY SERVE IT FROM HERE AT ALL. `VITE_API_BASE` is inlined at BUILD time, so a
+# separately-hosted frontend has to be rebuilt whenever the backend URL changes — which,
+# behind a `cloudflared` tunnel, is every restart. Served same-origin the variable can
+# stay empty, relative `/api/...` calls just work, and CORS stops mattering. It also
+# makes the whole product one Railway service instead of two.
+#
+# Absent (nobody ran `npm run build`), this is skipped and the API still serves normally
+# — `npm run dev` on :5173 remains the dev loop.
+
+FRONTEND_DIST = ROOT / "frontend" / "dist"
+
+if FRONTEND_DIST.is_dir():
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
+
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa(full_path: str):
+        """SPA fallback. The app routes client-side, so a deep link like /?referral=…
+        must return index.html rather than a 404. Unknown /api paths are excluded so a
+        typo'd endpoint still 404s as JSON instead of silently returning the HTML shell —
+        which is a genuinely confusing way to debug a broken fetch."""
+        if full_path.startswith("api/"):
+            raise HTTPException(404, f"no such endpoint '/{full_path}'")
+        candidate = FRONTEND_DIST / full_path
+        if full_path and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(FRONTEND_DIST / "index.html")
