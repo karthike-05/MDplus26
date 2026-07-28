@@ -897,15 +897,28 @@ if FRONTEND_DIST.is_dir():
 
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
 
+    _DIST_ROOT = FRONTEND_DIST.resolve()
+
     @app.get("/{full_path:path}", include_in_schema=False)
     async def spa(full_path: str):
         """SPA fallback. The app routes client-side, so a deep link like /?referral=…
         must return index.html rather than a 404. Unknown /api paths are excluded so a
         typo'd endpoint still 404s as JSON instead of silently returning the HTML shell —
-        which is a genuinely confusing way to debug a broken fetch."""
+        which is a genuinely confusing way to debug a broken fetch.
+
+        SECURITY — the containment check below is load-bearing, do not remove it.
+        `full_path` is attacker-controlled. Without `.resolve()` + `is_relative_to`,
+        `GET /%2e%2e%2f%2e%2e%2f.env` reads the repo's .env and hands back
+        SUPABASE_SERVICE_ROLE_KEY and ANTHROPIC_API_KEY to anyone who can reach this
+        process — which, behind a tunnel, is the whole internet. Starlette does NOT
+        normalise `..` out of a `:path` parameter, and percent-encoded traversal survives
+        into the string, so this has to be checked here. `.resolve()` also collapses
+        symlinks, so a link inside dist can't point out of it either.
+        """
         if full_path.startswith("api/"):
             raise HTTPException(404, f"no such endpoint '/{full_path}'")
-        candidate = FRONTEND_DIST / full_path
-        if full_path and candidate.is_file():
-            return FileResponse(candidate)
+        if full_path:
+            candidate = (FRONTEND_DIST / full_path).resolve()
+            if candidate.is_file() and candidate.is_relative_to(_DIST_ROOT):
+                return FileResponse(candidate)
         return FileResponse(FRONTEND_DIST / "index.html")

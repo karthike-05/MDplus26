@@ -547,3 +547,38 @@ def _age(db: MockReferralDB, action_id: str, *, seconds: int) -> None:
             a["updated_at"] = datetime.now(timezone.utc) - timedelta(seconds=seconds)
             return
     raise KeyError(action_id)
+
+
+# --- The static file mount (security) -----------------------------------------
+
+def test_spa_fallback_cannot_read_files_outside_dist():
+    """Regression: `GET /%2e%2e%2f%2e%2e%2f.env` returned the repo's .env —
+    SUPABASE_SERVICE_ROLE_KEY and ANTHROPIC_API_KEY — to anyone who could reach this
+    process. Starlette does not normalise `..` out of a `:path` param and
+    percent-encoded traversal survives into the string, so containment has to be
+    enforced in the handler itself.
+
+    Skipped when frontend/dist is absent: the route only exists once the UI is built.
+    """
+    from pathlib import Path
+    from fastapi.testclient import TestClient
+    import backend.main as main
+
+    if not (Path(main.ROOT) / "frontend" / "dist").is_dir():
+        pytest.skip("frontend/dist not built")
+
+    secrets = ("SUPABASE_SERVICE_ROLE_KEY", "ANTHROPIC_API_KEY", "sk-ant", "root:")
+    attacks = [
+        "/%2e%2e%2f%2e%2e%2f.env",
+        "/..%2f..%2f.env",
+        "/%2e%2e/%2e%2e/.env",
+        "/../../.env",
+        "/../../CLAUDE.md",
+        "/....//....//.env",
+        "/../../../../etc/passwd",
+    ]
+    with TestClient(main.app) as client:
+        for path in attacks:
+            body = client.get(path).text
+            assert not any(s in body for s in secrets), f"{path} leaked a secret"
+            assert "<!doctype html" in body.lower(), f"{path} returned a non-SPA body"
