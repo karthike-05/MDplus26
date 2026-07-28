@@ -153,12 +153,30 @@ export default function Dashboard({ onReview, onOpen, onChoose, onNew }) {
                     <tr key={r.referral_id} style={s.tr}>
                       <td style={s.tdName} onClick={() => onOpen(r.referral_id)}>{r.patient_name}</td>
                       <td style={s.td} onClick={() => onOpen(r.referral_id)}>
-                        {r.service_name || "—"}
-                        <div style={{ fontSize: 11, color: C.sub, marginTop: 2 }}>
-                          via {CHANNEL_LABEL[r.outreach_channel] || r.outreach_channel}
-                        </div>
+                        {/* No service yet is a distinct state from a service with no
+                            channel — conflating them made a referral waiting on the SW
+                            read as a misconfigured one. */}
+                        {r.awaiting_sw_selection ? (
+                          <>
+                            <span style={{ color: C.sub }}>not chosen yet</span>
+                            <div style={{ fontSize: 11, color: C.warn, marginTop: 2 }}>
+                              ranked shortlist ready
+                            </div>
+                          </>
+                        ) : (
+                          <>
+                            {r.service_name || "—"}
+                            <div style={{ fontSize: 11, color: C.sub, marginTop: 2 }}>
+                              via {CHANNEL_LABEL[r.outreach_channel] || r.outreach_channel}
+                            </div>
+                          </>
+                        )}
                       </td>
-                      <td style={s.td}><Badge state={r.current_state} /></td>
+                      <td style={s.td}>
+                        {r.awaiting_sw_selection
+                          ? <Badge state="awaiting_sw_selection" />
+                          : <Badge state={r.current_state} />}
+                      </td>
                       <td style={s.td}><ChannelsTried channels={r.channels_tried} count={r.attempt_count} /></td>
                       <td style={s.td}><PatientResponse response={r.patient_response} /></td>
                       <td style={s.td}>

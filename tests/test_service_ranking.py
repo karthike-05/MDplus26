@@ -90,13 +90,54 @@ def test_rank_referral_requires_base_url():
 
 
 def test_get_ranking_proxies_and_returns_results(monkeypatch):
+    """The ranking service is preferred when it has something to say — it carries the
+    display data (names, component scores) that the candidates table doesn't."""
     monkeypatch.setenv("SERVICE_RANKING_BASE_URL", "http://service-ranking.test")
     db = MockReferralDB()
     rid = asyncio.run(db.create_referral("pat_001", None, service_id="svc_capmetro"))
-    results = {"results": []}
+    results = {"results": [{"rank": 1, "service_id": "svc_capmetro",
+                            "service_name": "CapMetro Access NEMT", "combined_score": 88.5}]}
     with patch("httpx.AsyncClient.get", new=AsyncMock(return_value=_mock_response(results))):
         out = asyncio.run(_get_ranking(rid, db))
     assert out == results
+
+
+def test_get_ranking_falls_back_to_candidates_when_the_service_is_down(monkeypatch):
+    """This screen is a HUMAN GATE — the referral is parked until someone picks — so a
+    dependency being asleep doesn't just degrade the view, it blocks the pipeline. The
+    shortlist advance_referral actually acts on is already in our DB, so render that."""
+    import httpx as _httpx
+
+    monkeypatch.setenv("SERVICE_RANKING_BASE_URL", "http://service-ranking.test")
+    db = MockReferralDB()
+    rid = asyncio.run(db.create_referral("pat_001", None, service_id="svc_capmetro"))
+    db._candidates[rid] = [{
+        "service_id": "svc_capmetro", "rank": 1, "score": 88.5,
+        "candidate_status": "available", "eligibility_state": "eligible",
+        # Ranking's own display payload — we render THEIR numbers, not ours recomputed.
+        "reasons": [{"type": "combined_score", "text": "88.5"},
+                    {"type": "objective_score", "text": "91.2"},
+                    {"type": "subjective_rationale", "text": "Wheelchair accessible."}],
+    }]
+
+    boom = AsyncMock(side_effect=_httpx.ConnectError("railway asleep"))
+    with patch("httpx.AsyncClient.get", new=boom):
+        out = asyncio.run(_get_ranking(rid, db))
+
+    assert out["source"] == "referral_service_candidates"
+    [row] = out["results"]
+    assert row["service_name"] == "CapMetro Access NEMT"      # joined from our services
+    assert row["combined_score"] == 88.5
+    assert row["objective_score"] == 91.2
+    assert row["subjective_rationale"] == "Wheelchair accessible."
+
+
+def test_get_ranking_is_still_usable_with_no_ranking_service_configured(monkeypatch):
+    monkeypatch.delenv("SERVICE_RANKING_BASE_URL", raising=False)
+    db = MockReferralDB()
+    rid = asyncio.run(db.create_referral("pat_001", None, service_id="svc_capmetro"))
+    out = asyncio.run(_get_ranking(rid, db))
+    assert out["source"] == "referral_service_candidates"
 
 
 # --- _choose_service: sets service_id on OUR referral + best-effort feedback -

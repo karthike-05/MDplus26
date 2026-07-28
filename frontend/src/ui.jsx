@@ -28,6 +28,10 @@ export const STATE_META = {
   check_in_scheduled: { label: "Check-in sent", color: C.teal },
   completed: { label: "Completed", color: C.ok },
   needs_human: { label: "Needs worker", color: C.warn },
+  // Not a state_machine state — a live-only condition derived from an open
+  // select_resource action (003_sw_selection_gate.sql). Distinct badge because
+  // "Placing" (its underlying status) implies outreach is already happening.
+  awaiting_sw_selection: { label: "Pick a service", color: C.warn },
   escalated: { label: "Escalated", color: C.danger },
 };
 

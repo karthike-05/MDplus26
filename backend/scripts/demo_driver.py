@@ -330,19 +330,40 @@ def reset_selection(c, referral_id: str | None, apply: bool) -> None:
     print(f"referral {referral_id}")
     print(f"  status={r['status']}  service_id={r.get('service_id')}  "
           f"rank={r.get('current_resource_rank')}")
+    stale = [a for a in _rows(c, "referral_actions", referral_id=referral_id)
+             if a["action_status"] not in OPEN]
     print("\nWOULD SET service_id=NULL, current_resource_rank=NULL, status='ranking'")
-    print("  (and release any candidate previously flagged selected)")
+    print("  release any candidate previously flagged selected")
+    print(f"  DELETE {len(stale)} finished action(s) for this referral")
 
     if not apply:
         print("\nDRY RUN — nothing written. Re-run with --yes to apply.")
         return
+
+    # DELETE, not cancel. `queue_referral_action` upserts on
+    # (referral_id, deduplication_key) with ON CONFLICT DO UPDATE SET updated_at — it
+    # does NOT reset action_status. So a completed/cancelled row permanently poisons its
+    # dedup key: advance_referral "queues" the action, gets the dead row's id back, and
+    # the gate silently never fires again. Cost me a confusing ten minutes; deleting is
+    # the only way to genuinely re-arm a referral.
+    c.table("referral_actions").delete().eq("referral_id", referral_id).neq(
+        "action_status", "ready").neq("action_status", "in_progress").neq(
+        "action_status", "blocked").execute()
     c.table("referral_service_candidates").update(
         {"selected": False, "candidate_status": "available"},
     ).eq("referral_id", referral_id).eq("candidate_status", "selected").execute()
     c.table("referrals").update(
         {"service_id": None, "current_resource_rank": None, "status": "ranking"},
     ).eq("id", referral_id).execute()
-    print("\n✔ reset. Run --diagnose; it should now report AWAITING SOCIAL WORKER.")
+
+    # Fire the gate now rather than waiting for something else to advance the referral:
+    # a reset that leaves no open action just looks like nothing happened.
+    print("\n✔ reset. advance_referral ->", advance_referral(c, referral_id))
+
+
+def advance_referral(c, referral_id: str) -> dict:
+    res = c.rpc("advance_referral", {"p_referral_id": referral_id}).execute()
+    return res.data if isinstance(res.data, dict) else {"result": res.data}
 
 
 def main() -> None:

@@ -789,15 +789,72 @@ async def _rank_referral(referral_id: str, db: ReferralDB) -> dict:
 
 
 async def _get_ranking(referral_id: str, db: ReferralDB) -> dict:
+    """The ranked shortlist for the SW selection screen.
+
+    Prefers the ranking service, which returns richer display data (service and
+    organisation names, the raw component scores). Falls back to
+    `referral_service_candidates` — the same run, written by the same code, already in
+    our DB — when that service is unset, asleep or erroring.
+
+    The fallback matters because this screen is a **human gate**: the referral is parked
+    until someone picks, so a dependency being down doesn't merely degrade the view, it
+    blocks the pipeline. The shortlist is already local; there's no reason to be unable
+    to render it.
+    """
     try:
         await db.get_referral(referral_id)
     except KeyError:
         raise HTTPException(404, f"unknown referral '{referral_id}'")
-    base_url = os.environ["SERVICE_RANKING_BASE_URL"]  # required; no silent fallback
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(f"{base_url}/ranking-results/{referral_id}")
-        response.raise_for_status()
-        return response.json()
+
+    base_url = os.environ.get("SERVICE_RANKING_BASE_URL")
+    if base_url:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(f"{base_url}/ranking-results/{referral_id}")
+                response.raise_for_status()
+                payload = response.json()
+            if payload.get("results"):
+                return payload
+        except httpx.HTTPError as e:
+            print(f"[ranking] proxy failed, falling back to candidates: {e}")
+
+    return {"results": await _ranking_from_candidates(referral_id, db),
+            "source": "referral_service_candidates"}
+
+
+async def _ranking_from_candidates(referral_id: str, db: ReferralDB) -> list[dict]:
+    """Shape `referral_service_candidates` like the ranking service's response.
+
+    `reasons` is Ranking's own display payload — an array of `{type, text}` covering the
+    combined/objective/subjective scores and the Layer 3 rationale — so the numbers the
+    screen shows are theirs, not ours recomputed.
+    """
+    out = []
+    for c in await db.list_candidates(referral_id):
+        reasons = {r.get("type"): r.get("text")
+                   for r in (c.get("reasons") or []) if isinstance(r, dict)}
+        try:
+            service = await db.get_service(c["service_id"])
+        except KeyError:
+            service = {}
+
+        def _num(key):
+            try:
+                return float(reasons[key])
+            except (KeyError, TypeError, ValueError):
+                return None
+
+        out.append({
+            "rank": c.get("rank"),
+            "service_id": c.get("service_id"),
+            "service_name": service.get("name"),
+            "organization_name": None,
+            "objective_score": _num("objective_score"),
+            "subjective_score": _num("subjective_score"),
+            "combined_score": _num("combined_score") or float(c.get("score") or 0),
+            "subjective_rationale": reasons.get("subjective_rationale"),
+        })
+    return out
 
 
 async def _choose_service(referral_id: str, body: ChooseService, db: ReferralDB) -> dict:
