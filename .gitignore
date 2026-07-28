@@ -20,6 +20,7 @@ supabase/
 # a NEW form schema would simply never get committed, and the deploy would 404 the
 # review screen with the file sitting happily on the author's disk.
 !contracts/schemas/*.json
+!package.json
 !frontend/package.json
 !frontend/package-lock.json
 node_modules/

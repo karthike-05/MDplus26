@@ -1,0 +1,11 @@
+{
+  "name": "catalyst-26",
+  "private": true,
+  "description": "Root manifest so the deploy builder provisions Node alongside Python. The backend serves frontend/dist (one deployable, CLAUDE.md §4), and dist/ is gitignored, so the frontend MUST be built at deploy time. With only requirements.txt here, Nixpacks detects Python alone and `npm` doesn't exist in the build image. Nothing depends on this file locally — build the frontend with `cd frontend && npm run build` as before.",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "build": "npm ci --prefix frontend && npm run build --prefix frontend"
+  }
+}
