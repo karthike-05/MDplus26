@@ -1,28 +1,16 @@
 # Integration plan — wiring `service_ranking` into the orchestrator
 
-**Last updated: 2026-07-24 — the backend proxy seam is built and unit-tested.** No
-frontend work has been done yet, and live end-to-end testing is blocked on DB
-convergence (§4) — see [`docs/integration-status.md`](../../docs/integration-status.md).
+**Last updated: 2026-07-28.** Two passes are folded into this doc now: the original
+backend-proxy seam (2026-07-24) and the `referral_service_candidates` / action-queue
+wiring that unblocked the live orchestrator (2026-07-28, replacing the standalone
+`handoff-ranking-candidates.md`). This is the single pick-up doc for the **ranking**
+integration going forward.
 
-This is the pick-up doc for the **ranking** integration. It assumes
-[`CLAUDE.md`](../../CLAUDE.md) §2/§5, [`docs/integration-plan.md`](../../docs/integration-plan.md)
+It assumes [`CLAUDE.md`](../../CLAUDE.md) §2/§5, [`docs/integration-plan.md`](../../docs/integration-plan.md)
 ("Ranking" section), and [`docs/integration-status.md`](../../docs/integration-status.md)
 ("Ranking system — how it fits") as background. For the call_agent (Voice) precedent
-this integration follows the same shape as, see
-[`backend/call_agent/integration_plan_call_agent.md`](../call_agent/integration_plan_call_agent.md)
-— read that first if you haven't; this doc assumes familiarity with its patterns
-(proxy endpoints, required-vs-optional env vars, mocked-httpx tests) and doesn't
-re-explain them from scratch.
-
-**Bottom line up front:** ranking is architecturally different from Voice/Messaging —
-it's not an outreach channel, it never writes a `ToolOutcome`, and it doesn't
-participate in `current_state` transitions at all. It runs **upstream** of our loop:
-referral created → ranking picks candidates → a social worker approves → *then* our
-loop runs unchanged. Our backend now proxies ranking's three HTTP endpoints so it's the
-sole caller (frontend never talks to the deployed Railway service directly), and gained
-one new field (`need_category`) plus one new `ReferralDB` method
-(`set_referral_service`) to make that useful. This pass is **backend wiring + tests
-only** — no frontend UI was built; see §5.
+the proxy seam follows, see
+[`backend/call_agent/integration_plan_call_agent.md`](../call_agent/integration_plan_call_agent.md).
 
 ---
 
@@ -34,46 +22,39 @@ only** — no frontend UI was built; see §5.
 | Proxy endpoints (`rank` / `ranking` / `choose-service`) | **built** | [`backend/main.py`](../main.py) |
 | `referrals.need_category` | **built** — auto-derived at referral creation | `backend/main.py`'s `_slugify_category` / `_service_backfill` |
 | `ReferralDB.set_referral_service(...)` | **built** | [`backend/db/interface.py`](../db/interface.py), [`backend/db/mock.py`](../db/mock.py) |
-| Unit tests (mocked network, no live Supabase/Railway) | **built** | [`tests/test_service_ranking.py`](../../tests/test_service_ranking.py) |
-| Frontend ranked-candidate picker UI | **not built** — deferred (§5) | — |
-| Live end-to-end run (real Supabase, real Railway deploy of both services) | **not yet possible** — see §4 | — |
+| **`referral_service_candidates` writer** | **built (2026-07-28)** — every `rank_referral()` call now upserts survivors here, the table `advance_referral()` actually reads | `ranking.py` (`rank_referral`), `db.py` (`upsert_referral_service_candidates`) |
+| **Closing `rank_resources` + calling `advance_referral()`** | **built (2026-07-28)** — same call, right after the candidate write | `db.py` (`get_open_rank_resources_action`, `close_rank_resources_action`, `advance_referral`) |
+| Unit tests (mocked network, no live Supabase/Railway) | **built** — covers the proxy seam only | [`tests/test_service_ranking.py`](../../tests/test_service_ranking.py) |
+| Frontend ranked-candidate picker UI | **not built** — deferred (§7) | — |
+| Poller for `rank_resources` actions | **not built, on purpose** — see §5 | — |
+| Live end-to-end run (real Supabase, real Railway deploy of both services) | **verified live via Supabase MCP (2026-07-28)**; not yet run through the actual Python path — see §6 | — |
 
 `service_ranking` is vendored the same way `call_agent` is (CLAUDE.md §2) — we don't
-import its code, it doesn't import ours. Unlike `call_agent`, this pass didn't require
-editing its files at all: `service_ranking` already exposed a clean HTTP API
-(`main.py`) with no gaps analogous to `call_agent`'s missing `booking_id`-from-
-`referral_id` lookup, so everything here lives entirely on our side.
-
-Deployed base URL (from
-[`ranking_system_plan.md`](ranking_system_plan.md)):
-`https://md-catalyst-service-ranking-production.up.railway.app`. The orchestrator
-backend itself is **not deployed anywhere yet** — local `uvicorn --reload` only (same
-situation as the call_agent integration).
+import its code, it doesn't import ours.
 
 ---
 
 ## 2. Why this is a different shape than Voice/Messaging
 
 Voice and Messaging are **outreach channels**: they're dispatched by the scheduler at
-a specific state, they write a `ToolOutcome`, and an inbound webhook advances
-`current_state` via `scheduler.apply_inbound`. Ranking does none of this. Per
+a specific state, they write a `ToolOutcome`, and an inbound webhook advances state via
+`scheduler.apply_inbound`. Ranking does none of this. Per
 `docs/integration-status.md`'s "Ranking system — how it fits":
 
-> Ranking is UPSTREAM of our loop. Flow: referral created → ranking picks the service
-> (writes `ranking_results`, sets `referrals.service_id` / uses
-> `current_resource_rank`) → SW approves → *then our loop runs* (consent → outreach →
-> confirm → check-in). We consume the chosen `service_id`; we don't rank.
+> Ranking is UPSTREAM of our loop. Flow: referral created → ranking picks candidates
+> (writes `ranking_results` + `referral_service_candidates`) → a service gets selected
+> (auto top-rank, or an SW override) → *then our loop runs* (consent → outreach →
+> confirm → check-in).
 
-So there's no inbound adapter here, no status-vocabulary mapping table, no state-machine
-transition. The entire seam is: our backend calls ranking's HTTP API on a referral that
-already exists, and a human (or, later, a frontend screen) decides what to do with the
-result. This is why the proxy functions in `backend/main.py` are **not** tools
-(`backend/tools/`) — they don't fit `tool(referral_id, db, *, attempt_id, from_state) ->
-ToolOutcome` at all, and shouldn't be forced into that shape.
+So there's no inbound adapter here, no status-vocabulary mapping table, and (per the
+decision in §5) no state-machine transition it owns either — `advance_referral()` still
+decides everything once candidates exist. This is why the proxy functions in
+`backend/main.py` are **not** tools (`backend/tools/`) — they don't fit
+`tool(referral_id, db, *, attempt_id, from_state) -> ToolOutcome` at all.
 
 ---
 
-## 3. The proxy seam
+## 3. The proxy seam (backend/main.py)
 
 Three endpoints on our own backend, each a thin `httpx` proxy plus (for
 `choose-service`) one write to our own DB:
@@ -86,118 +67,193 @@ POST /api/referrals/{id}/choose-service   -> sets OUR service_id, then best-effo
                                               POST /sw-feedback
 ```
 
-`_rank_referral` and `_get_ranking` require `SERVICE_RANKING_BASE_URL`
-(`os.environ[...]`, no fallback — same reasoning as `CALL_AGENT_BASE_URL`: our
-backend isn't deployed anywhere yet, so there's no live service a missing default
-could accidentally protect or break). `_rank_referral` uses a 30s timeout, not the
-usual 10s, because Layer 3 is a live Claude call
-(`backend/service_ranking/ranking.py`'s `run_subjective_scoring`) — it can legitimately
-take longer than a simple DB-backed proxy.
+`_rank_referral` and `_get_ranking` require `SERVICE_RANKING_BASE_URL` (no fallback).
+`_rank_referral` uses a 30s timeout (not the usual 10s) because Layer 3 is a live
+Claude call (`ranking.py`'s `run_subjective_scoring`).
 
 `_choose_service` does two things, with different failure semantics:
-1. **Required:** `await db.set_referral_service(referral_id, service_id,
-   **_service_backfill(svc))` — sets `service_id` + backfills `service_name` /
-   `outreach_channel` / `form_id` / `need_category`, the same backfill `create_referral`
-   already does. If this fails, the whole request fails — this is the SW's actual
-   action and must persist.
-2. **Best-effort:** forward `{referral_id, service_id, label, label_notes}` to
-   `service_ranking`'s `POST /sw-feedback`, wrapped in its own try/except. Skipped
-   entirely (not an error) if `SERVICE_RANKING_BASE_URL` is unset. This mirrors the
-   call_agent integration's Seam B forward exactly: the SW's choice must land on our
-   side regardless of whether `service_ranking`'s own bookkeeping (its `sw_feedback`
-   table, feeding its future few-shot learning loop) is reachable.
+1. **Required:** `db.set_referral_service(...)` — sets `service_id` + backfills
+   `service_name` / `outreach_channel` / `form_id` / `need_category`. Fails the whole
+   request if this fails — it's the SW's actual action.
+2. **Best-effort:** forwards `{referral_id, service_id, label, label_notes}` to
+   `service_ranking`'s `POST /sw-feedback`, wrapped in its own try/except — skipped
+   (not an error) if `SERVICE_RANKING_BASE_URL` is unset.
 
-All three are implemented as plain `db`-injected async functions
-(`_rank_referral`, `_get_ranking`, `_choose_service`) with thin `@app.post`/`@app.get`
-route wrappers around them — **not** just route closures — so tests can call them
-directly with a fresh `MockReferralDB()`. This matches this repo's existing test
-convention (`tests/test_dashboard.py` and `tests/test_tools.py` both test logic
-functions with an injected mock DB rather than driving the FastAPI app through
-`TestClient`).
+All three are plain `db`-injected async functions with thin route wrappers, so tests
+call them directly with a fresh `MockReferralDB()` (this repo's convention — see
+`tests/test_dashboard.py`, `tests/test_tools.py`).
 
 ---
 
 ## 4. `need_category` — a real live-schema column we didn't model
 
-`ranking.rank_referral(referral_id)` reads `referrals.need_category` directly
-(`backend/service_ranking/db.py`'s `get_referral`) — it's a required input, not an
-optional one, and it's a real column in the live HSDS schema
-(`docs/integration-status.md`'s Supabase findings show `need_category='transportation'`
-on the one live referral row it introspected). Our mock/contract had no equivalent
-field before this pass.
+`ranking.rank_referral(referral_id)` reads `referrals.need_category` directly — a
+required input, and a real column in the live HSDS schema.
 
-**Resolution:** our fixture services already carry a human-readable `category` (e.g.
-`"Transportation"`, `"Food assistance"` — `backend/seed/services.py`). At referral
-creation, when a `service_id` is given (the only case a category is knowable), we
-slugify it (`_slugify_category`: lowercase, `&` → `and`, spaces → `_`) and store it as
-`need_category` alongside the existing `service_name`/`outreach_channel`/`form_id`
-backfill. Zero new required input from the social worker, no frontend change.
-
-This is a **mock-side convenience only** — it makes our own referrals ranking-shaped
-for local dev/testing. The real Supabase `need_category` values are populated
-independently by Data and don't need to match our slug format exactly; when the DB
-flip happens (§ below), align `backend/db/supabase.py`'s column maps the same way
-every other reconciled field was.
+**Resolution:** our fixture services already carry a human-readable `category`. At
+referral creation, when a `service_id` is given, we slugify it (`_slugify_category`)
+and store it as `need_category` alongside the existing backfill fields. Mock-side
+convenience only — the real Supabase `need_category` values are populated
+independently by Data.
 
 ---
 
-## 5. Blocking dependency + explicitly deferred scope
+## 5. `referral_service_candidates` + closing the action queue (2026-07-28)
 
-Same shape as the call_agent integration:
+### The problem this fixed
 
-- `service_ranking` has **no mock mode** — it talks directly to real Supabase and
-  needs real HSDS tables (`services`, `service_areas`, `service_at_location`,
-  `locations`, `cost_options`, `schedules`) our fixtures don't model at all. So this
-  wiring is **built and unit-tested** (mocked `httpx`, a fresh `MockReferralDB`), but
-  can't run **live end-to-end** until our backend flips onto the real Supabase path
-  (tracked in `docs/integration-status.md`).
-- **Explicitly deferred this pass (by design, not oversight):** no frontend change.
-  Today a social worker still picks a specific service directly in `Initiate.jsx`,
-  exactly as before. The proxy endpoints exist and are tested, ready for a future
-  frontend pass to build a ranked-candidate picker screen against
-  (`POST /api/referrals/{id}/rank` to trigger + show results,
-  `POST /api/referrals/{id}/choose-service` to record the pick). Until that UI exists,
-  `need_category` is populated but nothing calls `/rank` in the normal referral flow —
-  it's dormant, callable, and tested, not wired into any user-facing path yet.
-- Not modeled: `current_resource_rank` (mentioned in
-  `docs/integration-status.md`/`call_agent/database_usage.md` as a real column) — out
-  of scope for this pass since nothing here reads or writes it.
+`advance_referral()` runs its branches in a fixed order, and the candidate check comes
+**before** the service-selection check — unconditionally, even for a referral that
+already has `service_id` set. No rows in `referral_service_candidates` → the referral
+is bounced to `status='ranking'` and parked forever, regardless of how correct
+everything else looks. `ranking_results` is invisible to `advance_referral()` — as far
+as the DB scheduler is concerned, ranking had never run.
+
+Writing candidates alone isn't enough either: `advance_referral()`'s first guard is
+"any action already open? → return `waiting`, queue nothing." When it hit the
+candidate check it had already queued a `rank_resources` row addressed to `backend`,
+and nothing polls `backend`. So a ranking run has to close that action itself, or the
+referral stays parked one step further down.
+
+### What we built (`ranking.rank_referral()`, right after the existing
+### `db.upsert_ranking_results(rows)` call)
+
+```python
+candidate_rows = [
+    {
+        "referral_id": referral_id,
+        "service_id": c["service"]["id"],
+        "rank": c["rank"],
+        "score": c["combined_score"],
+        "eligibility_state": "unknown",
+        "candidate_status": "available",
+        "reasons": _candidate_reasons(c),
+    }
+    for c in survivors
+]
+db.upsert_referral_service_candidates(candidate_rows)
+
+try:
+    open_action = db.get_open_rank_resources_action(referral_id)
+    if open_action is not None:
+        db.close_rank_resources_action(open_action["id"], len(candidate_rows))
+    db.advance_referral(referral_id)
+except Exception:
+    logger.exception("closing rank_resources / advance_referral failed for referral_id=%s", referral_id)
+```
+
+Writing candidates is **not** wrapped in try/except — that's the actual blocker fix and
+is allowed to raise. Closing the action + advancing the referral *is* wrapped and just
+logged on failure — an unrelated hiccup there shouldn't hide ranking results that
+already wrote successfully.
+
+`get_open_rank_resources_action` queries by `action_type='rank_resources'` +
+`referral_id` rather than by `assigned_component` — verified live that
+`referral_actions_assigned_component_check` only allows
+`backend`/`twilio`/`retell`/`karthik_form`/`social_worker`. There's no `ranking` value,
+and we didn't add one.
+
+### The upsert trap we avoided
+
+`referral_service_candidates` has `UNIQUE(referral_id, rank)`. A blind full-column
+`.upsert()` (Supabase's default) would set `rank` in its `ON CONFLICT DO UPDATE`
+clause too, which can collide mid-statement on a re-rank that permutes the order
+(service A moves 2→1 while B moves 1→2 in the same call).
+
+`upsert_referral_service_candidates` avoids this by splitting explicitly: it reads
+which `(referral_id, service_id)` rows already exist, `.insert()`s the new ones, and
+for existing ones runs a plain `.update()` that only ever touches `score` / `reasons`
+/ `updated_at` — never `rank`, `candidate_status`, or `selected` (the last two are
+maintained by `advance_referral()` itself; clobbering them would erase orchestrator
+progress). **Not handled:** a genuine re-rank that needs to reorder existing rows —
+that needs a delete + re-insert, and only once no candidate has left `'available'`.
+Out of scope for this pass.
+
+### The `reasons` shape: array of `{type, text}`
+
+```json
+[
+  {"type": "combined_score", "text": "88.5"},
+  {"type": "objective_score", "text": "91.2"},
+  {"type": "objective_breakdown", "text": "distance=85, cost=100, hours_match=70, responsiveness=70"},
+  {"type": "subjective_score", "text": "85"},
+  {"type": "subjective_rationale", "text": "Good fit for wheelchair-accessible non-emergency transport."}
+]
+```
+
+Not read by `advance_referral()` — display-only, for whatever SW selection screen
+gets built against it (§7).
+
+### Decisions made alongside this fix
+
+| Question | Decision |
+| --- | --- |
+| Who triggers ranking? | Stays on-demand via the existing `POST /rank-referral/{id}` proxy — no poller built. Product intent: an SW clicks "Generate Ranking" during referral creation, right before service selection; wiring that button is a frontend/main-backend job, not ours. |
+| Who services `assigned_component='backend'` `rank_resources` rows? | We close our own referral's row inline when we happen to write candidates for it (above). We do **not** poll `backend` generally — anything else addressed to `backend` (`select_resource`, `complete_referral`, `try_next_resource`, `contact_service_by_email`) is still someone else's to claim. |
+| Zero-channel services in the hard filter (some ranked candidates have no `service_application_channels` row and dead-end immediately) | Left as-is. Data is synthetic/test data; not worth filtering or demoting yet. |
+| SW-selection gate: auto-pick + override (Option A) vs. a hard human gate (Option B) | **Option A** — zero `advance_referral()` changes. An SW who picks a service before the next scheduler tick just wins, since step 7 only auto-picks when `service_id IS NULL`. Option B would need a new branch in `advance_referral()`'s plpgsql source (`contracts/migrations/`, outside this subdir) — not built. |
+| Ground-transport service needs an `online_form` channel row (rank-1 candidate had none, so it could never route to `karthik_form`) | **Already resolved, found live, not by us** — the rank-1 service ("Non-Emergency Medical Transport (Synthetic)") now has an `online_form` row in `service_application_channels` pointing at `transport_intake_pdf.json`. |
 
 ---
 
-## 6. Tests
+## 6. Verifying it worked
 
-`tests/test_service_ranking.py`, mirroring `tests/test_tools.py`'s pattern
-(`httpx.AsyncClient` mocked via stdlib `unittest.mock`, no live network, no new
-dependency):
+```sql
+-- should be > 0 after calling rank_referral() / POST /rank-referral/{id}
+select count(*) from referral_service_candidates where referral_id = '<id>';
 
-- `_slugify_category` / `_service_backfill` — pure-function coverage of the
-  `need_category` derivation.
-- `_rank_referral` — proxies and returns results; 404s on an unknown referral; raises
-  clearly when `SERVICE_RANKING_BASE_URL` is unset.
-- `_get_ranking` — proxies and returns results.
-- `_choose_service` — sets `service_id` + `need_category` on our referral; forwards
-  the label to `service_ranking`'s `/sw-feedback` with the right payload; **still
-  succeeds** even if that forward fails (`httpx.ConnectError`) or
-  `SERVICE_RANKING_BASE_URL` is entirely unset; 404s on an unknown service.
+-- should be zero open actions afterward
+select action_type, action_status, assigned_component
+  from referral_actions where referral_id = '<id>'
+   and action_status in ('ready','in_progress','blocked');
 
-No test exercises `service_ranking`'s own code (`ranking.py`/`db.py`) — it isn't
-imported by our test suite (same boundary as `call_agent`), and it has no offline/mock
-mode to test against anyway.
+-- should return something other than {"state":"ranking"} or {"state":"waiting"}
+select advance_referral('<id>');
+```
+
+Or run the whole path in one call: `python backend/service_ranking/trigger_ranking.py
+<referral_id>` — ranks, writes `ranking_results`, writes candidates, closes the action,
+advances the referral, against real Supabase.
+
+Every live-schema fact quoted in this doc (constraint definitions, table shapes, row
+counts, the already-present `online_form` channel) was re-verified against the live DB
+via the Supabase MCP tools on 2026-07-28, not just carried over from the original
+handoff doc's 2026-07-27 read.
 
 ---
 
-## 7. Follow-up (not built, for whoever picks this up next)
+## 7. Tests
 
-1. **Frontend ranked-candidate picker.** The natural next step: after a referral is
-   created (or before, if the creation flow changes to defer service choice), call
-   `POST /api/referrals/{id}/rank`, render the ranked list (`objective_score` /
-   `subjective_score` / `subjective_rationale` per candidate — see
-   `ranking_system_plan.md` for what each field means), let the SW pick one and a
-   `label`, then `POST /api/referrals/{id}/choose-service`.
-2. **Live smoke test** after the DB flip: `python backend/service_ranking/trigger_ranking.py
-   <referral_id>` against a referral that also exists in our backend's Supabase-backed
-   `ReferralDB`, then confirm `choose-service` updates it correctly.
-3. **`current_resource_rank`** — decide whether/how our contract should track this if
-   a future flow needs to distinguish "the top-ranked pick" from "the SW's actual
-   pick" (they can differ — that's exactly what `sw_feedback.label` captures today).
+`tests/test_service_ranking.py` (mirroring `tests/test_tools.py`'s pattern —
+`httpx.AsyncClient` mocked, no live network) covers the **proxy seam only**:
+`_slugify_category` / `_service_backfill`, `_rank_referral`, `_get_ranking`,
+`_choose_service`.
+
+No test exercises `service_ranking`'s own code (`ranking.py`/`db.py`, including the new
+candidate-writing logic) — it isn't imported by our test suite (same boundary as
+`call_agent`), and it has no offline/mock mode to test against: it talks directly to
+real Supabase and needs real HSDS tables (`services`, `service_areas`,
+`service_at_location`, `locations`, `cost_options`, `schedules`, `service_application_channels`).
+The verification queries in §6 are the closest thing to a test it has today.
+
+---
+
+## 8. Follow-up (not built, for whoever picks this up next)
+
+1. **Frontend ranked-candidate picker.** The natural next step, and now the main
+   missing piece: after a referral is created, call `POST /api/referrals/{id}/rank`
+   (the SW's "Generate Ranking" button), render the ranked list with `reasons`, let the
+   SW pick one + a `label`, then `POST /api/referrals/{id}/choose-service`. The backend
+   seam and the candidate-writing it depends on are both done; only the screen is
+   missing.
+2. **Re-rank support.** `upsert_referral_service_candidates` doesn't handle a genuine
+   re-rank that reorders existing `available` rows (§5) — needs a delete + re-insert,
+   gated on no candidate having left `'available'` yet.
+3. **`current_resource_rank`** — still not modeled on our side. Decide whether/how our
+   contract should track "the top-ranked pick" vs. "the SW's actual pick" if a future
+   flow needs to distinguish them (`sw_feedback.label` already captures the divergence
+   when it happens).
+4. **Live smoke test through the actual Python path** (not just SQL verification) —
+   run `trigger_ranking.py` against a referral that also exists in our backend's
+   Supabase-backed `ReferralDB`, then confirm `choose-service` still updates it
+   correctly end to end.
