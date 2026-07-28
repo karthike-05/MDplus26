@@ -45,16 +45,45 @@ cosmetic and are not.
 
 ## Part A — required for integration
 
-### A1. Nothing writes `referral_service_candidates` 🔴 BLOCKER
-**Owner: Ranking / Data.** `advance_referral()` reads this table to pick a service. It is
-empty and has no writer — Ranking writes `ranking_results` instead. So **every live
-referral parks at `status='ranking'` forever**, waiting for a `rank_resources` job.
+### A1. Nothing writes `referral_service_candidates` ✅ SHIPPED BY RANKING 2026-07-28
+**Owner: Ranking / Data — done.** `rank_referral()` now writes
+`referral_service_candidates` alongside `ranking_results`, closes the open
+`rank_resources` action, and calls `advance_referral()` itself.
+(`origin/service_ranking_and_call_agent` @ `03e21fc`.)
 
-The bridge is nearly mechanical: `ranking_results` rows with `passed_hard_filter = true`
-→ `referral_service_candidates` (`rank`, `score` ← `combined_score`, `reasons` ← the
-objective breakdown / subjective rationale). `eligibility_state` has no source and can
-default to `'unknown'`, which `advance_referral` accepts. Only Ranking knows whether
-results map to candidates one-for-one or need filtering first.
+Their `upsert_referral_service_candidates` splits insert from update so an existing row
+only has `score`/`reasons` refreshed — which genuinely solves the
+`UNIQUE(referral_id, rank)` re-rank collision. `reasons` is an array of
+`{type, text}`; nothing in `advance_referral` reads it, it's for the selection UI.
+
+**Two things remain:** their branch isn't merged, and **their Railway service still runs
+the old code** — until they redeploy, live still only gets `ranking_results`.
+
+> Ranking has no `referral_actions` poller and doesn't want one: ranking stays
+> on-demand via `POST /rank-referral/{id}`. Something has to call it — the plan is a
+> "Generate ranking" control in our referral-creation flow. **That's ours and it isn't
+> built.**
+
+### A1b. Nobody triggers a ranking run 🟠 OURS, one env flag
+**Owner: us.** Ranking deliberately has no poller — ranking stays on-demand behind
+`POST /rank-referral/{id}`, and they've assigned the triggering to us. We already have
+the mechanism: `backend_component` claims the `rank_resources` action and proxies it to
+their endpoint. It just needs
+
+```bash
+BACKEND_CLAIM_RANKING=1
+SERVICE_RANKING_BASE_URL=https://md-catalyst-service-ranking-production.up.railway.app
+```
+
+The two workers compose correctly: we claim the action (`in_progress`), call their
+endpoint, their `get_open_rank_resources_action` finds it (their query accepts
+`in_progress`) and closes it, they advance; our proxy then marks it completed — already
+completed, harmless — and advances again, which the open-action guard absorbs.
+
+> 💸 **This costs money when it fires.** Their Layer 3 is a live Claude call per ranking
+> run. Left off, the `rank_resources` action sits `ready` and the referral waits. A
+> "Generate ranking" button in the referral-creation flow is the alternative — a human
+> decides when to spend.
 
 ### A2. Nobody services `backend`-addressed actions 🔴 BLOCKER
 **Owner: probably us — confirm with Data.** `advance_referral()` queues
@@ -255,9 +284,10 @@ Same items, grouped by owner. Roles per `CLAUDE.md` §4.
 ### Data / Ranking
 | # | Task | Why it matters |
 | --- | --- | --- |
-| **A1** | Write `referral_service_candidates` from `ranking_results` (`passed_hard_filter=true`) | 🔴 **Nothing live moves without it.** Every referral parks at `status='ranking'`. |
-| A2 | Confirm what `assigned_component='backend'` means — your service, or ours? | We'd build the wrong thing, or duplicate yours. Blocks A2. |
-| A9 | Decide whether `attempts.channel` gets a value for a filled PDF | We record PDFs as `email`; the DB can't tell that from a plain email, which skews channel-exhaustion. |
+| ~~A1~~ | ~~Write `referral_service_candidates`~~ | ✅ Shipped 2026-07-28 (`03e21fc`) |
+| **A1c** | **Merge the branch and redeploy Railway** | Until then live still only gets `ranking_results` and nothing moves. |
+| A1d | Note that `003_sw_selection_gate.sql` is applied — your "zero open actions" check now expects one | Your code needs no edit; the expectation changed and our stale doc caused it. |
+| B11 | Zero-channel services are still rankable (you left this as-is) | Fine while the affected rows are synthetic. A real service with no channel dead-ends its referral. |
 | B10 | Decide on a terminal `referrals.status` for "patient used it" | Today it's free-text `completion_outcome`; widening the CHECK constraint affects everyone. |
 | B11 | Wire `sw_feedback` embeddings + retrieval | Ranking can't learn from social-worker corrections until then. |
 

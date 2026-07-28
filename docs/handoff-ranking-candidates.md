@@ -11,30 +11,34 @@ immediately behind it.
 
 ---
 
-> ## ⚠️ Update 2026-07-27 — we wrote the change for you
+> ## ✅ Update 2026-07-28 — you shipped it; we're on your branch
 >
-> Rather than leave you blocked, we made the edit in the vendored copy of your service.
-> **We changed none of your ranking logic** — no filter, no scorer, no weights. It's one
-> new function and one new call, both writing data your pipeline had already computed:
+> **`origin/service_ranking_and_call_agent` @ `03e21fc` is now what we build against.**
+> We'd briefly written our own version of this while you were mid-flight; it's deleted.
+> Yours is better on two counts worth naming:
 >
-> - `backend/service_ranking/db.py` — added `upsert_referral_service_candidates()`,
->   mirroring your `upsert_ranking_results()` directly above it.
-> - `backend/service_ranking/ranking.py` — after the existing
->   `db.upsert_ranking_results(rows)` in `rank_referral()`, the same run is now also
->   written to `referral_service_candidates` (survivors only).
+> - `upsert_referral_service_candidates` splits insert from update so an existing row
+>   only ever gets `score`/`reasons` refreshed. That **solves** the
+>   `UNIQUE(referral_id, rank)` collision on a re-rank — ours only warned about it in a
+>   comment and would have hit it.
+> - `rank_referral()` closes the `rank_resources` action and calls `advance_referral()`
+>   itself. Ours leaned on our `backend` worker proxying that, which needed an env flag
+>   set to work at all.
 >
-> Verified against the live DB inside a rolled-back transaction: with those rows present,
-> `advance_referral()` returns
-> `{"state":"in_progress","channel":"online_form","attempt_number":2}` — it dispatches
-> straight to the form component. Nothing was left behind.
+> **Three things to know, all on our side:**
 >
-> **Two things this does NOT do:**
-> 1. Your **Railway service still runs the old code**. Pull and redeploy, or the live DB
->    keeps getting `ranking_results` only.
-> 2. **Re-ranking is still unsafe** — see the `UNIQUE (referral_id, rank)` note in §2.
+> 1. **We applied a migration you weren't expecting** — `003_sw_selection_gate.sql`,
+>    the Option B human gate. Our own handoff still said "recommend Option A" long after
+>    we'd decided otherwise, which is why your doc says "no advance_referral change".
+>    Entirely our error. See §4 — **your code needs no edit**, but your "zero open
+>    actions" check now expects one.
+> 2. **The `online_form` channel you found live was us**, on 2026-07-27, not
+>    pre-existing. We also seeded a `form_templates` row for that service so the form
+>    actually resolves. See §5.
+> 3. **Your Railway service still runs the old code** — pull and redeploy, or live keeps
+>    getting `ranking_results` only.
 >
-> Take it, rewrite it, or throw it away — you own this service. The rest of this document
-> is the original spec and the reasoning, which still stands.
+> The rest of this document is the original spec and reasoning, kept for the rationale.
 
 ---
 
@@ -240,7 +244,31 @@ The API seam between us is already built and tested.
 `service_id is null`, it takes the top-ranked candidate itself and queues
 `select_resource`. It never asks.
 
-### Option A — auto-select rank 1, SW can override *(recommended for Aug 2)*
+> ### ⚠️ RESOLVED — we went with **Option B**, and applied it. Sorry.
+>
+> **This section used to recommend Option A, and that line stayed here after the
+> decision had already been made the other way.** You read it and built to it in good
+> faith. That's on us, and it's the reason your handoff says "No advance_referral()
+> change" while the live function has one.
+>
+> `contracts/migrations/003_sw_selection_gate.sql` is **applied to the live DB** as of
+> 2026-07-27. What it means for you:
+>
+> - **Your code needs no change.** `rank_referral()` doesn't inspect what
+>   `advance_referral()` returns, so your sequence — write candidates → close
+>   `rank_resources` → advance — runs exactly as written. Verified against live in a
+>   rolled-back transaction.
+> - **Your verification step changes.** "Should be zero open actions afterwards" now
+>   expects **exactly one**: `select_resource → social_worker`, status `ready`. That is
+>   the gate waiting for a human, not a stall. Our dashboard completes it when the SW
+>   picks, which then dispatches outreach.
+> - **`advance_referral()` now returns `{"state":"awaiting_sw_selection"}`** for a
+>   freshly-ranked referral instead of dispatching a channel. Expected.
+>
+> Everything below is the original A-vs-B reasoning, kept because the tradeoff is real
+> and you may disagree — say so and we'll revert the migration.
+
+### Option A — auto-select rank 1, SW can override *(NOT what we shipped — see above)*
 
 No DB change. The orchestrator's pick becomes a *default*, not a decision: the SW screen
 shows all candidates with scores and rationale, rank 1 pre-selected, and the SW either
@@ -252,7 +280,7 @@ Cost: if outreach has *already* started against rank 1 when the SW overrides, th
 candidate should be marked `'skipped'` and the new one `'selected'`, or the shortlist
 state and `referrals.service_id` disagree. We'd handle that in `choose-service`.
 
-### Option B — a real human gate *(needs a change to `advance_referral`, your call)*
+### Option B — a real human gate *(⬅ THIS IS WHAT SHIPPED)*
 
 Insert one branch before step 7: if candidates exist, none is `selected`, and
 `service_id is null` → queue `select_resource` addressed to **`social_worker`** and
@@ -264,9 +292,13 @@ and calls `advance_referral()`.
 the `assigned_component` CHECK, so this is additive — no constraint migration, just the
 plpgsql branch.
 
-**Our recommendation:** ship **A** for Aug 2 because it needs zero DB changes and works
-the moment candidates exist, and treat **B** as the product-correct shape afterwards. A
-also degrades better on camera: if nobody clicks, the loop still closes.
+**Why B won in the end:** the product intent was always "the SW sees all the options and
+selects the most appropriate — *that* feeds the memory system and triggers the next
+step." Under A the machine picks and the human only gets to undo it, which is a
+different product, and it starves `sw_feedback` of the very signal Layer 3 is supposed
+to learn from. B's cost — the demo stalls if nobody clicks — is handled by an
+"Accept top pick" button on the selection screen: one click, still a recorded decision
+with a label.
 
 ---
 
