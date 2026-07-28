@@ -397,6 +397,41 @@ Consequences to keep in mind:
 Full walkthrough, the vocabulary translation, and the current blockers:
 [`docs/integration-status.md`](docs/integration-status.md).
 
+### 7d. ⚠ An `os.getenv` at module scope is evaluated before `.env` exists
+
+`backend/main.py` imports its dependencies (line ~37) and *then* calls `load_dotenv()`
+(line ~47). So any module-level `CONST = os.getenv(...)` in something it imports reads an
+environment that has no `.env` in it yet — the value in `.env` is **silently ignored**,
+and the flag reports its default forever.
+
+This cost a live debugging round on 2026-07-28: `ORCHESTRATOR_TICK=1` in `.env` did
+nothing and `/health` kept reporting `false`. `backend_component.claim_ranking()` was
+already a function, which is exactly why `BACKEND_CLAIM_RANKING` worked and the other
+didn't.
+
+**Read env flags in a function, never at import.** And note that patching the module
+attribute in a test proves nothing about how the value is sourced — that's what let this
+ship green. Drive the env var: `tests/test_worker.py::
+test_env_flags_are_read_at_call_time_not_import`.
+
+### 7e. Intake: the address is an input, not a stored field
+
+`patients` has **no street-address column** — only `postal_code`, `county`, `latitude`,
+`longitude` (§6a). `PATIENT_COLS` maps `"address": None`, and `_to_theirs` drops
+`None`-mapped keys, so an address typed into the intake form went nowhere and those four
+columns were never populated by anything.
+
+That is not cosmetic: Ranking's hard filter reads them, and `POST /rank-referral` returned
+a bare **500** for every referral created through our UI while succeeding for the seeded
+patients that had coordinates.
+
+So `address` is **required** on `NewPatient` and
+[`backend/intake/geocode.py`](backend/intake/geocode.py) resolves it into those four
+columns (US Census — free, keyless, authoritative for county). Geocoding degrades to
+`None` on any failure — it must never be why a social worker can't create a patient — but
+reports `geocoded: false` rather than failing silently, because unresolved coordinates
+kill the referral later inside a service we don't own.
+
 ---
 
 ## 8. How to add a new tool
@@ -483,6 +518,16 @@ supabase db push                            # apply contracts/db_schema.sql (whe
 | DDL only | `SUPABASE_ACCESS_TOKEN` (`sbp_…` Management API PAT — account-scoped, revocable) |
 | Frontend | `VITE_API_BASE` (inlined at **build** time), `SUPABASE_ANON_KEY` |
 | Theirs, not ours | `TWILIO_*` / `RETELL_*` live in Messaging's and Voice's own deploys — this backend never dials out |
+
+**Behaviour flags** (not secrets — safe defaults, read at *call* time per §7d):
+
+| Flag | Default | Turn on when |
+| --- | --- | --- |
+| `ORCHESTRATOR_TICK` | `0` | Voice/Messaging aren't calling `advance_referral()` after their steps, so chains stop dead. Currently **true**, so it's on |
+| `BACKEND_CLAIM_RANKING` | `0` | Nothing else triggers ranking runs. **Costs one Claude call per run** |
+| `ALLOW_LIVE_INTAKE` | `0` | You're demoing intake. On, "+ New referral" sends a **real WhatsApp** to whatever number was typed, on the team's Twilio. The app has no auth — **leave off on any permanent URL** |
+| `GEOCODING_ENABLED` | `1` | Off only for offline work; `conftest` forces it off so the suite stays hermetic |
+| `WORKER_ENABLED` | `1` | `0` disables the background poller entirely |
 
 > Names match the sibling services deliberately, so one value pastes across all four
 > deploys: it's `SUPABASE_SERVICE_ROLE_KEY` (not `..._SERVICE_KEY`) and `DATABASE_URL`

@@ -265,5 +265,11 @@ No separate frontend deploy, and no `ALLOWED_ORIGINS` to maintain.
 | "no channel configured" on a row | The service has no `service_application_channels` row. `advance_referral` treats it as instantly exhausted, so the referral dead-ends |
 | Review screen 404s live | `form_templates` isn't seeded for that service: `python -m backend.scripts.seed_form_templates --list` |
 | Worker says STOPPED | Check `/health`; `WORKER_ENABLED=0` disables it |
-| Row actions greyed out live | Correct — `advance_referral()` owns transitions there, not our buttons |
+| Live rows say "the DB scheduler drives this live" | Correct — `advance_referral()` owns transitions there, not our buttons. Review still works |
+| A `409` from `/run` or `/inbound` | Same cause. Those drive our *offline* scheduler; switch the data source to Mock |
 | Nothing in "Inbound webhooks" | Voice/Messaging haven't set their URL at us, or haven't sent anything |
+| New referral sends no consent text | `ALLOW_LIVE_INTAKE` is off (the default). `/health` reports it. Otherwise: Messaging's poller, or the number never joined the Twilio WhatsApp sandbox |
+| Ranking action fails with a 500 | Patient has NULL `latitude`/`longitude`. Intake geocodes these now — a pre-2026-07-28 patient won't have them. See [changes-2026-07-28](changes-2026-07-28.md#for-ranking-pranav) |
+| A referral looks fine but does nothing | Almost always a poisoned dedup key (CLAUDE.md §7c). Check for a `completed`/`failed` action whose step should have re-run; **DELETE** it, don't cancel |
+| A flag set in `.env` is ignored | Read at module scope, before `load_dotenv()`. CLAUDE.md §7d |
+| Consent confirmed but the referral never moves | Nobody called `advance_referral()` after the step. `ORCHESTRATOR_TICK=1` makes our worker do it |

@@ -7,6 +7,11 @@ worker, and a utilization check-in fires after enrollment.
 
 > **Read [`CLAUDE.md`](CLAUDE.md) before writing code** — it defines the seams,
 > contracts, and conventions that let the team build in parallel.
+>
+> **Picking this up for the first time?** Start with
+> [`docs/local-setup.md`](docs/local-setup.md) — clone-to-running in ~5 minutes plus a
+> click-by-click UI walkthrough, with no database, credentials, or teammate's service
+> needed.
 
 ## Quick start
 
@@ -15,7 +20,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 python run_demo.py      # headless end-to-end (PDF) — always the fixture mock
-pytest tests -q         # layered suite — 112 tests, no DB / browser / network needed
+pytest tests -q         # layered suite — 123 tests, no DB / browser / network needed
 
 # The whole app on one port: the backend serves the built frontend (see the StaticFiles
 # mount at the bottom of backend/main.py), so this is the deployable shape too.

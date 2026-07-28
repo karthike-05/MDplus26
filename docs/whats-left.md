@@ -76,7 +76,20 @@ the old code** — until they redeploy, live still only gets `ranking_results`.
 > "Generate ranking" control in our referral-creation flow. **That's ours and it isn't
 > built.**
 
-### A1b. Nobody triggers a ranking run 🟠 OURS, one env flag
+### A1b. Nobody triggers a ranking run ✅ DONE 2026-07-28 — but it surfaced a Ranking bug
+**`BACKEND_CLAIM_RANKING=1` is set and working.** Ranking redeployed, our `backend`
+worker claims `rank_resources` and proxies it. The mechanism below is all correct.
+
+What it revealed: **`POST /rank-referral/{id}` returns a bare 500** for patients with
+NULL `latitude`/`longitude` — i.e. every referral created through our intake UI, since
+intake wasn't populating them. Our half is fixed (see B5); the 500 is Ranking's to
+harden. Full diagnosis: [`changes-2026-07-28.md`](changes-2026-07-28.md#for-ranking-pranav).
+
+⚠ And because a failed action **poisons its dedup key** (CLAUDE.md §7c), the two
+referrals that hit the 500 can't be re-queued without DELETEing the dead
+`rank:<referral_id>` rows.
+
+<details><summary>Original mechanism notes (still accurate)</summary>
 **Owner: us.** Ranking deliberately has no poller — ranking stays on-demand behind
 `POST /rank-referral/{id}`, and they've assigned the triggering to us. We already have
 the mechanism: `backend_component` claims the `rank_resources` action and proxies it to
@@ -96,6 +109,8 @@ completed, harmless — and advances again, which the open-action guard absorbs.
 > run. Left off, the `rank_resources` action sits `ready` and the referral waits. A
 > "Generate ranking" button in the referral-creation flow is the alternative — a human
 > decides when to spend.
+
+</details>
 
 ### A2. Nobody services `backend`-addressed actions 🔴 BLOCKER
 **Owner: probably us — confirm with Data.** `advance_referral()` queues
@@ -242,11 +257,20 @@ mapped. This is the scalability story and the Aug-17 stretch (`CLAUDE.md` §13).
 `form_templates` table already models `mapping_status` and `verified_by`, so the DB is
 ready for it.
 
-### B5. Patient street address isn't modelled
+### B5. Patient street address isn't modelled 🟡 PARTLY RESOLVED 2026-07-28
 `patients` has no street-address column (only `postal_code`, `county`, lat/long; the
-`addresses` table is keyed by `location_id`, i.e. service locations). Transport addresses
-live on `service_requests`, but `food_assistance_pdf.json` sources `home_address` from
-`patient.address` and will render blank. **Needs a product decision**, not a code fix.
+`addresses` table is keyed by `location_id`, i.e. service locations).
+
+**Resolved for ranking.** The address was being collected and silently dropped
+(`PATIENT_COLS` maps it to `None`), leaving all four location columns NULL — which is why
+Ranking 500'd on every UI-created referral. Intake now **requires** an address and
+geocodes it into `postal_code`/`county`/`latitude`/`longitude`
+([`backend/intake/geocode.py`](../backend/intake/geocode.py), CLAUDE.md §7e).
+
+**Still open for form-fill.** `food_assistance_pdf.json` sources `home_address` from
+`patient.address`, which has no column to read and will render **blank**. The address is
+now used but not stored, so the options are: add a column, source it from
+`service_requests`, or reverse-geocode. Still **a product decision**, narrower than before.
 
 ### B6. Realtime dashboard
 The board refetches on action and on **↻ Refresh**; there's no live subscription. The
@@ -297,7 +321,10 @@ Same items, grouped by owner. Roles per `CLAUDE.md` §4.
 | # | Task | Why it matters |
 | --- | --- | --- |
 | ~~A1~~ | ~~Write `referral_service_candidates`~~ | ✅ Shipped 2026-07-28 (`03e21fc`) |
-| **A1c** | **Merge the branch and redeploy Railway** | Until then live still only gets `ranking_results` and nothing moves. |
+| ~~A1c~~ | ~~Merge the branch and redeploy Railway~~ | ✅ Redeployed 2026-07-28; endpoints confirmed live |
+| **A1e** | **`POST /rank-referral/{id}` 500s on a patient with NULL `latitude`/`longitude`** | 🔴 A 500 marks the action `failed`, which **poisons the `rank:` dedup key forever** (§7c) — the referral then looks healthy and does nothing. Degrade instead of throwing. [Diagnosis](changes-2026-07-28.md#for-ranking-pranav) |
+| A1f | SW ranking-review UI: show the agent's reasoning, approve/reject | In progress. `subjective_rationale`, `objective_breakdown` and `filter_reject_reason` already exist on `ranking_results` and nothing renders them. **Extend `ChooseService.jsx` rather than replacing the endpoint** — [the four things it must keep doing](changes-2026-07-28.md#if-youre-building-the-sw-ranking-review-ui) |
+| A1g | Delete the `demo_driver --bridge-candidates` shim rows | They carry `"_source": "demo_driver shim"` in `reasons`; your service should own those writes now |
 | A1d | Note that `003_sw_selection_gate.sql` is applied — your "zero open actions" check now expects one | Your code needs no edit; the expectation changed and our stale doc caused it. |
 | B11 | Zero-channel services are still rankable (you left this as-is) | Fine while the affected rows are synthetic. A real service with no channel dead-ends its referral. |
 | B10 | Decide on a terminal `referrals.status` for "patient used it" | Today it's free-text `completion_outcome`; widening the CHECK constraint affects everyone. |
