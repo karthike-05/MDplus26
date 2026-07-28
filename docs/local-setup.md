@@ -113,6 +113,13 @@ Back on the dashboard, the row actions simulate the inbound signals:
 That last transition is the differentiator. `python run_demo.py` does the same thing
 headless in about a second if you'd rather read it than click it.
 
+**The two signals are genuinely separate.** "Service accepted" comes from the org
+(`POST /api/org/response` → an `attempts` row with `outcome='enrolled'`, which is the only
+thing `advance_referral` promotes on). "Patient response" comes from the patient replying
+to the check-in. On **live** rows awaiting an answer you'll see **Org accepted ✓ / Org
+declined ✕** — a manual trigger for a real seam, until Messaging points `ORG_BACKEND_URL`
+at us and the parsed email hits the same endpoint.
+
 ### 3.4 New referral — intake
 
 **Name** + **Date of birth** → *Find patient*. No match → fill **Phone**, **Address**,

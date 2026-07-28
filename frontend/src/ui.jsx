@@ -175,10 +175,34 @@ export function RowActions({ row, onReview, onChange, small, live }) {
   if (a.flag) return <span style={{ color: C.warn, fontWeight: 600, fontSize: 13 }}>⚠ Needs social worker</span>;
   if (a.review) return <Btn small={small} onClick={() => onReview?.(row.referral_id)}>{a.review}</Btn>;
 
-  // Live, `advance_referral()` owns transitions (CLAUDE.md §7a) and /run + /inbound
-  // answer 409 by design. Review still works — it's our component either way — but a
-  // button whose only possible outcome is an error reads as a broken app, so name the
-  // owner of the step instead of offering it.
+  // `submitted` is the one waiting state that IS actionable live: the org's answer is a
+  // real inbound seam (POST /api/org/response), not our offline scheduler. It writes the
+  // `attempts.outcome='enrolled'` row that advance_referral reads — the row nothing else
+  // writes, and without which a live referral can never leave `submitted`.
+  //
+  // Until Messaging points ORG_BACKEND_URL at us, a human clicks this instead of an
+  // email arriving. Same endpoint either way, so wiring the email leg needs no new code.
+  if (live && row.current_state === "submitted")
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <span style={{ fontSize: 11, color: C.sub }}>Awaiting service response</span>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          <Btn small={small} disabled={busy}
+               onClick={() => go(() => api.orgResponse(row.referral_id, "accepted"))}>
+            {busy ? "…" : "Org accepted ✓"}
+          </Btn>
+          <Btn small tone="ghost" disabled={busy}
+               onClick={() => go(() => api.orgResponse(row.referral_id, "rejected"))}>
+            Org declined ✕
+          </Btn>
+        </div>
+      </div>
+    );
+
+  // Every other live state: `advance_referral()` owns transitions (CLAUDE.md §7a) and
+  // /run + /inbound answer 409 by design. Review still works — it's our component either
+  // way — but a button whose only possible outcome is an error reads as a broken app, so
+  // name the owner of the step instead of offering it.
   if (live)
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>

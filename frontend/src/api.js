@@ -39,5 +39,10 @@ export const api = {
   // The SW selection gate: read the ranked shortlist, then record the human's pick.
   ranking: (id) => j(`/api/referrals/${id}/ranking`),
   chooseService: (id, body) => post(`/api/referrals/${id}/choose-service`, body),
+  // MILESTONE 1 — the ORG's answer, distinct from the patient having used the service.
+  // Works live (writes the `enrolled` attempt advance_referral reads) and offline. The
+  // org-email webhook will post to this same endpoint once ORG_BACKEND_URL points here.
+  orgResponse: (id, decision, extra = {}) =>
+    post("/api/org/response", { referral_id: id, decision, ...extra }),
   pageImageUrl: (formId, page) => `${API}/api/form/${formId}/page/${page}.png`,
 };

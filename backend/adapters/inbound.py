@@ -93,6 +93,51 @@ class PatientCommsEvent(BaseModel):
     reply_text: str | None = None
 
 
+# --- The service organisation's answer (MILESTONE 1) -------------------------
+# Our decision vocab -> the live `attempts.outcome` CHECK vocabulary. `enrolled` is the
+# one that matters: `advance_referral` (001_orchestration_bus.sql:81) moves a referral to
+# status='enrolled' if and only if an attempts row carries it —
+#
+#     if exists(select 1 from attempts where referral_id=r.id and outcome='enrolled')
+#
+# and NOTHING wrote it. Our own successful submit records `submitted`, correctly:
+# submitting a form is not the org accepting, and collapsing those two would destroy the
+# distinction that is the whole product (§7). So a live referral could reach `submitted`
+# and never reach `enrolled` -> never `completed`. The loop could not close on live data.
+ORG_DECISION_OUTCOME: dict[str, str] = {
+    "accepted": "enrolled",          # -> status='enrolled', then migration 002's check-in
+    "rejected": "rejected",          # org said no -> advance_referral moves down the list
+    "no_response": "no_response",    # exhausted -> try_next_resource
+    "ineligible": "ineligible",      # patient not eligible for THIS service
+}
+
+# The same decisions in OUR offline vocabulary, for the mock scheduler (§7a). `submitted`
+# is the from_state, so success -> confirmed and failed -> escalated.
+ORG_DECISION_STATUS: dict[str, str] = {
+    "accepted": "success",
+    "rejected": "failed",
+    "no_response": "failed",
+    "ineligible": "needs_human",
+}
+
+
+class OrgResponse(BaseModel):
+    """The service organisation's answer to a submitted application.
+
+    Posted by whatever parses the org's reply — today the SW dashboard's "Org accepted"
+    control, and the org-email webhook once ``ORG_BACKEND_URL`` is pointed at us. Both
+    hit this same endpoint, so wiring the email leg later needs no new code path.
+    """
+
+    referral_id: str
+    decision: str                        # ORG_DECISION_OUTCOME keys
+    attempt_no: int | None = None        # defaults to the next free number
+    channel: str = "email"               # how they answered; attempts.channel vocabulary
+    confirmation_id: str | None = None
+    note: str | None = None
+    external_id: str | None = None       # their message id, for webhook dedupe
+
+
 # --- The durable webhook log (A12) -------------------------------------------
 # `integration_events.provider` is CHECK-constrained to twilio / retell / karthik_form,
 # so an inbound event is logged under the SENDING service's provider name, not ours.
@@ -211,5 +256,78 @@ def build_router(db: ReferralDB, tools: Tools) -> APIRouter:
             known=sorted(PATIENT_COMMS_EVENT_MAP), channel_for="whatsapp",
             data_key="patient_comms_event",
         )
+
+    @router.post("/api/org/response")
+    async def org_response(body: OrgResponse) -> dict:
+        """Record the service organisation's answer — MILESTONE 1 (§7).
+
+        This is the one seam that had no implementation, and its absence meant the loop
+        could not close on live data at all (see ORG_DECISION_OUTCOME above).
+
+        Unlike the Voice and Messaging seams, this one writes a **shared `attempts` row**
+        rather than only driving our offline scheduler, because live it's that row —
+        specifically `outcome='enrolled'` — that `advance_referral` reads. Offline it
+        falls through to `apply_inbound` as before, so `run_demo.py` is unchanged.
+        """
+        outcome_value = ORG_DECISION_OUTCOME.get(body.decision)
+        payload = body.model_dump()
+        if outcome_value is None:
+            await _log_event(db, provider="karthik_form", event_type=body.decision,
+                             payload=payload, referral_id=body.referral_id,
+                             external_id=body.external_id, status="failed",
+                             error=f"unknown decision; expected one of "
+                                   f"{sorted(ORG_DECISION_OUTCOME)}")
+            raise HTTPException(
+                422, f"unknown decision '{body.decision}'; expected one of "
+                     f"{sorted(ORG_DECISION_OUTCOME)}")
+        try:
+            referral = await db.get_referral(body.referral_id)
+        except KeyError:
+            await _log_event(db, provider="karthik_form", event_type=body.decision,
+                             payload=payload, referral_id=None,
+                             external_id=body.external_id, status="failed",
+                             error=f"unknown referral '{body.referral_id}'")
+            raise HTTPException(404, f"unknown referral '{body.referral_id}'")
+
+        service_id = referral.get("service_id")
+        attempt_no = body.attempt_no or await db.next_attempt_number(
+            body.referral_id, service_id)
+        await db.record_shared_attempt({
+            "referral_id": body.referral_id,
+            "service_id": service_id,
+            "attempt_number": attempt_no,
+            "channel": body.channel,
+            # `manual` while a human clicks it; the email webhook will keep it, since the
+            # org is not one of the CHECK-allowed providers either way.
+            "provider": "manual",
+            "direction": "inbound",
+            "status": "completed",
+            "outcome": outcome_value,
+            "structured_result": {"decision": body.decision,
+                                  "confirmation_id": body.confirmation_id},
+            "notes": body.note,
+        })
+
+        # Hand straight back to whichever scheduler owns transitions here (§7a). Live
+        # that's advance_referral, which now sees the attempts row we just wrote.
+        # `kind` is DBSwitch's property; a bare adapter (as the tests pass) has none, so
+        # fall back to its class name rather than mis-routing to the offline branch.
+        result: dict
+        if getattr(db, "kind", type(db).__name__) != "MockReferralDB":
+            result = {"advanced": await db.advance_referral(body.referral_id),
+                      "outcome": outcome_value, "attempt_number": attempt_no}
+        else:
+            result = await _apply_and_cascade(
+                body.referral_id, status=ORG_DECISION_STATUS[body.decision],
+                channel=body.channel, attempt_no=attempt_no,
+                data={"org_decision": body.decision,
+                      "confirmation_id": body.confirmation_id},
+            )
+            result["outcome"] = outcome_value
+
+        await _log_event(db, provider="karthik_form", event_type=body.decision,
+                         payload=payload, referral_id=body.referral_id,
+                         external_id=body.external_id)
+        return result
 
     return router

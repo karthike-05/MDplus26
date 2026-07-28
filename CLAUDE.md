@@ -2,7 +2,7 @@
 
 Guidance for Claude Code and for the team. **Read this before writing code.** It defines **how the pieces fit together** so four people can build in parallel without colliding.
 
-- The form-fill design detail lives in [`docs/form-filling-architecture-and-build-plan.md`](docs/form-filling-architecture-and-build-plan.md).
+- The form-fill design detail lives in [§6](#6-form-fill-architecture--the-injector-seam) below, and in the code it describes ([`backend/tools/fill_form/`](backend/tools/fill_form/)).
 - A runnable slice lives in the repo ([`run_demo.py`](run_demo.py), [`tests/`](tests/)).
 - This file is about **seams, contracts, and conventions.**
 
@@ -84,7 +84,13 @@ Incumbents (findhelp, Unite Us) *generate* referrals; our differentiator is **co
 ├─ CLAUDE.md                       # this file
 ├─ README.md                       # how to run the slice
 ├─ docs/
-│   └─ form-filling-architecture-and-build-plan.md
+│   ├─ local-setup.md              # clone -> running + a UI walkthrough (start here)
+│   ├─ changes-2026-07-28.md       # latest changes; incl. the Ranking handoff
+│   ├─ integration-status.md       # the four-service bus, in detail
+│   ├─ whats-left.md               # the task list, grouped by owner
+│   ├─ demo-walkthrough.md         # running a demo for an audience
+│   ├─ handoff-ranking-candidates.md
+│   └─ db-contract.md              # live columns + CHECK constraints
 ├─ contracts/                      # SHARED SOURCE OF TRUTH — freeze early
 │   ├─ models.py                   # FormSchema / FormField / ToolOutcome (Pydantic)
 │   └─ schemas/                    # one verified schema per form (web XOR pdf)
@@ -203,7 +209,9 @@ One shape for both targets. Every field carries `fill_policy` (`auto` / `review`
 - **web** fields carry a `selector`.
 - **pdf** fields carry `page` + `rect`.
 
-Full definition in [`docs/form-filling-architecture-and-build-plan.md` §4](docs/form-filling-architecture-and-build-plan.md).
+Full definition: [`contracts/models.py`](contracts/models.py) (`FormSchema` / `FormField`),
+with [`contracts/schemas/transport_intake_pdf.json`](contracts/schemas/transport_intake_pdf.json)
+as the worked example.
 
 > **Source of truth:** the JSON file in `contracts/schemas/` is **authoritative**. The
 > `form_schemas` DB table is a **cache** populated from it — never hand-edit the table.
@@ -432,6 +440,24 @@ columns (US Census — free, keyless, authoritative for county). Geocoding degra
 reports `geocoded: false` rather than failing silently, because unresolved coordinates
 kill the referral later inside a service we don't own.
 
+### 7f. `attempts.outcome='enrolled'` is the only thing that closes milestone 1
+
+`advance_referral` promotes a referral to `status='enrolled'` **only** if an `attempts`
+row carries `outcome='enrolled'` (`001_orchestration_bus.sql:81`). Nothing wrote it until
+2026-07-28, so a live referral could reach `submitted` and never advance — the loop could
+not close on live data at all.
+
+Our successful submit records `outcome='submitted'`, and that is **correct**: submitting a
+form is not the org accepting. Never "fix" this by having submit write `enrolled` —
+collapsing the two milestones destroys the distinction the product exists to make (§7),
+and `tests/test_org_response.py` asserts it can't happen.
+
+The org's answer arrives at **`POST /api/org/response`** (in the inbound adapter, beside
+the Voice and Messaging seams). Today a human clicks *Org accepted ✓* on the dashboard;
+once Messaging sets `ORG_BACKEND_URL`, the parsed email posts to the same endpoint. The
+live `attempts.outcome` CHECK vocabulary is pinned in `tests/test_org_response.py` — a
+value outside it fails the insert on the real DB and nowhere else.
+
 ---
 
 ## 8. How to add a new tool
@@ -578,4 +604,5 @@ Deferred on purpose — build only after the Aug-2 warm path is solid.
   forget; that table is the durable webhook log.
 - **Inbound webhooks for real** (org email parse, Twilio "Y") replacing the simulated
   `apply_inbound` in `run_demo.py` (§7). The Twilio leg already works in Messaging's
-  deploy; what's missing is `ORG_BACKEND_URL` pointing at us.
+  deploy; what's missing is `ORG_BACKEND_URL` pointing at us. **The receiving end is
+  built** — `POST /api/org/response` (§7f) — so that's a config change, not code.

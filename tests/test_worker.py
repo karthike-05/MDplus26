@@ -606,3 +606,50 @@ def test_spa_fallback_cannot_read_files_outside_dist():
             body = client.get(path).text
             assert not any(s in body for s in secrets), f"{path} leaked a secret"
             assert "<!doctype html" in body.lower(), f"{path} returned a non-SPA body"
+
+
+def test_sweep_entries_are_not_counted_as_serviced_actions(monkeypatch):
+    """REGRESSION (2026-07-28). The advance sweep returns one entry per open referral
+    whether or not anything happened, and tick() folded those into `actions_serviced`.
+    Live that read 580 actions serviced after 145 idle ticks — a number the Integration
+    screen renders, and which was flatly untrue. They're separate counters now."""
+    monkeypatch.setenv("ORCHESTRATOR_TICK", "1")
+    monkeypatch.setenv("ORCHESTRATOR_SWEEP_SECONDS", "0")   # sweep every tick
+    db = _consenting_db()
+    worker.status.serviced = worker.status.referrals_advanced = worker.status.ticks = 0
+
+    asyncio.run(worker.tick(db))                            # nothing queued for us yet
+    assert worker.status.serviced == 0, "an idle tick serviced no actions"
+    assert worker.status.referrals_advanced > 0, "but it did sweep referrals"
+
+
+def test_the_advance_sweep_runs_slower_than_the_drain(monkeypatch):
+    """Every sweep is one advance_referral() RPC per open referral against the TEAM's
+    database. The drain has to stay responsive (5s) for the demo to feel live; the sweep
+    is only a safety net for components that don't self-advance, so it gets its own
+    slower cadence rather than firing on every tick."""
+    monkeypatch.setenv("ORCHESTRATOR_TICK", "1")
+    monkeypatch.setenv("WORKER_POLL_SECONDS", "5")
+    monkeypatch.setenv("ORCHESTRATOR_SWEEP_SECONDS", "30")  # -> every 6th tick
+    db = _consenting_db()
+    worker.status.referrals_advanced = worker.status.ticks = 0
+
+    for _ in range(12):
+        asyncio.run(worker.tick(db))
+
+    # 12 ticks at 5s = 60s of wall clock -> 2 sweeps, not 12.
+    referrals = len(asyncio.run(db.list_referrals()))
+    assert worker.status.referrals_advanced == 2 * referrals
+
+
+def test_sweep_still_fires_on_the_first_tick(monkeypatch):
+    """A safety net that waits 30s before its first run makes a fresh deploy look stuck
+    for exactly as long as someone is watching it start."""
+    monkeypatch.setenv("ORCHESTRATOR_TICK", "1")
+    monkeypatch.setenv("WORKER_POLL_SECONDS", "5")
+    monkeypatch.setenv("ORCHESTRATOR_SWEEP_SECONDS", "30")
+    db = _consenting_db()
+    worker.status.referrals_advanced = worker.status.ticks = 0
+
+    asyncio.run(worker.tick(db))
+    assert worker.status.referrals_advanced > 0

@@ -292,6 +292,22 @@ No backoff, no dead-lettering, no recovery for actions stuck `in_progress`. The 
 attempts per service at 3, but a crashed worker leaves a row that blocks its referral
 indefinitely.
 
+### B9b. Nothing recorded the ORG's answer ✅ FIXED 2026-07-28
+`advance_referral` promotes a referral to `status='enrolled'` **only** if an `attempts`
+row carries `outcome='enrolled'` (`001_orchestration_bus.sql:81`), and nothing wrote it.
+Our own successful submit records `outcome='submitted'` — correct, since submitting a
+form is not the org accepting — so a live referral could reach `submitted` and never
+reach `enrolled`, never `completed`. **The loop could not close on live data.**
+
+`POST /api/org/response` (in the inbound adapter, alongside the Voice and Messaging
+seams) records the decision as a shared `attempts` row and hands back to whichever
+scheduler owns transitions. The SW dashboard shows **Org accepted ✓ / Org declined ✕**
+on live rows awaiting a response.
+
+That control is a *manual trigger for a real seam*, not demo scaffolding: when Messaging
+points `ORG_BACKEND_URL` at us, the parsed org email posts to the same endpoint and no
+code changes.
+
 ### B10. Terminal status for "the patient used it"
 Currently recorded in the free-text `completion_outcome` because widening the
 `referrals.status` CHECK constraint would affect every service. A first-class terminal

@@ -62,9 +62,25 @@ def stale_after() -> int:
 
 
 def orchestrator_tick() -> bool:
-    """A3: also call advance_referral() for every open referral each tick, covering the
-    components that don't advance themselves. Opt-in — see advance_open_referrals()."""
+    """A3: also call advance_referral() for every open referral, covering the components
+    that don't advance themselves. Opt-in — see advance_open_referrals()."""
     return os.getenv("ORCHESTRATOR_TICK", "0").strip().lower() in ("1", "true", "yes")
+
+
+def sweep_seconds() -> float:
+    """How often the advance sweep runs, independent of the drain cadence. Deliberately
+    slower: the sweep is a safety net, and every run is one advance_referral() RPC per
+    open referral against the shared DB."""
+    return float(os.getenv("ORCHESTRATOR_SWEEP_SECONDS", "30"))
+
+
+def _sweep_is_due() -> bool:
+    """True at most once per `sweep_seconds()`. Uses the tick counter rather than a
+    clock so it stays deterministic in tests."""
+    if not orchestrator_tick():
+        return False
+    every = max(1, round(sweep_seconds() / max(poll_seconds(), 0.001)))
+    return status.ticks % every == 1 % every
 
 # Belt-and-braces cap so a bug that keeps re-queueing work can't spin a tick forever.
 MAX_ACTIONS_PER_TICK = 25
@@ -81,7 +97,8 @@ class WorkerStatus:
         self.enabled = False
         self.running = False
         self.ticks = 0
-        self.serviced = 0
+        self.serviced = 0            # real actions only — see the note in tick()
+        self.referrals_advanced = 0  # advance sweep entries, counted separately
         self.reclaimed = 0
         self.last_tick_at: str | None = None
         self.last_error: str | None = None
@@ -95,9 +112,11 @@ class WorkerStatus:
             "orchestrator_tick": orchestrator_tick(),
             "claims_ranking": backend_component.claim_ranking(),
             "poll_seconds": poll_seconds(),
+            "sweep_seconds": sweep_seconds(),
             "stale_after_seconds": stale_after(),
             "ticks": self.ticks,
             "actions_serviced": self.serviced,
+            "referrals_advanced": self.referrals_advanced,
             "actions_reclaimed": self.reclaimed,
             "last_tick_at": self.last_tick_at,
             "last_error": self.last_error,
@@ -157,10 +176,23 @@ async def tick(db: ReferralDB) -> list[dict]:
         if not serviced:
             break
 
-    reports.extend(await advance_open_referrals(db))
-
     status.ticks += 1
+    # Count ONLY real action work. The advance sweep below returns one entry per open
+    # referral whether or not anything happened, so folding it in here made
+    # `actions_serviced` read 580 after 145 idle ticks — a number the Integration screen
+    # renders, and which flatly wasn't true.
     status.serviced += len(reports)
+
+    # The sweep is a safety net for components that don't self-advance, not the thing
+    # that makes the demo feel live — that's the drain above. Running it every tick meant
+    # an advance_referral() RPC per open referral every 5s against the TEAM's database,
+    # for no gain. Its own slower cadence keeps the drain responsive and the noise down.
+    advanced = []
+    if _sweep_is_due():
+        advanced = await advance_open_referrals(db)
+        status.referrals_advanced += len(advanced)
+        reports.extend(advanced)
+
     status.last_tick_at = datetime.now(timezone.utc).isoformat()
     if reports:
         status.last_reports.extend(reports)
