@@ -534,14 +534,29 @@ def _blockers(actions_by_component: dict, candidates_total: int, live: bool) -> 
             continue
         open_rows = [a for a in actions_by_component.get(component["name"], [])
                      if a["action_status"] in OPEN_STATUSES]
-        if open_rows:
+        if not open_rows:
+            continue
+
+        # An open `social_worker` action is the DESIGN, not a fault: the SW selection
+        # gate parks the referral on purpose and the dashboard is the claimant. Flagging
+        # it red would train people to ignore this panel, which is the one thing it must
+        # not do — every other entry here is a genuine silent failure.
+        if component["name"] == "social_worker":
             out.append({
-                "id": "A3/A4", "severity": "warning", "owner": component["owner"],
-                "title": f"{len(open_rows)} open action(s) for `{component['name']}`",
-                "detail": "Queued and unclaimed. advance_referral's first guard is "
-                          "\"any open action -> waiting\", so each one freezes its referral "
-                          f"until {component['owner']} claims it.",
+                "id": "gate", "severity": "info", "owner": "the dashboard",
+                "title": f"{len(open_rows)} referral(s) waiting on a social worker",
+                "detail": "Working as intended — the SW selection gate parks a referral "
+                          "until someone picks a service on the dashboard. Not a stall.",
             })
+            continue
+
+        out.append({
+            "id": "A3/A4", "severity": "warning", "owner": component["owner"],
+            "title": f"{len(open_rows)} open action(s) for `{component['name']}`",
+            "detail": "Queued and unclaimed. advance_referral's first guard is "
+                      "\"any open action -> waiting\", so each one freezes its referral "
+                      f"until {component['owner']} claims it.",
+        })
 
     if not os.getenv("SERVICE_RANKING_BASE_URL"):
         out.append({
