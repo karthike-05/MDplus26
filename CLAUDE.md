@@ -119,6 +119,8 @@ Incumbents (findhelp, Unite Us) *generate* referrals; our differentiator is **co
 │   └─ scripts/make_sample_pdf.py  # generates the flat-PDF fixture
 ├─ frontend/
 │   ├─ src/ReviewUI.jsx            # per-patient review screen
+│   ├─ src/ChooseService.jsx       # the SW selection gate (§7b)
+│   ├─ src/Integration.jsx         # the shared bus: queue, worker, named blockers
 │   └─ mock_form/index.html        # local web-form test double
 ├─ sample_forms/                   # PDF fixtures + rendered previews
 ├─ tests/test_fill_form.py         # layered suite (runs with no DB/browser)
@@ -369,6 +371,28 @@ rows — so the SW's own pick is the one row it would skip.
 > Ranking's handoff assumed the opposite (auto-select + override) because **our** doc
 > still recommended it after we'd decided otherwise. Their code needs no change; only
 > their "zero open actions afterwards" check moves to expecting one.
+
+### 7c. ⚠ A finished action permanently poisons its dedup key
+
+The single sharpest trap on this bus, and it is silent. `queue_referral_action` does:
+
+```sql
+on conflict (referral_id, deduplication_key) do update set updated_at = now()
+```
+
+It **does not reset `action_status`**. So once an action is `completed`, `failed` or
+`cancelled`, `advance_referral` can never re-queue anything under that key again: it
+"queues" the action, gets the dead row's id back, reports success, and **no open action
+exists**. The referral then looks fine and does nothing. Nothing errors.
+
+Consequences to keep in mind:
+
+- **To genuinely re-arm a referral you must DELETE the finished rows, not cancel them.**
+  `backend/scripts/demo_driver.py --reset-selection` does this.
+- A retried step is only re-runnable if its key varies. `attempt:<referral>:<service>:
+  <channel>` does; `sw_select:<referral>` and `rank:<referral>` do not.
+- This is also why recording an attempt under the wrong `channel` stalls a referral
+  (§ CHANNEL_FOR_TARGET): the re-dispatch computes the same key and hits the dead row.
 
 Full walkthrough, the vocabulary translation, and the current blockers:
 [`docs/integration-status.md`](docs/integration-status.md).

@@ -287,7 +287,17 @@ test, so a populated `.env` can never turn a unit test into a live Retell call.
   the guard; keep it passing.
 - **Cost:** no Twilio or Retell call without explicit sign-off. `make_phone_call` stubs
   when `CALL_AGENT_BASE_URL` is unset and records `placed: false, stub: true`, so a
-  stubbed dispatch is never mistaken for a real one.
+  stubbed dispatch is never mistaken for a real one. `BACKEND_CLAIM_RANKING=1` spends a
+  Claude call per ranking run — leave it off unless you mean it.
+- **A finished action permanently poisons its dedup key.** `queue_referral_action`'s
+  ON CONFLICT only bumps `updated_at`, so a completed/cancelled row can never be
+  re-opened: `advance_referral` hands back the dead id and no open action exists. To
+  re-arm, DELETE the row (CLAUDE.md §7c).
+- **Never serve files by a user-supplied path without a containment check.** The SPA
+  fallback did, and `GET /%2e%2e%2f%2e%2e%2f.env` returned the service-role key.
+  Starlette does not normalise `..` out of a `:path` param.
+- **Re-apply a migration after editing it.** 003 was edited post-apply and the deployed
+  function silently drifted from the checked-in file for several hours.
 
 ## Open questions for the team
 

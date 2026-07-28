@@ -1,10 +1,22 @@
 # What's still required
 
-**Updated 2026-07-27.** Two lists: **Part A** is what integration needs before the four
+**Updated 2026-07-28.** Two lists: **Part A** is what integration needs before the four
 services actually work together, **Part B** is what the product needs beyond that.
 Architecture context is in [`integration-status.md`](integration-status.md); how to run a
 walkthrough is in [`demo-walkthrough.md`](demo-walkthrough.md).
 
+> ### Closed on 2026-07-28
+>
+> - **A1 — Ranking shipped the candidates write** (`03e21fc`, merged). Their branch is
+>   the source of truth for `backend/service_ranking/`; our competing version is deleted.
+> - **The SW selection gate** — `003_sw_selection_gate.sql` applied live, mirrored in
+>   `MockReferralDB`, plus `frontend/src/ChooseService.jsx`. The social worker picks the
+>   service and that choice triggers the next step (CLAUDE.md §7b).
+> - **A9 was a bug, not a preference** — see below.
+> - **A11 — the demo service can reach the form component** (channel row + seeded
+>   `form_templates`).
+> - **Security** — the SPA fallback allowed arbitrary file reads; fixed + regression-tested.
+>
 > ### Closed on 2026-07-27
 >
 > - **A2 — `backend`-addressed actions now have a servicer.** Ownership confirmed as
