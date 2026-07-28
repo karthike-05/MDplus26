@@ -73,3 +73,21 @@ def test_new_patient_requires_the_not_null_columns():
             pass
         else:
             raise AssertionError(f"expected rejection when omitting one of {missing}")
+
+
+def test_live_intake_guard_defaults_off_and_withholds_the_advance(monkeypatch):
+    """The app has no auth. On a permanent public URL, "+ New referral" would let anyone
+    type a phone number and cause a REAL WhatsApp on the team's Twilio account, because
+    create_referral kicks advance_referral -> confirm_consent -> twilio -> Messaging's
+    deployed poller. The guard withholds only that kick; the rows are still written.
+
+    Defaults OFF so a fresh deploy is safe without remembering to set anything.
+    """
+    from backend.main import allow_live_intake
+
+    monkeypatch.delenv("ALLOW_LIVE_INTAKE", raising=False)
+    assert allow_live_intake() is False          # safe by default
+    monkeypatch.setenv("ALLOW_LIVE_INTAKE", "1")
+    assert allow_live_intake() is True
+    monkeypatch.setenv("ALLOW_LIVE_INTAKE", "0")
+    assert allow_live_intake() is False

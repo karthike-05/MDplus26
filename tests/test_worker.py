@@ -123,7 +123,7 @@ def test_run_forever_survives_a_broken_db_and_keeps_ticking():
             return []
 
     async def drive():
-        task = asyncio.create_task(worker.run_forever(Flaky(), poll_seconds=0.01))
+        task = asyncio.create_task(worker.run_forever(Flaky(), interval=0.01))
         await asyncio.sleep(0.05)
         task.cancel()
         try:
@@ -520,22 +520,46 @@ def test_email_action_writes_a_shared_attempt():
 def test_orchestrator_tick_is_opt_in(monkeypatch):
     """Opt-in because it's one of two valid designs (A3): a central tick, or every
     component advancing itself. Doing both is safe only because of the open-action
-    guard, so the choice should be explicit."""
+    guard, so the choice should be explicit.
+
+    Drives the ENV VAR, not a module attribute. Patching the attribute is what let the
+    import-time bug below ship green.
+    """
     db = _consenting_db()
-    monkeypatch.setattr(worker, "ORCHESTRATOR_TICK", False)
+    monkeypatch.setenv("ORCHESTRATOR_TICK", "0")
     assert asyncio.run(worker.advance_open_referrals(db)) == []
 
-    monkeypatch.setattr(worker, "ORCHESTRATOR_TICK", True)
+    monkeypatch.setenv("ORCHESTRATOR_TICK", "1")
     advanced = asyncio.run(worker.advance_open_referrals(db))
     assert advanced and all("advanced" in a for a in advanced)
 
 
 def test_orchestrator_tick_skips_terminal_referrals(monkeypatch):
-    monkeypatch.setattr(worker, "ORCHESTRATOR_TICK", True)
+    monkeypatch.setenv("ORCHESTRATOR_TICK", "1")
     db = _consenting_db()
     for referral in db._referrals.values():
         referral["status"] = "enrolled"
     assert asyncio.run(worker.advance_open_referrals(db)) == []
+
+
+def test_env_flags_are_read_at_call_time_not_import(monkeypatch):
+    """REGRESSION (2026-07-28). These were module-level `os.getenv` constants, but
+    `backend.main` imports this module BEFORE calling `load_dotenv()` — so a value set
+    in `.env` was evaluated against an environment that didn't have it yet. The flag
+    read back False at /health and the sweep silently never ran.
+
+    Any of these going back to an import-time constant re-breaks `.env` configuration
+    with no error anywhere, so assert the late binding directly.
+    """
+    monkeypatch.setenv("ORCHESTRATOR_TICK", "1")
+    assert worker.orchestrator_tick() is True
+    monkeypatch.setenv("ORCHESTRATOR_TICK", "0")
+    assert worker.orchestrator_tick() is False
+
+    monkeypatch.setenv("WORKER_POLL_SECONDS", "0.25")
+    assert worker.poll_seconds() == 0.25
+    monkeypatch.setenv("WORKER_STALE_AFTER_SECONDS", "7")
+    assert worker.stale_after() == 7
 
 
 # --- helpers ------------------------------------------------------------------

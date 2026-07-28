@@ -198,7 +198,8 @@ export default function Dashboard({ onReview, onOpen, onChoose, onNew }) {
                           // our run / simulated-inbound buttons are not the driver there,
                           // and offering them would imply a control we don't have.
                           ? <span style={{ fontSize: 11, color: C.sub }}>driven by the DB scheduler</span>
-                          : <RowActions row={r} onReview={onReview} onChange={load} small />}
+                          : <RowActions row={r} onReview={onReview} onChange={load} small
+                                        live={dbInfo?.mode === "supabase"} />}
                       </td>
                     </tr>
                   );

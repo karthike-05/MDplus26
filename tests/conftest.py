@@ -22,6 +22,14 @@ SEAM_URL_VARS = ("CALL_AGENT_BASE_URL", "SERVICE_RANKING_BASE_URL")
 # The DB seam: set, these make `make_db()` return a REAL Supabase adapter.
 DB_VARS = ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "DATABASE_URL")
 
+# Behaviour flags the worker reads at CALL time. A developer who turns these on in
+# `.env` for a live run would otherwise silently change what the suite asserts:
+# ORCHESTRATOR_TICK adds advance_referral sweeps to every `tick()` report, and
+# BACKEND_CLAIM_RANKING makes the `backend` component claim `rank_resources` — both of
+# which have tests asserting the OPPOSITE default. Turned both on live on 2026-07-28
+# and three unrelated tests went red.
+BEHAVIOUR_FLAG_VARS = ("ORCHESTRATOR_TICK", "BACKEND_CLAIM_RANKING")
+
 # Blanked at COLLECTION time, before any test module imports `backend.main` — the
 # adapter is chosen once, at import, so an autouse fixture runs too late to stop it.
 #
@@ -32,7 +40,7 @@ DB_VARS = ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "DATABASE_URL")
 # Without this, populating .env with working credentials silently converts this suite
 # from "no DB, no network" (CLAUDE.md §9) into one that reads and writes the team's
 # shared database.
-for _var in DB_VARS:
+for _var in DB_VARS + BEHAVIOUR_FLAG_VARS:
     os.environ[_var] = ""
 
 
@@ -45,7 +53,7 @@ def _no_ambient_seam_urls(monkeypatch):
     # whatever `db` happens to be — nondeterministic, and against a real Supabase if the
     # developer's .env is populated. Tests that want the worker call it directly.
     monkeypatch.setenv("WORKER_ENABLED", "0")
-    for var in DB_VARS:
+    for var in DB_VARS + BEHAVIOUR_FLAG_VARS:
         monkeypatch.delenv(var, raising=False)
 
 

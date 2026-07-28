@@ -153,7 +153,7 @@ export function actionFor(row) {
 // The one control that pushes a referral forward — reused by the dashboard rows and
 // the referral detail. Runs the auto-tool (`run`), opens the review screen (`review`),
 // or fires a simulated inbound signal, then calls onChange() to refresh.
-export function RowActions({ row, onReview, onChange, small }) {
+export function RowActions({ row, onReview, onChange, small, live }) {
   const [busy, setBusy] = useState(false);
   const a = actionFor(row);
   const go = async (fn) => {
@@ -162,7 +162,11 @@ export function RowActions({ row, onReview, onChange, small }) {
       await fn();
       await onChange?.();
     } catch (e) {
-      alert(String(e));
+      const msg = String(e);
+      alert(msg.includes("409")
+        ? "Live, the DB's advance_referral() owns this transition — these buttons drive "
+          + "our offline scheduler. Switch the data source to Mock to drive the loop by hand."
+        : msg);
     } finally {
       setBusy(false);
     }
@@ -170,6 +174,20 @@ export function RowActions({ row, onReview, onChange, small }) {
   if (a.done) return <span style={{ color: C.ok, fontWeight: 600, fontSize: 13 }}>✅ Loop closed</span>;
   if (a.flag) return <span style={{ color: C.warn, fontWeight: 600, fontSize: 13 }}>⚠ Needs social worker</span>;
   if (a.review) return <Btn small={small} onClick={() => onReview?.(row.referral_id)}>{a.review}</Btn>;
+
+  // Live, `advance_referral()` owns transitions (CLAUDE.md §7a) and /run + /inbound
+  // answer 409 by design. Review still works — it's our component either way — but a
+  // button whose only possible outcome is an error reads as a broken app, so name the
+  // owner of the step instead of offering it.
+  if (live)
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+        <span style={{ fontSize: 12, color: C.ink }}>{a.wait || a.run}</span>
+        <span style={{ fontSize: 11, color: C.sub }}>
+          the DB scheduler drives this live
+        </span>
+      </div>
+    );
   if (a.run)
     return (
       <Btn small={small} disabled={busy} onClick={() => go(() => api.run(row.referral_id))}>

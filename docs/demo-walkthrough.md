@@ -24,6 +24,46 @@ nothing else is ready.
 
 ---
 
+## The run sheet
+
+The whole walkthrough on one screen. Detail for each step is in the sections below.
+
+**Before anyone is watching** (~3 min)
+
+```bash
+cd frontend && npm run build && cd ..     # backend serves dist/ — one process, one URL
+uvicorn backend.main:app --port 8000 &
+python -m pytest tests -q                 # 114 green, no DB / browser / network
+python run_demo.py                        # headless: prints the loop closing
+python -m backend.scripts.demo_driver     # read-only: what live will do with each referral
+```
+
+Open **http://localhost:8000**. Four tabs: **Dashboard · Services · New referral ·
+Integration**. Deep-link any referral with `?referral=<uuid>`.
+
+**Demo A — the product (5 min, mock data, always works)**
+
+| # | Do | Say |
+| --- | --- | --- |
+| 1 | Data-source pill top-right → **Use mock** | Fixtures are a deliberate choice: clean, repeatable, nobody else's deploy can break it |
+| 2 | **Dashboard** — three groups, two right-hand columns | "Service accepted" and "Patient response" are *different facts*. findhelp and Unite Us stop at the first |
+| 3 | Transport referral → **Review** | Split screen; click a field, its box lights up on the PDF |
+| 4 | Point at the signature row | No value, "needs your signature" — `human_only` is enforced by `fillable_fields()`, not by asking a model to behave |
+| 5 | Fill the flagged field → **Submit** | A real PDF lands in `sample_forms/filled/` |
+| 6 | Back on the dashboard, drive the inbound signals | org emails back → **Service accepted**; check-in goes out; patient replies `Y` → **Closed the loop**. *This last one is the product* |
+
+**Demo B — the integration (5 min, live data, honest)**
+
+| # | Do | Say |
+| --- | --- | --- |
+| 1 | Pill → **Supabase (live)**, then the **Integration** tab | Every failure on this bus is silent; this screen names the cause instead |
+| 2 | Walk the blockers, components, worker ticks, action queue | `backend` had no poller at all until this week — one `select_resource` row deadlocked its referral permanently |
+| 3 | Dashboard → the referral under **Needs you** → **Choose service →** | The SW choosing is what feeds `sw_feedback`, the only signal ranking's subjective layer learns from. Auto-selecting would starve it |
+| 4 | **Pick rank #1** | ⚠ See the warning below — #2 and #4 are phone-channel and will park |
+| 5 | The review screen opens on live data | Same `prepare` → review → `submit` path as Demo A, now driven by `advance_referral()` instead of our scheduler |
+
+---
+
 ## Setup (once, ~2 minutes)
 
 ```bash
@@ -41,7 +81,7 @@ works and is better while editing the UI.)
 Sanity check before anyone is watching:
 
 ```bash
-python -m pytest tests -q          # 112 green, no DB / browser / network
+python -m pytest tests -q          # 114 green, no DB / browser / network
 python run_demo.py                 # headless: prints the loop closing
 curl -s localhost:8000/health      # ok + db mode + worker state
 ```
@@ -116,33 +156,52 @@ do with each live referral, and nothing is written:
 python -m backend.scripts.demo_driver
 ```
 
-Today it reports: one referral held at the consent gate, and two that will park at
-`ranking` — one of which already has four passing `ranking_results` rows ready to bridge.
+As of **2026-07-28** it reports three live referrals:
 
-### Setting up a live demo tonight (Ranking shipped, but hasn't redeployed)
+| Patient | State | Verdict |
+| --- | --- | --- |
+| Emily Martinez | `not_started`, consent pending | will queue `confirm_consent → twilio` |
+| **Jordan Ellis** | `ranking`, 4 candidates, 1 open action | **⏸ parked at the SW gate — this is the demo referral** |
+| Aneesh | `waiting_for_consent` but consent *confirmed* | will park at `ranking`; nothing triggers a run (A1b) |
 
-Ranking's code writes candidates properly as of 2026-07-28, but **their Railway service
-still runs the old build**, and they deliberately built no poller — so nothing produces
-or triggers candidates on the live DB yet. Three commands get you a working live demo in
-about a minute. All three are dry-run without `--yes`:
+Aneesh's row is worth a mention if someone asks: consent was confirmed and nothing called
+`advance_referral()` afterwards, so it sits with zero open actions and nothing to wake it.
+That is the "does every component advance the referral when it finishes?" question with a
+live specimen attached, not a bug in our code.
+
+### Setting up a live demo (the demo referral is already armed)
+
+**Jordan Ellis `c1a1e002-51a1-4f1a-9c11-000000000002` is parked at the SW gate right
+now** — no setup needed. The board shows it under **Needs you** with **Choose service →**.
+Pick one and it dispatches `prepare_online_form` to us, so the review screen opens on
+live data.
+
+> ### ⚠ Pick rank #1
+>
+> Rank #1 (*Non-Emergency Medical Transport (Synthetic)*) is the **only** candidate with
+> an `online_form` channel, and the only one with a seeded `form_templates` row. Ranks #2
+> and #4 are `phone` → they dispatch to `retell`, **which nobody polls**, so the referral
+> parks. Rank #3 has no `service_application_channels` row at all, so `advance_referral`
+> treats it as instantly exhausted. All three are real findings and fine to *mention* —
+> just don't walk into one live.
+
+Once you've clicked through, re-arm it for the next run:
 
 ```bash
-python -m backend.scripts.demo_driver --bridge-candidates --yes   # 4 already-scored rows
-python -m backend.scripts.demo_driver --reset-selection --yes     # so the SW gate fires
-python -m backend.scripts.demo_driver                             # confirm
+python -m backend.scripts.demo_driver --reset-selection \
+  --referral-id c1a1e002-51a1-4f1a-9c11-000000000002 --yes
 ```
 
-The bridge is not inventing a ranking — those four rows are already in `ranking_results`,
-scored and filtered by their pipeline. It's moving data their new code *would* write.
-The reset clears a `service_id` that was seeded, not chosen by a social worker; the gate
-only asks when nothing is chosen.
+This **deletes** the finished action rows rather than cancelling them, and it has to:
+`queue_referral_action` upserts on `(referral_id, deduplication_key)` without resetting
+`action_status`, so a completed action permanently poisons its key (CLAUDE.md §7c). A
+cancelled `sw_select:<referral>` row would make the gate silently never fire again.
 
-Then the live board shows the referral under **Needs you** with **Choose service →**.
-Pick one, and it dispatches `prepare_online_form` to us — the rank-1 service has an
-`online_form` channel and a seeded `form_templates` row (A11), so the review screen
-opens. Verified end-to-end in a rolled-back transaction.
-
-**Delete the bridge once Ranking redeploys.**
+If a referral has *no* candidates and you need some, `demo_driver --bridge-candidates
+--yes` copies rows their pipeline already scored in `ranking_results` — it invents
+nothing. It's a shim for **Ranking's un-redeployed Railway service**; their code has been
+correct since `03e21fc`. **Delete the bridge once they redeploy.** All `demo_driver`
+writes are dry-run without `--yes`.
 
 ---
 

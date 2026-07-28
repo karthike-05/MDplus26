@@ -15,6 +15,13 @@ frontend/dist/
 .venv/
 supabase/
 *.json
+# ...but NOT the JSON the build and the form-fill pipeline depend on. Already-tracked
+# files are unaffected by a later ignore rule, so this was latent rather than broken —
+# a NEW form schema would simply never get committed, and the deploy would 404 the
+# review screen with the file sitting happily on the author's disk.
+!contracts/schemas/*.json
+!frontend/package.json
+!frontend/package-lock.json
 node_modules/
 
 # artifacts and cache

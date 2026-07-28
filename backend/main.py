@@ -17,13 +17,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from contracts.models import DashboardRow
 from backend.adapters.inbound import build_router as build_inbound_router
@@ -170,6 +172,46 @@ app.include_router(build_inbound_router(db, TOOLS))
 
 # --- Request models ----------------------------------------------------------
 
+def _normalize_dob(v: str) -> str:
+    """`patients.date_of_birth` is a DATE column, so anything Postgres can't parse comes
+    back as an opaque 500 (`invalid input syntax for type date: "j"` — hit live on
+    2026-07-28 by typing a letter into the intake form). Validate at the edge instead,
+    where FastAPI turns it into a 422 the UI can actually render.
+
+    Accepts ISO `YYYY-MM-DD` and US `MM/DD/YYYY` — the fixtures use the latter
+    (`tests/test_intake.py`) and a social worker is likelier to type it. Ambiguous
+    day/month ordering is resolved US-style; this is a US healthcare demo.
+    """
+    raw = (v or "").strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(raw, fmt).date().isoformat()
+        except ValueError:
+            continue
+    raise ValueError(f"date of birth must be YYYY-MM-DD or MM/DD/YYYY, got {raw!r}")
+
+
+def _normalize_phone(v: str) -> str:
+    """Store E.164. Messaging's Twilio provider prefixes `whatsapp:` and sends as-is —
+    its docstring states the app stores "plain E.164 (+1...) numbers" — so a number
+    saved as `408-898-8088` becomes `whatsapp:408-898-8088` and Twilio rejects it in
+    *their* logs, which reads here as a loop that silently stalled. US-only, matching
+    the demo's scope; an explicit `+<country>` is passed through untouched.
+    """
+    raw = (v or "").strip()
+    if raw.startswith("+"):
+        if re.fullmatch(r"\+\d{8,15}", raw):
+            return raw
+        raise ValueError(f"not a valid E.164 number: {raw!r}")
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    raise ValueError(
+        f"phone must be 10 digits, or E.164 with a leading +, got {raw!r}")
+
+
 class NewPatient(BaseModel):
     name: str
     dob: str
@@ -184,6 +226,16 @@ class NewPatient(BaseModel):
     medicaid_id: str | None = None
     mobility_needs: str | None = None
     household_size: str | None = None
+
+    @field_validator("dob")
+    @classmethod
+    def _check_dob(cls, v: str) -> str:
+        return _normalize_dob(v)
+
+    @field_validator("phone")
+    @classmethod
+    def _check_phone(cls, v: str) -> str:
+        return _normalize_phone(v)
 
 
 class NewReferral(BaseModel):
@@ -329,6 +381,32 @@ def _owns_transitions() -> bool:
 async def _advance_result(referral_id: str, steps) -> dict:
     referral = await db.get_referral(referral_id)
     return {"state": _display_state(referral), "steps": [o.model_dump() for o in steps]}
+
+
+LIVE_INTAKE_BLOCKED = (
+    "ALLOW_LIVE_INTAKE=0: the referral was created, but not advanced. Advancing it live "
+    "queues confirm_consent -> twilio, and Messaging's deployed poller sends a REAL "
+    "WhatsApp to whatever number was typed, billed to the team's Twilio. Set "
+    "ALLOW_LIVE_INTAKE=1 to enable."
+)
+
+
+def allow_live_intake() -> bool:
+    """Whether creating a referral may kick `advance_referral()` on the LIVE DB.
+
+    Defaults OFF, and that default is the whole point. The app has no auth, so anyone
+    with the URL can open "+ New referral", type any phone number, and cause a real
+    WhatsApp to be sent on the team's account. That was an acceptable risk for an
+    ephemeral tunnel shared with three teammates for an evening; it is not one for a
+    permanent public deploy, which is what this guard was written for.
+
+    Creating the patient and referral rows still works with this off — only the outbound
+    kick is withheld, and the response says so rather than looking like a success.
+
+    Read at call time, not import: `backend.main` imports before `load_dotenv()`, and a
+    module-level constant here would silently ignore `.env` (see worker.py's note).
+    """
+    return os.getenv("ALLOW_LIVE_INTAKE", "0").strip().lower() in ("1", "true", "yes")
 
 
 def _require_our_scheduler() -> None:
@@ -635,7 +713,10 @@ async def system_status() -> dict:
 async def health() -> dict:
     """Deploy health check. Reports the worker too: a process that answers HTTP while
     its worker died is "up" by every naive check and completely broken in practice."""
-    return {"ok": True, "db": _db_status(), "worker": worker.status.as_dict()}
+    return {"ok": True, "db": _db_status(), "worker": worker.status.as_dict(),
+            # Surfaced because "new referrals send no consent text" is otherwise
+            # indistinguishable from Messaging's poller being down.
+            "allow_live_intake": allow_live_intake()}
 
 
 class DBMode(BaseModel):
@@ -751,7 +832,10 @@ async def create_referral(body: NewReferral) -> dict:
     # scheduler owns that and the UI's Run button drives it.
     advanced = None
     if not _owns_transitions():
-        advanced = await db.advance_referral(referral_id)
+        if allow_live_intake():
+            advanced = await db.advance_referral(referral_id)
+        else:
+            advanced = {"state": "not_advanced", "reason": LIVE_INTAKE_BLOCKED}
     return {"referral_id": referral_id, "advanced": advanced}
 
 

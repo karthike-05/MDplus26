@@ -18,9 +18,13 @@ const DOT = { success: C.ok, needs_human: C.warn, failed: C.danger };
 export default function ReferralDetail({ referralId, onBack, onReview }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
+  // Which scheduler owns transitions, so RowActions can offer the buttons or name the
+  // owner instead of firing a guaranteed 409 (CLAUDE.md §7a).
+  const [live, setLive] = useState(false);
 
   const load = () => api.referral(referralId).then(setData).catch((e) => setError(String(e)));
   useEffect(() => { setData(null); load(); }, [referralId]);
+  useEffect(() => { api.dbMode().then((d) => setLive(d?.mode === "supabase")).catch(() => {}); }, []);
 
   if (error) return <div style={s.center}>Couldn’t load: {error}</div>;
   if (!data) return <div style={s.center}>Loading…</div>;
@@ -63,7 +67,7 @@ export default function ReferralDetail({ referralId, onBack, onReview }) {
           <div style={{ marginTop: 6 }}><PatientResponse response={patient_response} /></div>
 
           <div style={{ ...s.sectionLabel, marginTop: 16 }}>Next step</div>
-          <div style={{ marginTop: 6 }}><RowActions row={row} onReview={onReview} onChange={load} /></div>
+          <div style={{ marginTop: 6 }}><RowActions row={row} onReview={onReview} onChange={load} live={live} /></div>
         </div>
 
         {/* right: timeline */}

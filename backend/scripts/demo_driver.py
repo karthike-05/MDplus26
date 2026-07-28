@@ -48,6 +48,11 @@ TERMINAL = ("enrolled", "failed", "escalated")
 # deadlock in waiting, because advance_referral's first guard is "any open action -> wait".
 POLLED = {"karthik_form", "backend", "twilio"}
 
+# ...except `social_worker`, where a *human* is the poller by design (§7b): the dashboard's
+# "Choose service" screen completes the action. Calling that deadlocked reads as a broken
+# demo when it is the demo, so it gets its own label rather than the skull.
+HUMAN_POLLED = {"social_worker": 'the dashboard\'s "Choose service" screen completes it'}
+
 
 def _client():
     url, key = os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -90,10 +95,15 @@ def diagnose(c) -> None:
         # function 2026-07-27) so the verdict matches what the DB will actually do.
         if open_actions:
             for a in open_actions:
-                stuck = a["assigned_component"] not in POLLED
+                comp = a["assigned_component"]
+                if comp in HUMAN_POLLED:
+                    note = f"   ⏸ awaiting a human — {HUMAN_POLLED[comp]}"
+                elif comp not in POLLED:
+                    note = "   ⛔ NOBODY POLLS THIS — deadlocked"
+                else:
+                    note = ""
                 print(f"  → WAITING on {a['action_type']} [{a['action_status']}] "
-                      f"-> {a['assigned_component']}"
-                      + ("   ⛔ NOBODY POLLS THIS — deadlocked" if stuck else ""))
+                      f"-> {comp}{note}")
             continue
 
         if r["status"] in TERMINAL:

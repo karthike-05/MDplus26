@@ -39,18 +39,32 @@ from backend.orchestrator import actions, backend_component
 # referral that reached it. Same claim/do/close/advance contract for both.
 COMPONENTS = (actions, backend_component)
 
-# Seconds between ticks when the queue is empty.
-POLL_SECONDS = float(os.getenv("WORKER_POLL_SECONDS", "5"))
+# These read the environment at CALL time, not at import. `backend.main` imports this
+# module (line 37) BEFORE it calls `load_dotenv()` (line 47), so a module-level
+# `os.getenv` constant is evaluated against an environment that has no `.env` in it yet.
+# Setting ORCHESTRATOR_TICK=1 in `.env` then does *nothing*, silently — the flag reads
+# back False at /health and the sweep never runs. Cost us a live debugging round on
+# 2026-07-28. `backend_component.claim_ranking()` was already a function, which is
+# exactly why BACKEND_CLAIM_RANKING worked from `.env` and this one didn't.
 
-# How long an action may sit `in_progress` before we assume the worker holding it died.
-# Comfortably longer than a real prepare/submit (a PDF fill is sub-second; the slowest
-# step is one guarded Claude call in the mapper), short enough that a crash doesn't
-# stall a demo.
-STALE_AFTER = int(os.getenv("WORKER_STALE_AFTER_SECONDS", "120"))
 
-# A3: also call advance_referral() for every open referral each tick, covering the
-# components that don't advance themselves. Opt-in — see advance_open_referrals().
-ORCHESTRATOR_TICK = os.getenv("ORCHESTRATOR_TICK", "0").strip().lower() in ("1", "true", "yes")
+def poll_seconds() -> float:
+    """Seconds between ticks when the queue is empty."""
+    return float(os.getenv("WORKER_POLL_SECONDS", "5"))
+
+
+def stale_after() -> int:
+    """How long an action may sit `in_progress` before we assume the worker holding it
+    died. Comfortably longer than a real prepare/submit (a PDF fill is sub-second; the
+    slowest step is one guarded Claude call in the mapper), short enough that a crash
+    doesn't stall a demo."""
+    return int(os.getenv("WORKER_STALE_AFTER_SECONDS", "120"))
+
+
+def orchestrator_tick() -> bool:
+    """A3: also call advance_referral() for every open referral each tick, covering the
+    components that don't advance themselves. Opt-in — see advance_open_referrals()."""
+    return os.getenv("ORCHESTRATOR_TICK", "0").strip().lower() in ("1", "true", "yes")
 
 # Belt-and-braces cap so a bug that keeps re-queueing work can't spin a tick forever.
 MAX_ACTIONS_PER_TICK = 25
@@ -78,10 +92,10 @@ class WorkerStatus:
             "enabled": self.enabled,
             "running": self.running,
             "components": [c.COMPONENT for c in COMPONENTS],
-            "orchestrator_tick": ORCHESTRATOR_TICK,
+            "orchestrator_tick": orchestrator_tick(),
             "claims_ranking": backend_component.claim_ranking(),
-            "poll_seconds": POLL_SECONDS,
-            "stale_after_seconds": STALE_AFTER,
+            "poll_seconds": poll_seconds(),
+            "stale_after_seconds": stale_after(),
             "ticks": self.ticks,
             "actions_serviced": self.serviced,
             "actions_reclaimed": self.reclaimed,
@@ -112,7 +126,7 @@ async def advance_open_referrals(db: ReferralDB) -> list[dict]:
     making this safe, which is why this is opt-in rather than on by default — if the
     team settles on "every component advances itself", turn it off and delete it.
     """
-    if not ORCHESTRATOR_TICK:
+    if not orchestrator_tick():
         return []
     out = []
     for referral in await db.list_referrals():
@@ -127,7 +141,7 @@ async def advance_open_referrals(db: ReferralDB) -> list[dict]:
 async def tick(db: ReferralDB) -> list[dict]:
     """One sweep + drain, across every component we service."""
     for component in COMPONENTS:
-        status.reclaimed += await db.reclaim_stale_actions(component.COMPONENT, STALE_AFTER)
+        status.reclaimed += await db.reclaim_stale_actions(component.COMPONENT, stale_after())
 
     reports: list[dict] = []
     for _ in range(MAX_ACTIONS_PER_TICK):
@@ -154,8 +168,12 @@ async def tick(db: ReferralDB) -> list[dict]:
     return reports
 
 
-async def run_forever(db: ReferralDB, poll_seconds: float = POLL_SECONDS) -> None:
-    """Tick until cancelled. Swallows per-tick errors on purpose — see module docstring."""
+async def run_forever(db: ReferralDB, interval: float | None = None) -> None:
+    """Tick until cancelled. Swallows per-tick errors on purpose — see module docstring.
+
+    `interval=None` resolves `poll_seconds()` per sleep rather than binding it as a
+    default at import — same reason the flags above are functions.
+    """
     status.enabled, status.running = True, True
     try:
         while True:
@@ -167,6 +185,6 @@ async def run_forever(db: ReferralDB, poll_seconds: float = POLL_SECONDS) -> Non
             except Exception as exc:              # noqa: BLE001 — must not kill the loop
                 status.last_error = f"{type(exc).__name__}: {exc}"
                 print(f"[worker] tick failed: {status.last_error}")
-            await asyncio.sleep(poll_seconds)
+            await asyncio.sleep(interval if interval is not None else poll_seconds())
     finally:
         status.running = False
