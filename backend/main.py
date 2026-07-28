@@ -728,7 +728,16 @@ async def create_referral(body: NewReferral) -> dict:
             fields.setdefault(key, value)
     form_id = fields.pop("form_id", None)
     referral_id = await db.create_referral(patient_id, form_id, **fields)
-    return {"referral_id": referral_id}
+
+    # Live, a referral that nobody advances is inert: `advance_referral()` is a function,
+    # not a daemon, so a brand-new row sits at `status='not_started'` and the consent
+    # text is never queued to twilio. Kicking it here is what makes "create a referral ->
+    # the patient gets a WhatsApp asking to opt in" actually happen. Offline, our own
+    # scheduler owns that and the UI's Run button drives it.
+    advanced = None
+    if not _owns_transitions():
+        advanced = await db.advance_referral(referral_id)
+    return {"referral_id": referral_id, "advanced": advanced}
 
 
 @app.get("/api/forms")
