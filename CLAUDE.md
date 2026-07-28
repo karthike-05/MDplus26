@@ -93,10 +93,16 @@ Incumbents (findhelp, Unite Us) *generate* referrals; our differentiator is **co
 │                                  # NOTE: no *_web.json yet — the online-application
 │                                  # component is unbuilt (docs/whats-left.md B1)
 ├─ backend/
-│   ├─ main.py                     # FastAPI app + routes (to build)
+│   ├─ main.py                     # FastAPI app + routes; serves frontend/dist last
 │   ├─ orchestrator/
 │   │   ├─ state_machine.py        # referral lifecycle states + transitions
-│   │   └─ scheduler.py            # reads DB state, dispatches exactly one tool
+│   │   ├─ scheduler.py            # reads DB state, dispatches exactly one tool
+│   │   ├─ actions.py              # the `karthik_form` worker on the shared bus (§7a)
+│   │   ├─ backend_component.py    # the `backend` worker — bookkeeping + email (§7a)
+│   │   └─ worker.py               # the runner: drains both, recovers crashed actions
+│   ├─ scripts/
+│   │   ├─ demo_driver.py          # read-only verdict on every LIVE referral (+ demo setup)
+│   │   └─ seed_form_templates.py  # contracts/schemas/*.json -> form_templates
 │   ├─ tools/
 │   │   └─ fill_form/
 │   │       ├─ fill_form.py        # prepare() for review UI; submit() injects + records
@@ -313,11 +319,56 @@ components is **`karthik_form`** — us. Messaging already works this way
 `MockReferralDB` **mirrors** `advance_referral` in Python so the same worker code runs
 both ways — that mirror is what keeps them from drifting (`tests/test_actions.py`).
 
+**We service TWO components, and a runner drives them.** `karthik_form` was always ours;
+**`backend`** was confirmed ours on 2026-07-27 and had no poller anywhere, which mattered
+more than it sounds: `advance_referral`'s first guard is "any open action → `waiting`",
+so one unserviced `select_resource` row **deadlocks** its referral permanently.
+[`worker.py`](backend/orchestrator/worker.py) runs both in the FastAPI lifespan —
+drain-per-tick (a backlog clears in one pass, not one-per-interval), and a sweep that
+returns actions stuck `in_progress` to `ready` so a crashed worker doesn't wedge a
+referral. It never raises into the event loop: a servicing failure is recorded on the
+action, a DB failure is logged and retried.
+
+Two things it deliberately does **not** do, both `.env` flags defaulting off:
+`rank_resources` is left for Ranking (claiming it would advance a referral with an empty
+shortlist — `BACKEND_CLAIM_RANKING`), and the central `advance_referral` sweep over all
+open referrals is opt-in (`ORCHESTRATOR_TICK`) because the team hasn't chosen between
+that and "every component advances itself".
+
+> **Live mode has no `current_state` and no `form_id`.** `set_state()` is a documented
+> **no-op** on both real adapters — writing our vocabulary into their `status` would
+> corrupt the column every other service branches on — and the form is resolved through
+> `form_templates.service_id`. The routes that push our offline scheduler (`/run`,
+> `/inbound`) return **409** live rather than silently doing nothing.
+
 > **Never add `referrals.current_state` to the shared DB, and never write our
 > vocabulary into their `referrals.status`.** Our state machine and theirs are parallel
 > implementations of the same decisions; a second state field would be a second owner
 > of truth. Their `referral_actions(referral_id, deduplication_key)` unique index
 > already gives us the idempotency `attempt_id` was for.
+
+### 7b. The social worker picks the service — `003_sw_selection_gate.sql`
+
+**Applied to the live DB (2026-07-27).** `advance_referral` used to take the top-ranked
+candidate itself and dispatch outreach. That is a different product from the one we're
+building: the SW seeing the options and choosing is what feeds `sw_feedback`, and
+`sw_feedback` is the *only* signal ranking's subjective layer ever learns from.
+Auto-selecting doesn't just remove a safeguard — it starves the feedback loop.
+
+So: candidates exist and none is `selected` → queue `select_resource` to
+**`social_worker`** and return `awaiting_sw_selection`. Nothing polls that component
+because a human is the poller. `POST /api/referrals/{id}/choose-service` completes it,
+and it must do **four** things or the gate breaks silently: flag the candidate, point the
+referral, **close the action** (else the open-action guard freezes the referral on the
+choice just made), and record the label.
+
+A candidate already flagged `selected` is *adopted*, not re-ranked. Without that branch
+the function falls through to the old auto-picker, which only considers `available`
+rows — so the SW's own pick is the one row it would skip.
+
+> Ranking's handoff assumed the opposite (auto-select + override) because **our** doc
+> still recommended it after we'd decided otherwise. Their code needs no change; only
+> their "zero open actions afterwards" check moves to expecting one.
 
 Full walkthrough, the vocabulary translation, and the current blockers:
 [`docs/integration-status.md`](docs/integration-status.md).
@@ -388,10 +439,13 @@ pytest -q               # layered suite
 ## 11. Dev workflow & commands
 
 ```bash
-uvicorn backend.main:app --reload           # backend
+uvicorn backend.main:app --reload           # backend (+ frontend/dist if built)
 python -m backend.scripts.make_sample_pdf   # regenerate the PDF fixture
-python run_demo.py                          # headless end-to-end
-pytest -q                                   # tests
+python run_demo.py                          # headless end-to-end (always the mock)
+pytest tests -q                             # our suite — `pytest -q` also collects
+                                            # backend/patient_comms, which needs sqlalchemy
+python -m backend.scripts.demo_driver       # read-only: what the LIVE loop will do next
+python -m backend.scripts.seed_form_templates --list   # form_templates + candidate services
 python -m http.server 8000 --directory frontend/mock_form   # mock web form (EMPTY — see §9)
 cd frontend && npm run dev                  # frontend
 supabase db push                            # apply contracts/db_schema.sql (when using the CLI)

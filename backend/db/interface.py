@@ -62,3 +62,47 @@ class ReferralDB(Protocol):
                                result: dict | None = None, error: str | None = None) -> None: ...
     async def record_shared_attempt(self, row: dict) -> None: ...
     async def advance_referral(self, referral_id: str) -> dict: ...
+
+    # `attempts.attempt_number` is NOT NULL with NO default, and the table carries a
+    # UNIQUE (referral_id, service_id, attempt_number). So a shared attempt cannot be
+    # written without one — an omission fails the insert outright rather than
+    # defaulting. This returns the next free number for that (referral, service) pair.
+    # CONTRACT TOUCH — announced.
+    async def next_attempt_number(self, referral_id: str, service_id: str | None) -> int: ...
+
+    # Crash recovery for the worker (docs/whats-left.md A5). An action marked
+    # `in_progress` by a worker that then died stays that way forever, and
+    # `advance_referral`'s first guard ("any open action -> waiting") turns that into a
+    # permanent deadlock for its referral. This resets long-stalled `in_progress` rows
+    # back to `ready` so another pass can claim them. Returns how many it reclaimed.
+    #
+    # ONLY `in_progress` — never `blocked`. `prepare_online_form` leaves its action
+    # `blocked` on purpose while it waits for a human reviewer (§2: form outreach is
+    # human-gated), and reclaiming those would re-run the prepare in a loop behind the
+    # reviewer's back.
+    async def reclaim_stale_actions(self, component: str, older_than_seconds: int) -> int: ...
+
+    # The durable inbound-webhook log (`integration_events`, docs/whats-left.md A12).
+    # Our adapters used to apply-and-forget, which made a dropped or duplicated webhook
+    # untraceable. Keys on the live UNIQUE (provider, external_id, event_type) when the
+    # caller has an external id; without one Postgres treats NULLs as distinct, so the
+    # row is appended rather than deduped. CONTRACT TOUCH — announced.
+    async def record_integration_event(self, event: dict) -> None: ...
+
+    # --- Read-only diagnostics (the /api/system panel) -----------------------
+    # Four services share one queue, and the failure modes are all *silent*: an action
+    # nobody polls, a candidate list nobody wrote, a webhook that never arrived. None of
+    # those raise anywhere. These three reads are what make that visible on one screen
+    # instead of only in psql. CONTRACT TOUCH — announced.
+    async def list_actions(self, referral_id: str | None = None,
+                           limit: int = 50) -> list[dict]: ...
+    async def list_integration_events(self, limit: int = 20) -> list[dict]: ...
+    async def list_candidates(self, referral_id: str) -> list[dict]: ...
+
+    # The social worker's pick (003_sw_selection_gate.sql). Flags one candidate
+    # `selected` and releases the rest back to `available`, which is the signal
+    # `advance_referral` adopts instead of ranking for itself. Writing
+    # `referrals.service_id` alone is not enough: the shortlist would still claim a
+    # different row was chosen, and any later `try_next_resource` would reason from it.
+    # CONTRACT TOUCH — announced.
+    async def select_candidate(self, referral_id: str, service_id: str) -> None: ...

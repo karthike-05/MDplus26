@@ -101,20 +101,29 @@ findings, and the live architecture live in
 ## Where to resume
 
 **Read [`integration-status.md`](integration-status.md) first** — it is the pick-up doc.
-The short version, updated 2026-07-26:
+Running a walkthrough? [`demo-walkthrough.md`](demo-walkthrough.md). The short version,
+updated 2026-07-27:
 
 1. **The architecture question is settled.** The live DB owns a scheduler,
-   `advance_referral()`, which dispatches work to components via `referral_actions`; we
-   are `karthik_form` and now poll it (`backend/orchestrator/actions.py`). So
-   `referrals.current_state` is **not** added and `001_orchestration_bus.sql` is
-   obsolete — our own state machine remains the *offline* orchestrator only, and
-   `MockReferralDB` mirrors `advance_referral` so one worker serves both.
+   `advance_referral()`, which dispatches work to components via `referral_actions`. We
+   poll **two** of those components — `karthik_form` and `backend` (the latter had no
+   poller anywhere, which deadlocked every referral that reached it) — driven by
+   `backend/orchestrator/worker.py` in the app lifespan. So `referrals.current_state` is
+   **not** added and `001_orchestration_bus.sql` is obsolete; our own state machine is
+   the *offline* orchestrator only, and `MockReferralDB` mirrors `advance_referral` so
+   one worker serves both.
 2. **One blocker, upstream of us:** nothing writes `referral_service_candidates`, which
    `advance_referral` reads, so live referrals park at `status='ranking'`. Ranking writes
-   `ranking_results`; the bridge is nearly mechanical but belongs to Ranking/Data.
-3. **UI + deployment:** surface all three channels and the closed-loop view; set both
-   legs of every seam (`ORCHESTRATOR_BASE_URL` / `ORG_BACKEND_URL` live in *their*
-   environments and fail silently when unset).
-4. **Deferred:** the online-application form component (the PDF half is built); seeding
-   `form_templates` from our schema JSON; persisting inbound events to
-   `integration_events`; upload-a-PDF → auto-extract schema (`CLAUDE.md` §13).
+   `ranking_results`; the bridge is specified for them in
+   [`handoff-ranking-candidates.md`](handoff-ranking-candidates.md). Everything
+   downstream is now ready — the demo service has an `online_form` channel and a seeded
+   `form_templates` row, so the referral routes to the form component the moment
+   candidates exist (verified in a rolled-back transaction).
+3. **One deployable.** The backend serves the built frontend, so a tunnel or a single
+   Railway service covers the whole product and the public URL can change without
+   rebuilding the bundle. Both legs of every seam still matter:
+   `ORCHESTRATOR_BASE_URL` / `ORG_BACKEND_URL` live in *their* environments and fail
+   silently when unset.
+4. **Deferred:** the online-application form component (the PDF half is built); a real
+   provider behind `send_email`; an escalations queue in the UI; upload-a-PDF →
+   auto-extract schema (`CLAUDE.md` §13).

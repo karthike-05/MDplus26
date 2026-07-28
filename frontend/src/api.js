@@ -2,8 +2,16 @@
 
 // Vite inlines import.meta.env.VITE_* at BUILD time, so a deployed bundle needs
 // VITE_API_BASE set in the build environment — setting it at runtime does nothing.
-// Defaults to the local backend so `npm run dev` needs no config.
-const API = import.meta.env.VITE_API_BASE || "http://localhost:8000";
+//
+// The default is chosen per mode rather than hardcoded, because the two situations want
+// opposite things:
+//   - `npm run dev` (:5173) needs an absolute URL to reach the backend on :8000.
+//   - a PRODUCTION build is served BY that backend (see the StaticFiles mount at the
+//     bottom of backend/main.py), so "" makes every call same-origin and relative. That
+//     is what lets the deployed URL change — a new tunnel, a new Railway domain —
+//     without rebuilding the bundle.
+const API =
+  import.meta.env.VITE_API_BASE ?? (import.meta.env.PROD ? "" : "http://localhost:8000");
 
 async function j(path, opts) {
   const r = await fetch(API + path, opts);
@@ -15,6 +23,7 @@ const post = (path, body) =>
 
 export const api = {
   dashboard: () => j("/api/dashboard"),
+  system: () => j("/api/system"),
   dbMode: () => j("/api/db"),
   setDbMode: (mode) => post("/api/db", { mode }),
   services: () => j("/api/services"),
@@ -27,5 +36,8 @@ export const api = {
   createPatient: (p) => post("/api/patients", p),
   createReferral: (r) => post("/api/referrals", r),
   submit: (id, values) => post(`/api/submit/${id}`, { values }),
+  // The SW selection gate: read the ranked shortlist, then record the human's pick.
+  ranking: (id) => j(`/api/referrals/${id}/ranking`),
+  chooseService: (id, body) => post(`/api/referrals/${id}/choose-service`, body),
   pageImageUrl: (formId, page) => `${API}/api/form/${formId}/page/${page}.png`,
 };

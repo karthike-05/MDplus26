@@ -1,8 +1,36 @@
 # What's still required
 
-**As of 2026-07-26.** Two lists: **Part A** is what integration needs before the four
+**Updated 2026-07-27.** Two lists: **Part A** is what integration needs before the four
 services actually work together, **Part B** is what the product needs beyond that.
-Architecture context is in [`integration-status.md`](integration-status.md).
+Architecture context is in [`integration-status.md`](integration-status.md); how to run a
+walkthrough is in [`demo-walkthrough.md`](demo-walkthrough.md).
+
+> ### Closed on 2026-07-27
+>
+> - **A2 — `backend`-addressed actions now have a servicer.** Ownership confirmed as
+>   ours. [`orchestrator/backend_component.py`](../backend/orchestrator/backend_component.py)
+>   handles the three bookkeeping types and `contact_service_by_email`. It deliberately
+>   does **not** claim `rank_resources` — that's Ranking's (A1).
+> - **A5 — the worker has a runner.** [`orchestrator/worker.py`](../backend/orchestrator/worker.py),
+>   started in the FastAPI lifespan. Drains per tick, sweeps actions stuck `in_progress`
+>   back to `ready`, never raises into the event loop. Visible at `GET /api/worker` and
+>   on the new **Integration** screen.
+> - **A3 — a central tick exists** (`ORCHESTRATOR_TICK=1`), off by default because the
+>   team hasn't chosen between it and "every component advances itself".
+> - **A6 — a seeder exists** for `form_templates`
+>   ([`scripts/seed_form_templates.py`](../backend/scripts/seed_form_templates.py)).
+>   It needs a `--service-id`; the table is still empty until someone picks one.
+> - **A12 — inbound webhooks persist to `integration_events`**, including the two
+>   rejection paths (unknown vocabulary, unknown referral).
+> - **A8 — one deployable.** The backend now serves the built frontend, so it's a single
+>   Railway service and a tunnel URL works without rebuilding the bundle.
+>
+> **Three live-mode defects fixed the same day** — all invisible offline, all fatal live:
+> `REFERRAL_COLS` dropped `status` / `completion_outcome` / `patient_confirmed_utilization`
+> (so the live board showed every referral as `created`); `referrals` has no `form_id`
+> column (now resolved via `form_templates.service_id`); and `attempts.attempt_number` is
+> NOT NULL with no default, so every `record_shared_attempt` would have failed on its
+> first real insert.
 
 Each item says **who owns it** and **why it blocks**, because several of these look
 cosmetic and are not.
@@ -17,16 +45,45 @@ cosmetic and are not.
 
 ## Part A — required for integration
 
-### A1. Nothing writes `referral_service_candidates` 🔴 BLOCKER
-**Owner: Ranking / Data.** `advance_referral()` reads this table to pick a service. It is
-empty and has no writer — Ranking writes `ranking_results` instead. So **every live
-referral parks at `status='ranking'` forever**, waiting for a `rank_resources` job.
+### A1. Nothing writes `referral_service_candidates` ✅ SHIPPED BY RANKING 2026-07-28
+**Owner: Ranking / Data — done.** `rank_referral()` now writes
+`referral_service_candidates` alongside `ranking_results`, closes the open
+`rank_resources` action, and calls `advance_referral()` itself.
+(`origin/service_ranking_and_call_agent` @ `03e21fc`.)
 
-The bridge is nearly mechanical: `ranking_results` rows with `passed_hard_filter = true`
-→ `referral_service_candidates` (`rank`, `score` ← `combined_score`, `reasons` ← the
-objective breakdown / subjective rationale). `eligibility_state` has no source and can
-default to `'unknown'`, which `advance_referral` accepts. Only Ranking knows whether
-results map to candidates one-for-one or need filtering first.
+Their `upsert_referral_service_candidates` splits insert from update so an existing row
+only has `score`/`reasons` refreshed — which genuinely solves the
+`UNIQUE(referral_id, rank)` re-rank collision. `reasons` is an array of
+`{type, text}`; nothing in `advance_referral` reads it, it's for the selection UI.
+
+**Two things remain:** their branch isn't merged, and **their Railway service still runs
+the old code** — until they redeploy, live still only gets `ranking_results`.
+
+> Ranking has no `referral_actions` poller and doesn't want one: ranking stays
+> on-demand via `POST /rank-referral/{id}`. Something has to call it — the plan is a
+> "Generate ranking" control in our referral-creation flow. **That's ours and it isn't
+> built.**
+
+### A1b. Nobody triggers a ranking run 🟠 OURS, one env flag
+**Owner: us.** Ranking deliberately has no poller — ranking stays on-demand behind
+`POST /rank-referral/{id}`, and they've assigned the triggering to us. We already have
+the mechanism: `backend_component` claims the `rank_resources` action and proxies it to
+their endpoint. It just needs
+
+```bash
+BACKEND_CLAIM_RANKING=1
+SERVICE_RANKING_BASE_URL=https://md-catalyst-service-ranking-production.up.railway.app
+```
+
+The two workers compose correctly: we claim the action (`in_progress`), call their
+endpoint, their `get_open_rank_resources_action` finds it (their query accepts
+`in_progress`) and closes it, they advance; our proxy then marks it completed — already
+completed, harmless — and advances again, which the open-action guard absorbs.
+
+> 💸 **This costs money when it fires.** Their Layer 3 is a live Claude call per ranking
+> run. Left off, the `rank_resources` action sits `ready` and the referral waits. A
+> "Generate ranking" button in the referral-creation flow is the alternative — a human
+> decides when to spend.
 
 ### A2. Nobody services `backend`-addressed actions 🔴 BLOCKER
 **Owner: probably us — confirm with Data.** `advance_referral()` queues
@@ -96,11 +153,22 @@ reach us it needs a public URL — either a fifth Railway service (Root Director
 `Procfile` is ready) or a tunnel (`cloudflared tunnel --url http://localhost:8000`). The
 tunnel is better for a recorded take: no cold starts, no credit ceiling, logs in view.
 
-### A9. `attempts.channel` has no value for a filled PDF
-**Owner: Data to decide.** We record PDF submissions as `email` (how the form reaches the
-service); a web form would be `online_form`. One constant, `CHANNEL_FOR_TARGET` in
-`orchestrator/actions.py`. Fine as-is, but it means the DB can't distinguish "we emailed a
-filled PDF" from "we sent a plain email", which affects channel-exhaustion logic.
+### A9. `attempts.channel` has no value for a filled PDF ✅ resolved 2026-07-27
+**Was: owner Data to decide.** This turned out not to be a preference but a **bug**.
+We recorded a PDF submission as `email` regardless of how the service was contacted.
+`advance_referral` step 9 asks "is there an attempt whose channel equals this *configured*
+channel", so a PDF submitted through an `online_form` service never marked that channel
+tried: step 10 re-picked `online_form`, the dedup key
+`attempt:<referral>:<service>:online_form` was unchanged, and `queue_referral_action`'s
+ON CONFLICT handed back the **already-completed** action rather than queueing a new one.
+No new work, no error — the referral would sit at `in_progress` forever.
+
+Now the attempt is recorded under **the channel the scheduler dispatched**
+(`input_payload.channel`, else the referral's resolved channel), with
+`CHANNEL_FOR_TARGET` demoted to a fallback for when nothing dispatched it. `attempts`
+therefore agrees with `service_application_channels`, which is what the exhaustion logic
+compares. Covered by `tests/test_worker.py::
+test_attempt_is_recorded_under_the_dispatched_channel_not_the_file_format`.
 
 ### A10. Messaging's outbound trigger is still a stub
 **Owner: us.** `notify_patient` doesn't call `patient_comms`. It may not need to — twilio
@@ -108,11 +176,26 @@ actions already flow through the queue, so the DB may cover it. **Decide** wheth
 dispatch directly or leave it entirely to the bus; doing both would double-message a
 patient.
 
-### A11. IDs and demo data
-**Owner: us.** Live is all-UUID; our fixtures use `pat_001` / `svc_capmetro` /
-`transport_intake`. Decision taken: drive the demo off the 3 live referrals. Still to
-verify: that the chosen service has an `online_form` row in
-`service_application_channels`, or the referral will never route to us.
+### A11. The demo referral could never reach us ✅ fixed 2026-07-27
+**Owner: Data + us.** Of the four services ranked for the transport referral, **two had
+no `service_application_channels` row at all** — including rank 1, which
+`advance_referral` step 9 reads as vacuously exhausted and dead-ends into an unserviced
+`try_next_resource` — and **none had an `online_form` channel**. Across the whole DB only
+23 of 58 services have any channel, and all 13 `online_form` rows belong to
+air-ambulance charities. A ground-transport referral could therefore only ever route to
+`phone` → `retell` or `email` → `backend`; the form component was unreachable.
+
+**Fixed** by giving `Non-Emergency Medical Transport (Synthetic)`
+(`f0a1a007…`, `verification_status='exclude'`, the rank-1 candidate the demo referral
+already points at) an `online_form` channel at priority 1, plus a `form_templates` row so
+the form resolves. Verified inside a rolled-back transaction — with candidates present,
+`advance_referral` now returns
+`{"state":"in_progress","channel":"online_form","attempt_number":2}`, i.e. it dispatches
+`prepare_online_form` to `karthik_form`. Reproduce with
+`python -m backend.scripts.demo_driver --enable-form-channel`.
+
+**Still open, and Ranking's:** a service with *no* channel shouldn't rank at all — see
+item 6 in [`handoff-ranking-candidates.md`](handoff-ranking-candidates.md).
 
 ### A12. Inbound events aren't persisted
 **Owner: us.** `integration_events` is the durable webhook log and it's empty — our
@@ -201,9 +284,10 @@ Same items, grouped by owner. Roles per `CLAUDE.md` §4.
 ### Data / Ranking
 | # | Task | Why it matters |
 | --- | --- | --- |
-| **A1** | Write `referral_service_candidates` from `ranking_results` (`passed_hard_filter=true`) | 🔴 **Nothing live moves without it.** Every referral parks at `status='ranking'`. |
-| A2 | Confirm what `assigned_component='backend'` means — your service, or ours? | We'd build the wrong thing, or duplicate yours. Blocks A2. |
-| A9 | Decide whether `attempts.channel` gets a value for a filled PDF | We record PDFs as `email`; the DB can't tell that from a plain email, which skews channel-exhaustion. |
+| ~~A1~~ | ~~Write `referral_service_candidates`~~ | ✅ Shipped 2026-07-28 (`03e21fc`) |
+| **A1c** | **Merge the branch and redeploy Railway** | Until then live still only gets `ranking_results` and nothing moves. |
+| A1d | Note that `003_sw_selection_gate.sql` is applied — your "zero open actions" check now expects one | Your code needs no edit; the expectation changed and our stale doc caused it. |
+| B11 | Zero-channel services are still rankable (you left this as-is) | Fine while the affected rows are synthetic. A real service with no channel dead-ends its referral. |
 | B10 | Decide on a terminal `referrals.status` for "patient used it" | Today it's free-text `completion_outcome`; widening the CHECK constraint affects everyone. |
 | B11 | Wire `sw_feedback` embeddings + retrieval | Ranking can't learn from social-worker corrections until then. |
 
@@ -225,15 +309,15 @@ Same items, grouped by owner. Roles per `CLAUDE.md` §4.
 ### Form-fill (us)
 | # | Task | Why it matters |
 | --- | --- | --- |
-| **A2** | Service `backend`-addressed actions, once ownership is confirmed | 🔴 One unserviced `select_resource` row **deadlocks** its referral via the open-action guard. |
-| **A5** | Give the worker a runner (background task or endpoint) + crash recovery | `run_once()` exists but nothing calls it on a loop; a crash leaves a row `in_progress` forever. |
-| A6 | Seed `form_templates` from `contracts/schemas/*.json` | The table is provisioned and empty. |
-| A8 | Make our backend reachable (Railway service or tunnel) | Inbound can't reach us otherwise. |
-| A11 | Verify the demo referral's service has an `online_form` channel | Or it never routes to us. |
-| A12 | Persist inbound events to `integration_events` | Dropped/duplicate webhooks are currently untraceable. |
+| ~~A2~~ | ~~Service `backend`-addressed actions~~ | ✅ Done — `orchestrator/backend_component.py` |
+| ~~A5~~ | ~~Worker runner + crash recovery~~ | ✅ Done — `orchestrator/worker.py`, in the app lifespan |
+| ~~A12~~ | ~~Persist inbound events~~ | ✅ Done — including both rejection paths |
+| ~~A8~~ | ~~Make our backend reachable~~ | ✅ Single deployable; tunnel or Railway, no rebuild on URL change |
+| A6 | Run the seeder — it needs a `--service-id` | Script is written; the table is still empty until a service is chosen. |
+| A11 | Get one ground-transport service an `online_form` channel row | 🔴 Without it the form component **never fires** on a live referral. |
 | B1 | Build the online-application component + its `mock_form` fixture and web schema | The PDF half is built; this half is what most services need. |
 | B2 | An escalations queue in the UI | `escalate_to_social_worker` actions are queued and **unclaimable** — a product hole. |
-| B3 | Wire a provider behind `send_email` | One of the three advertised channels. |
+| B3 | Wire a provider behind `send_email` | Now reachable via `contact_service_by_email`, but still a stub that records without sending. |
 | B4, B8, B9, B12 | Cold path; observability; retry/dead-letter; live-mode tests | Post-Aug-2 hardening. |
 
 ### Whole team (decide together, quickly)

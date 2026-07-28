@@ -8,7 +8,7 @@ Swapping this for ``SupabaseReferralDB`` changes no tool code.
 from __future__ import annotations
 
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -57,6 +57,7 @@ class MockReferralDB:
         self._actions: list[dict] = []               # referral_actions
         self.shared_attempts: list[dict] = []        # attempts, in THEIR vocabulary
         self._candidates: dict[str, list[dict]] = {}  # referral_service_candidates
+        self.integration_events: list[dict] = []     # integration_events (A12)
 
     async def get_patient(self, patient_id: str) -> dict:
         return dict(self._patients[patient_id])
@@ -160,12 +161,16 @@ class MockReferralDB:
         for existing in self._actions:
             if existing["referral_id"] == referral_id and existing["deduplication_key"] == key:
                 return existing["id"]
+        now = datetime.now(timezone.utc)
         action = {
             "id": f"act_{uuid4().hex[:8]}", "referral_id": referral_id,
             "service_id": service_id, "action_type": action_type,
             "action_status": "ready", "assigned_component": component,
             "input_payload": payload or {}, "deduplication_key": key,
             "reason": reason, "result": None, "error_message": None,
+            # Live these are real columns; the mirror needs them so the worker's
+            # crash-recovery sweep (reclaim_stale_actions) has something to age off.
+            "created_at": now, "updated_at": now,
         }
         self._actions.append(action)
         return action["id"]
@@ -179,6 +184,7 @@ class MockReferralDB:
         for a in self._actions:
             if a["id"] == action_id:
                 a["action_status"] = status
+                a["updated_at"] = datetime.now(timezone.utc)
                 if result is not None:
                     a["result"] = result
                 if error is not None:
@@ -186,10 +192,67 @@ class MockReferralDB:
                 return
         raise KeyError(action_id)
 
+    async def reclaim_stale_actions(self, component: str, older_than_seconds: int) -> int:
+        """Mirror of the live sweep: `in_progress` rows older than the cutoff go back to
+        `ready`. Never touches `blocked` — that's the human-review gate, not a crash."""
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)
+        reclaimed = 0
+        for a in self._actions:
+            if (a["assigned_component"] == component
+                    and a["action_status"] == "in_progress"
+                    and a["updated_at"] <= cutoff):
+                a["action_status"] = "ready"
+                a["updated_at"] = datetime.now(timezone.utc)
+                reclaimed += 1
+        return reclaimed
+
     async def record_shared_attempt(self, row: dict) -> None:
         """`attempts` in THEIR vocabulary (status + outcome), which is what
         advance_referral reads to decide whether a channel has been tried."""
         self.shared_attempts.append(dict(row))
+
+    async def next_attempt_number(self, referral_id: str, service_id: str | None) -> int:
+        """Mirror of the live UNIQUE (referral_id, service_id, attempt_number)."""
+        return 1 + sum(1 for a in self.shared_attempts
+                       if a.get("referral_id") == referral_id
+                       and a.get("service_id") == service_id)
+
+    async def list_actions(self, referral_id: str | None = None,
+                           limit: int = 50) -> list[dict]:
+        rows = [dict(a) for a in self._actions
+                if referral_id is None or a["referral_id"] == referral_id]
+        return rows[-limit:][::-1]                # newest first, like the live order
+
+    async def list_integration_events(self, limit: int = 20) -> list[dict]:
+        return [dict(e) for e in self.integration_events[-limit:][::-1]]
+
+    async def list_candidates(self, referral_id: str) -> list[dict]:
+        referral = self._referrals.get(referral_id)
+        return [dict(c) for c in self._candidates_for(referral)] if referral else []
+
+    async def select_candidate(self, referral_id: str, service_id: str) -> None:
+        """Mirror of the live two-step: release everything, then flag the pick."""
+        rows = self._candidates.setdefault(
+            referral_id, list(self._candidates_for(self._referrals.get(referral_id, {}))))
+        for row in rows:
+            row["selected"] = row["service_id"] == service_id
+            if row["service_id"] == service_id:
+                row["candidate_status"] = "selected"
+            elif row.get("candidate_status") == "selected":
+                row["candidate_status"] = "available"
+
+    async def record_integration_event(self, event: dict) -> None:
+        """Append-only inbound log. Deduped on (provider, external_id, event_type) only
+        when external_id is set — matching Postgres, where NULLs never collide."""
+        key = (event.get("provider"), event.get("external_id"), event.get("event_type"))
+        if key[1] is not None:
+            for existing in self.integration_events:
+                if (existing.get("provider"), existing.get("external_id"),
+                        existing.get("event_type")) == key:
+                    existing.update(event)
+                    return
+        self.integration_events.append(
+            {"received_at": datetime.now(timezone.utc).isoformat(), **event})
 
     async def advance_referral(self, referral_id: str) -> dict:
         r = self._referrals.get(referral_id)
@@ -258,15 +321,39 @@ class MockReferralDB:
                                           f"rank:{referral_id}", "No candidate ranking exists")
             return {"state": "ranking", "action_id": aid}
 
+        # THE SOCIAL-WORKER SELECTION GATE — mirrors 003_sw_selection_gate.sql.
+        # The scheduler no longer picks the service; the SW does, and that choice is what
+        # feeds `sw_feedback` and triggers the next step.
         if not r.get("service_id"):
-            best = sorted(candidates, key=lambda c: c["rank"])[0]
-            r.update(service_id=best["service_id"], current_resource_rank=best["rank"],
-                     status="resource_selected")
-            aid = await self.queue_action(referral_id, best["service_id"], "select_resource",
-                                          "backend", f"select:{referral_id}:{best['service_id']}",
-                                          "Selected highest-ranked available candidate")
-            return {"state": "resource_selected", "service_id": best["service_id"],
-                    "action_id": aid}
+            chosen = next((c for c in candidates if c.get("selected")), None)
+            if chosen is not None:
+                # Adopt the human's pick. Falling through would re-pick by rank and
+                # quietly overrule them — and worse, the auto-picker only considers
+                # `available` rows, so their own choice is the one it would skip.
+                r.update(service_id=chosen["service_id"],
+                         current_resource_rank=chosen["rank"], status="resource_selected")
+                return {"state": "resource_selected", "service_id": chosen["service_id"],
+                        "reason": "Social worker selected this service"}
+
+            available = [c for c in candidates
+                         if c.get("candidate_status", "available") == "available"
+                         and c.get("eligibility_state", "unknown")
+                         in ("eligible", "potentially_eligible", "unknown")]
+            if available:
+                r["status"] = "ranking"       # nothing is selected yet — see the migration
+                aid = await self.queue_action(
+                    referral_id, None, "select_resource", "social_worker",
+                    f"sw_select:{referral_id}",
+                    "Ranked shortlist is ready; a social worker must choose a service")
+                return {"state": "awaiting_sw_selection", "action_id": aid}
+
+            # Nothing available -> the pre-existing escalation path, unchanged.
+            r.update(status="escalated",
+                     escalation_reason="No eligible or unexhausted resource remains")
+            aid = await self.queue_action(
+                referral_id, None, "escalate_to_social_worker", "social_worker",
+                f"escalate:no_resource:{referral_id}", "No candidate remains")
+            return {"state": "escalated", "action_id": aid}
 
         service_id = r["service_id"]
         mine = [a for a in atts if a.get("service_id") == service_id]

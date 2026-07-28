@@ -3,7 +3,9 @@ import { createRoot } from "react-dom/client";
 import ReviewUI from "./ReviewUI.jsx";
 import Dashboard from "./Dashboard.jsx";
 import Services from "./Services.jsx";
+import ChooseService from "./ChooseService.jsx";
 import Initiate from "./Initiate.jsx";
+import Integration from "./Integration.jsx";
 import ReferralDetail from "./ReferralDetail.jsx";
 import { api } from "./api.js";
 import { C } from "./ui.jsx";
@@ -19,6 +21,7 @@ function App() {
     ["dashboard", "Dashboard"],
     ["services", "Services"],
     ["initiate", "New referral"],
+    ["integration", "Integration"],
   ];
 
   return (
@@ -42,9 +45,18 @@ function App() {
         <Dashboard
           onReview={(id) => setView({ name: "review", id })}
           onOpen={(id) => setView({ name: "detail", id })}
+          onChoose={(id) => setView({ name: "choose", id })}
           onNew={() => setView({ name: "initiate" })}
         />
       )}
+      {view.name === "choose" && (
+        <ChooseService
+          referralId={view.id}
+          onBack={() => setView({ name: "dashboard" })}
+          onChosen={() => setView({ name: "dashboard" })}
+        />
+      )}
+      {view.name === "integration" && <Integration />}
       {view.name === "services" && <Services onStart={(svc) => setView({ name: "initiate", serviceId: svc.id })} />}
       {view.name === "initiate" && (
         <Initiate
