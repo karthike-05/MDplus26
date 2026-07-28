@@ -91,8 +91,16 @@ PATIENT_COLS = {
     # The consent gate `advance_referral()` reads before dispatching any outreach;
     # Messaging owns writing it.
     "consent_status": "consent_status",
+    # Derived from the typed `address` at intake (backend/intake/geocode.py). These are
+    # what Ranking's hard filter reads — a patient with them NULL made
+    # /rank-referral return a bare 500 (live, 2026-07-28), so an unmapped column here
+    # doesn't just lose data, it dead-ends the referral in someone else's service.
+    "postal_code": "postal_code",
+    "county": "county",
+    "latitude": "latitude",
+    "longitude": "longitude",
     # -- no column on `patients`: --
-    "address": None,                     # has postal_code + county + lat/long instead
+    "address": None,                     # geocoded into the four fields above, not stored
 }
 REFERRAL_COLS = {
     "id": "id",

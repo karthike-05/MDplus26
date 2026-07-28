@@ -63,12 +63,12 @@ def test_new_patient_requires_the_not_null_columns():
     from backend.main import NewPatient
 
     ok = NewPatient(name="Ada", dob="1815-12-10", phone="5125550000",
-                    referring_clinic="CommUnityCare Hancock")
+                    referring_clinic="CommUnityCare Hancock", address="1 Main St")
     assert ok.phone and ok.referring_clinic
 
     for missing in ({"phone": "5125550000"}, {"referring_clinic": "X"}):
         try:
-            NewPatient(name="Ada", dob="1815-12-10", **missing)
+            NewPatient(name="Ada", dob="1815-12-10", address="1 Main St", **missing)
         except ValidationError:
             pass
         else:

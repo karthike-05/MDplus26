@@ -31,6 +31,7 @@ from contracts.models import DashboardRow
 from backend.adapters.inbound import build_router as build_inbound_router
 from backend.db.interface import ReferralDB
 from backend.db.mock import MockReferralDB
+from backend.intake.geocode import geocode
 from backend.orchestrator import actions as act
 from backend.orchestrator import scheduler
 from backend.orchestrator import state_machine as sm
@@ -222,10 +223,20 @@ class NewPatient(BaseModel):
     # consent message, and every channel needs the phone.
     phone: str
     referring_clinic: str
-    address: str | None = None
+    # REQUIRED even though `patients` has no address column: it's the input we geocode
+    # into postal_code / county / latitude / longitude, which is what Ranking's hard
+    # filter reads. Optional, it was left blank, those four stayed NULL, and
+    # /rank-referral 500'd on every referral born in our UI.
+    address: str
     medicaid_id: str | None = None
     mobility_needs: str | None = None
     household_size: str | None = None
+    # Normally derived from `address`; accepted explicitly so a caller can supply them
+    # when the geocoder can't resolve an address (rural, PO box, brand-new street).
+    postal_code: str | None = None
+    county: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
 
     @field_validator("dob")
     @classmethod
@@ -805,8 +816,26 @@ async def find_patient(name: str, dob: str) -> dict:
 
 @app.post("/api/patients")
 async def create_patient(body: NewPatient) -> dict:
-    pid = await db.create_patient(body.model_dump(exclude_none=True))
-    return {"patient_id": pid, "patient": await db.get_patient(pid)}
+    fields = body.model_dump(exclude_none=True)
+
+    # Resolve the typed address into the columns `patients` actually has. Only fills
+    # what the caller didn't supply, so an explicit postal_code/lat/long always wins over
+    # a geocoder guess.
+    located = None
+    if not all(fields.get(k) for k in ("latitude", "longitude")):
+        located = await geocode(fields["address"])
+        for key, value in (located or {}).items():
+            if value is not None:
+                fields.setdefault(key, value)
+
+    pid = await db.create_patient(fields)
+    # Reported, not swallowed: with these NULL, Ranking's /rank-referral returns a bare
+    # 500 and the referral dead-ends in a service we don't own. `geocoded: false` is what
+    # makes that traceable to this address rather than to their bug.
+    return {"patient_id": pid, "patient": await db.get_patient(pid),
+            "geocoded": located is not None,
+            "location": {k: fields.get(k) for k in
+                         ("postal_code", "county", "latitude", "longitude")}}
 
 
 @app.post("/api/referrals")

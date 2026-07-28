@@ -53,6 +53,11 @@ def _no_ambient_seam_urls(monkeypatch):
     # whatever `db` happens to be — nondeterministic, and against a real Supabase if the
     # developer's .env is populated. Tests that want the worker call it directly.
     monkeypatch.setenv("WORKER_ENABLED", "0")
+    # Intake geocodes the typed address against the US Census API. On by default so a
+    # deploy resolves addresses without remembering a flag — which makes it exactly the
+    # kind of thing that would turn this suite into a network-dependent one. Tests that
+    # exercise geocoding set it back on and stub the transport.
+    monkeypatch.setenv("GEOCODING_ENABLED", "0")
     for var in DB_VARS + BEHAVIOUR_FLAG_VARS:
         monkeypatch.delenv(var, raising=False)
 

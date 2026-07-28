@@ -30,6 +30,7 @@ export default function Initiate({ preselectedServiceId, onDone, onCancel }) {
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  const [located, setLocated] = useState(null);   // geocoder result, or null if it missed
 
   useEffect(() => {
     api.services().then((d) => {
@@ -60,6 +61,11 @@ export default function Initiate({ preselectedServiceId, onDone, onCancel }) {
     call(async () => {
       const d = await api.createPatient(clean(draft));
       setPatient(d.patient);
+      // `patients` has no address column — the address is geocoded into postal_code /
+      // county / lat-long, which is what Ranking's hard filter reads. If that misses,
+      // say so HERE: unresolved, the referral reaches Ranking and dies with a 500 that
+      // looks like their bug. See backend/intake/geocode.py.
+      setLocated(d.geocoded ? d.location : null);
       setDraft(null);
     });
 
@@ -98,18 +104,39 @@ export default function Initiate({ preselectedServiceId, onDone, onCancel }) {
               <Field label="Phone"><input style={s.input} value={draft.phone} onChange={(e) => setDraft({ ...draft, phone: e.target.value })} /></Field>
               <Field label="Medicaid ID"><input style={s.input} value={draft.medicaid_id} onChange={(e) => setDraft({ ...draft, medicaid_id: e.target.value })} /></Field>
             </Row>
-            <Field label="Address"><input style={s.input} value={draft.address} onChange={(e) => setDraft({ ...draft, address: e.target.value })} /></Field>
+            {/* Required, though `patients` has no address column: it's the input we
+                geocode into postal_code / county / lat-long, and those are what
+                Ranking's hard filter reads. Left blank, the referral reaches Ranking
+                and dies with a 500. */}
+            <Field label="Address">
+              <input style={s.input} value={draft.address} placeholder="6330 Leavenworth Rd, Kansas City, KS 66104"
+                     onChange={(e) => setDraft({ ...draft, address: e.target.value })} />
+            </Field>
+            <div style={s.hint}>Street, city, state — used to locate the patient for service matching.</div>
             {/* Phone + referring clinic are NOT NULL on the shared patients table, so
                 the button stays disabled until both are filled — a rejected insert
                 here would surface as an opaque 500. */}
             <Field label="Referring clinic"><input style={s.input} value={draft.referring_clinic} onChange={(e) => setDraft({ ...draft, referring_clinic: e.target.value })} /></Field>
-            <Btn disabled={busy || !draft.phone.trim() || !draft.referring_clinic.trim()} onClick={createPatient}>{busy ? "Saving…" : "Create patient"}</Btn>
+            <Btn disabled={busy || !draft.phone.trim() || !draft.referring_clinic.trim() || !draft.address.trim()}
+                 onClick={createPatient}>{busy ? "Saving…" : "Create patient"}</Btn>
           </>
         )}
 
         {patient && (
           <>
             <Note tone="ok">{patient.name} · {patient.dob} · {patient.phone || "no phone"}</Note>
+            {located && (
+              <Note tone="ok">
+                Located: {[located.county, located.postal_code].filter(Boolean).join(" · ")}
+                {" "}({Number(located.latitude).toFixed(4)}, {Number(located.longitude).toFixed(4)})
+              </Note>
+            )}
+            {located === null && patient.latitude == null && (
+              <Note tone="warn">
+                Couldn’t resolve that address to coordinates. The referral will still be
+                created, but service ranking needs a location — expect it to stall.
+              </Note>
+            )}
 
             {/* 2 — service + mode */}
             <div style={s.step}>2 · Service</div>
