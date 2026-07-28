@@ -423,6 +423,20 @@ class SupabaseReferralDB(ReferralDB):
             "ORDER BY rank", referral_id)
         return [dict(r) for r in rows]
 
+    async def select_candidate(self, referral_id: str, service_id: str) -> None:
+        """The SW's pick. One statement, so the release and the flag can't interleave."""
+        pool = await self._p()
+        await pool.execute(
+            "UPDATE referral_service_candidates SET "
+            "  selected = (service_id = $2), "
+            "  candidate_status = CASE WHEN service_id = $2 THEN 'selected' "
+            "                          WHEN candidate_status = 'selected' THEN 'available' "
+            "                          ELSE candidate_status END, "
+            "  updated_at = now() "
+            "WHERE referral_id = $1",
+            referral_id, service_id,
+        )
+
     async def record_integration_event(self, event: dict) -> None:
         cols = list(event)
         placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))

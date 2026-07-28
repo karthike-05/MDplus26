@@ -230,6 +230,17 @@ class MockReferralDB:
         referral = self._referrals.get(referral_id)
         return [dict(c) for c in self._candidates_for(referral)] if referral else []
 
+    async def select_candidate(self, referral_id: str, service_id: str) -> None:
+        """Mirror of the live two-step: release everything, then flag the pick."""
+        rows = self._candidates.setdefault(
+            referral_id, list(self._candidates_for(self._referrals.get(referral_id, {}))))
+        for row in rows:
+            row["selected"] = row["service_id"] == service_id
+            if row["service_id"] == service_id:
+                row["candidate_status"] = "selected"
+            elif row.get("candidate_status") == "selected":
+                row["candidate_status"] = "available"
+
     async def record_integration_event(self, event: dict) -> None:
         """Append-only inbound log. Deduped on (provider, external_id, event_type) only
         when external_id is set — matching Postgres, where NULLs never collide."""
@@ -310,15 +321,39 @@ class MockReferralDB:
                                           f"rank:{referral_id}", "No candidate ranking exists")
             return {"state": "ranking", "action_id": aid}
 
+        # THE SOCIAL-WORKER SELECTION GATE — mirrors 003_sw_selection_gate.sql.
+        # The scheduler no longer picks the service; the SW does, and that choice is what
+        # feeds `sw_feedback` and triggers the next step.
         if not r.get("service_id"):
-            best = sorted(candidates, key=lambda c: c["rank"])[0]
-            r.update(service_id=best["service_id"], current_resource_rank=best["rank"],
-                     status="resource_selected")
-            aid = await self.queue_action(referral_id, best["service_id"], "select_resource",
-                                          "backend", f"select:{referral_id}:{best['service_id']}",
-                                          "Selected highest-ranked available candidate")
-            return {"state": "resource_selected", "service_id": best["service_id"],
-                    "action_id": aid}
+            chosen = next((c for c in candidates if c.get("selected")), None)
+            if chosen is not None:
+                # Adopt the human's pick. Falling through would re-pick by rank and
+                # quietly overrule them — and worse, the auto-picker only considers
+                # `available` rows, so their own choice is the one it would skip.
+                r.update(service_id=chosen["service_id"],
+                         current_resource_rank=chosen["rank"], status="resource_selected")
+                return {"state": "resource_selected", "service_id": chosen["service_id"],
+                        "reason": "Social worker selected this service"}
+
+            available = [c for c in candidates
+                         if c.get("candidate_status", "available") == "available"
+                         and c.get("eligibility_state", "unknown")
+                         in ("eligible", "potentially_eligible", "unknown")]
+            if available:
+                r["status"] = "ranking"       # nothing is selected yet — see the migration
+                aid = await self.queue_action(
+                    referral_id, None, "select_resource", "social_worker",
+                    f"sw_select:{referral_id}",
+                    "Ranked shortlist is ready; a social worker must choose a service")
+                return {"state": "awaiting_sw_selection", "action_id": aid}
+
+            # Nothing available -> the pre-existing escalation path, unchanged.
+            r.update(status="escalated",
+                     escalation_reason="No eligible or unexhausted resource remains")
+            aid = await self.queue_action(
+                referral_id, None, "escalate_to_social_worker", "social_worker",
+                f"escalate:no_resource:{referral_id}", "No candidate remains")
+            return {"state": "escalated", "action_id": aid}
 
         service_id = r["service_id"]
         mine = [a for a in atts if a.get("service_id") == service_id]

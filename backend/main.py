@@ -270,10 +270,15 @@ def _patient_response(referral: dict, patient: dict) -> dict:
     }
 
 
-async def _dashboard_row(referral: dict) -> dict:
+async def _dashboard_row(referral: dict, open_sw_selection: set[str] | None = None) -> dict:
     patient = await db.get_patient(referral["patient_id"])
     attempts = await db.list_attempts(referral["id"])
     state = _display_state(referral)
+    # An open `select_resource` addressed to `social_worker` is the SW gate
+    # (003_sw_selection_gate.sql) waiting on a person. It's derived from the ACTION, not
+    # from `status`: the status CHECK has no value for "awaiting a human", and inventing
+    # one would force a schema change on every other service.
+    awaiting_selection = referral["id"] in (open_sw_selection or set())
     row = DashboardRow(
         referral_id=referral["id"],
         patient_name=patient.get("name", ""),
@@ -283,7 +288,7 @@ async def _dashboard_row(referral: dict) -> dict:
         service_name=referral.get("service_name") or "",
         current_state=state,
         confirmation_source=_confirmation_source(state),
-        needs_attention=state in (sm.NEEDS_HUMAN, sm.ESCALATED),
+        needs_attention=state in (sm.NEEDS_HUMAN, sm.ESCALATED) or awaiting_selection,
         updated_at=attempts[-1]["at"] if attempts else None,
     ).model_dump()
     # Extra fields the UI needs to route actions (superset of the frozen contract).
@@ -304,6 +309,7 @@ async def _dashboard_row(referral: dict) -> dict:
         # attempt failed and a form attempt followed (all three services land here).
         "channels_tried": sorted({a["channel"] for a in attempts if a.get("channel")}),
         "attempt_count": len(attempts),
+        "awaiting_sw_selection": awaiting_selection,
     })
     return row
 
@@ -347,11 +353,17 @@ def _service_backfill(svc: dict) -> dict:
     """Fields to backfill onto a referral once its service is known — shared by
     referral creation and post-creation service selection (e.g. after a social
     worker acts on backend/service_ranking's output, see integration_plan_service_ranking.md)."""
+    # `.get`, not `[...]`. Live, SERVICE_COLS maps `preferred_channel` and `form_id` to
+    # None (no such column — the channel lives in service_application_channels), so
+    # `_to_ours` omits the keys entirely and subscripting raised KeyError. That took out
+    # the whole choose-service endpoint against the real DB while passing every offline
+    # test, because the fixture services do carry those keys.
     fields = {
-        "service_name": svc["name"],
-        "outreach_channel": svc["preferred_channel"],
-        "need_category": _slugify_category(svc.get("category", "")),
+        "service_name": svc.get("name"),
+        "outreach_channel": svc.get("preferred_channel"),
+        "need_category": _slugify_category(svc.get("category") or ""),
     }
+    fields = {k: v for k, v in fields.items() if v is not None}
     if svc.get("form_id"):
         fields["form_id"] = svc["form_id"]
     return fields
@@ -441,7 +453,15 @@ async def post_submit(referral_id: str, body: ReviewedValues) -> dict:
 @app.get("/api/dashboard")
 async def dashboard() -> dict:
     referrals = await db.list_referrals()
-    return {"rows": [await _dashboard_row(r) for r in referrals], "db": _db_status()}
+    # One queue read for the whole board rather than one per row.
+    open_sw_selection = {
+        str(a["referral_id"]) for a in await db.list_actions(limit=200)
+        if a.get("action_type") == "select_resource"
+        and a.get("assigned_component") == "social_worker"
+        and a.get("action_status") in OPEN_STATUSES
+    }
+    return {"rows": [await _dashboard_row(r, open_sw_selection) for r in referrals],
+            "db": _db_status()}
 
 
 # --- Data source (mock <-> Supabase, flippable from the UI) ------------------
@@ -781,7 +801,27 @@ async def _choose_service(referral_id: str, body: ChooseService, db: ReferralDB)
     except KeyError:
         raise HTTPException(404, f"unknown service '{body.service_id}'")
 
+    # 1. Flag the chosen candidate. This is the signal advance_referral's SW gate
+    #    (003_sw_selection_gate.sql) adopts. Doing only step 2 would leave the shortlist
+    #    claiming a different service was selected, and the gate would re-ask.
+    await db.select_candidate(referral_id, body.service_id)
+
+    # 2. Point the referral at it.
     await db.set_referral_service(referral_id, body.service_id, **_service_backfill(svc))
+
+    # 3. Close the open `select_resource` action addressed to `social_worker`. Nothing
+    #    polls that component — a human is the poller — so if this is skipped the
+    #    open-action guard freezes the referral on the very choice that was just made.
+    closed = []
+    for action in await db.list_actions(referral_id):
+        if (action.get("action_type") == "select_resource"
+                and action.get("assigned_component") == "social_worker"
+                and action.get("action_status") in ("ready", "in_progress", "blocked")):
+            await db.set_action_status(
+                str(action["id"]), "completed",
+                result={"chosen_service_id": body.service_id, "label": body.label},
+            )
+            closed.append(str(action["id"]))
 
     # Best-effort: log the SW's choice to ranking's own sw_feedback bookkeeping.
     # The db write above is authoritative for our loop regardless of this succeeding.
@@ -800,7 +840,16 @@ async def _choose_service(referral_id: str, body: ChooseService, db: ReferralDB)
         except httpx.HTTPError as e:
             print(f"[choose_service] sw-feedback forward failed (non-fatal): {e}")
 
-    return {"referral": await db.get_referral(referral_id)}
+    # 4. Trigger the next step. The whole point of the gate is that the SW's choice —
+    #    not a rank ordering — is what moves the referral, so the selection has to hand
+    #    control straight back to the scheduler. Offline our own scheduler owns that, so
+    #    this only applies live.
+    advanced = None
+    if not _owns_transitions():
+        advanced = await db.advance_referral(referral_id)
+
+    return {"referral": await db.get_referral(referral_id),
+            "closed_actions": closed, "advanced": advanced}
 
 
 @app.post("/api/referrals/{referral_id}/rank")

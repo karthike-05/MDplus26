@@ -314,23 +314,23 @@ def _awaiting_selection():
 
 
 def test_an_unserviced_backend_action_deadlocks_the_referral():
-    """The bug A2 describes, demonstrated. advance_referral queues `select_resource` to
-    `backend` AFTER it has already chosen the service — so the work is done, but the open
-    row makes every later call return `waiting`. Forever, with no poller."""
-    db = _awaiting_selection()
-    assert asyncio.run(db.advance_referral("ref_1001"))["state"] == "resource_selected"
-    assert db._referrals["ref_1001"]["service_id"] == "svc_capmetro"   # already done
-
+    """The bug A2 describes. advance_referral queues bookkeeping to `backend` AFTER it
+    has already done the work, so the open row makes every later call return `waiting` —
+    forever, with no poller."""
+    db = _consenting_db()
+    asyncio.run(db.queue_action("ref_1001", "svc_capmetro", "complete_referral",
+                                "backend", "complete:ref_1001", "enrollment recorded"))
     for _ in range(3):
         assert asyncio.run(db.advance_referral("ref_1001"))["state"] == "waiting"
 
 
 def test_servicing_the_backend_action_unblocks_the_chain():
-    db = _awaiting_selection()
-    asyncio.run(db.advance_referral("ref_1001"))
+    db = _consenting_db()
+    asyncio.run(db.queue_action("ref_1001", "svc_capmetro", "complete_referral",
+                                "backend", "complete:ref_1001", "enrollment recorded"))
 
     report = asyncio.run(backend_component.run_once(db))
-    assert report["action"] == "select_resource"
+    assert report["action"] == "complete_referral"
     assert report["result"]["service_id"] == "svc_capmetro"
     # and it advanced: the next step is now addressed to US
     assert report["advanced"]["state"] == "in_progress"
@@ -341,12 +341,141 @@ def test_servicing_the_backend_action_unblocks_the_chain():
 def test_one_tick_clears_a_cross_component_chain():
     """`backend` unblocks `karthik_form` within the same tick. Draining one component
     fully before the other would need two ticks — two poll intervals of visible stall."""
-    db = _awaiting_selection()
-    asyncio.run(db.advance_referral("ref_1001"))
+    db = _consenting_db()
+    asyncio.run(db.queue_action("ref_1001", "svc_capmetro", "complete_referral",
+                                "backend", "complete:ref_1001", "enrollment recorded"))
 
     reports = asyncio.run(worker.tick(db))
-    assert [r["action"] for r in reports] == ["select_resource", "prepare_online_form"]
+    assert [r["action"] for r in reports] == ["complete_referral", "prepare_online_form"]
     assert reports[-1]["state"] == "awaiting_review"
+
+
+# --- The social-worker selection gate (003_sw_selection_gate.sql) --------------
+
+def test_a_ranked_shortlist_waits_for_the_social_worker():
+    """The product intent: the SW sees the options and picks. Before the gate,
+    advance_referral silently took rank 1 and dispatched outreach, so the human was never
+    asked and `sw_feedback` — the signal Layer 3 learns from — had no event to record."""
+    db = _awaiting_selection()
+    out = asyncio.run(db.advance_referral("ref_1001"))
+    assert out["state"] == "awaiting_sw_selection"
+
+    queued = asyncio.run(db.list_ready_actions("social_worker"))
+    assert [a["action_type"] for a in queued] == ["select_resource"]
+    # nothing was dispatched to an outreach component, and no service was chosen
+    assert asyncio.run(db.list_ready_actions("karthik_form")) == []
+    assert db._referrals["ref_1001"]["service_id"] is None
+    # ...and it stays parked until a human acts
+    assert asyncio.run(db.advance_referral("ref_1001"))["state"] == "waiting"
+
+
+def test_the_social_workers_pick_is_adopted_not_overruled():
+    """They may choose rank 2. The scheduler must take THAT service — not re-sort and
+    quietly substitute its own favourite."""
+    db = _awaiting_selection()
+    db._candidates["ref_1001"].append(
+        {"service_id": "svc_drive_senior", "rank": 2,
+         "candidate_status": "available", "eligibility_state": "eligible"})
+    asyncio.run(db.advance_referral("ref_1001"))
+
+    asyncio.run(db.select_candidate("ref_1001", "svc_drive_senior"))       # the SW picks #2
+    for a in db._actions:                                                   # ...and it's closed
+        if a["action_type"] == "select_resource":
+            a["action_status"] = "completed"
+
+    out = asyncio.run(db.advance_referral("ref_1001"))
+    assert out["state"] == "resource_selected"
+    assert out["service_id"] == "svc_drive_senior"
+    assert db._referrals["ref_1001"]["current_resource_rank"] == 2
+    # and the next dispatch follows THEIR choice — a phone service, not the form one
+    assert asyncio.run(db.advance_referral("ref_1001"))["channel"] == "phone"
+
+
+def test_select_candidate_releases_the_previous_pick():
+    """Only ever one `selected` row: otherwise the gate's "adopt the selected one" branch
+    would pick arbitrarily between two."""
+    db = _awaiting_selection()
+    db._candidates["ref_1001"].append(
+        {"service_id": "svc_drive_senior", "rank": 2,
+         "candidate_status": "available", "eligibility_state": "eligible"})
+
+    asyncio.run(db.select_candidate("ref_1001", "svc_capmetro"))
+    asyncio.run(db.select_candidate("ref_1001", "svc_drive_senior"))   # changed their mind
+    chosen = [c for c in asyncio.run(db.list_candidates("ref_1001")) if c.get("selected")]
+    assert [c["service_id"] for c in chosen] == ["svc_drive_senior"]
+    released = {c["service_id"]: c["candidate_status"]
+                for c in asyncio.run(db.list_candidates("ref_1001"))}
+    assert released["svc_capmetro"] == "available"
+
+
+def test_choose_service_completes_the_whole_gate():
+    """The endpoint has to do FOUR things, and skipping any one of them silently breaks
+    the gate: flag the candidate (else advance_referral re-asks), point the referral,
+    close the social_worker action (else the open-action guard freezes the referral on
+    the very choice just made), and record the label (the ranker's only training signal).
+    """
+    from fastapi.testclient import TestClient
+    import backend.main as main
+
+    db = _awaiting_selection()
+    db._candidates["ref_1001"].append(
+        {"service_id": "svc_drive_senior", "rank": 2,
+         "candidate_status": "available", "eligibility_state": "eligible"})
+    asyncio.run(db.advance_referral("ref_1001"))
+    assert asyncio.run(db.list_ready_actions("social_worker"))            # parked
+
+    main.db.swap(db)
+    try:
+        with TestClient(main.app) as client:
+            board = client.get("/api/dashboard").json()["rows"]
+            row = next(r for r in board if r["referral_id"] == "ref_1001")
+            assert row["awaiting_sw_selection"] is True
+            assert row["needs_attention"] is True      # surfaces under "Needs you"
+
+            r = client.post("/api/referrals/ref_1001/choose-service",
+                            json={"service_id": "svc_drive_senior", "label": "good_fit",
+                                  "label_notes": "patient has used them before"})
+            assert r.status_code == 200, r.text
+    finally:
+        main.db.swap(MockReferralDB())
+
+    chosen = [c for c in asyncio.run(db.list_candidates("ref_1001")) if c.get("selected")]
+    assert [c["service_id"] for c in chosen] == ["svc_drive_senior"]
+    assert db._referrals["ref_1001"]["service_id"] == "svc_drive_senior"
+    assert [a["action_status"] for a in db._actions
+            if a["action_type"] == "select_resource"] == ["completed"]
+    # And the referral is free to move again, straight to outreach on THEIR choice —
+    # not `resource_selected`, because choose-service already pointed the referral, so
+    # the gate's "adopt the selected candidate" branch has nothing left to do. That
+    # branch is the safety net for a candidate flagged without a service_id.
+    assert asyncio.run(db.advance_referral("ref_1001"))["state"] == "in_progress"
+
+
+def test_choose_service_survives_a_live_service_row():
+    """Regression: SERVICE_COLS maps `preferred_channel` to None live (no such column),
+    so _to_ours omits the key and `svc["preferred_channel"]` raised KeyError — taking out
+    the entire endpoint against the real DB while every offline test passed."""
+    import backend.main as main
+
+    live_shaped = {"id": "svc_x", "name": "A Service", "category": "Transportation",
+                   "description": None, "email": None, "website": None}
+    assert main._service_backfill(live_shaped) == {
+        "service_name": "A Service", "need_category": "transportation"}
+
+
+def test_an_empty_shortlist_still_escalates():
+    """The pre-existing "no candidate remains" path must survive the new gate — a
+    referral with a shortlist that is entirely exhausted needs a human, not a wait."""
+    db = _consenting_db()
+    db._referrals["ref_1001"]["service_id"] = None
+    db._candidates["ref_1001"] = [
+        {"service_id": "svc_capmetro", "rank": 1,
+         "candidate_status": "exhausted", "eligibility_state": "eligible"},
+    ]
+    out = asyncio.run(db.advance_referral("ref_1001"))
+    assert out["state"] == "escalated"
+    assert [a["action_type"] for a in asyncio.run(db.list_ready_actions("social_worker"))] \
+        == ["escalate_to_social_worker"]
 
 
 def test_rank_resources_is_left_for_ranking_by_default():

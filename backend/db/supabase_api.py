@@ -343,6 +343,17 @@ class SupabaseAPIReferralDB(ReferralDB):
             "referral_id", referral_id).order("rank").execute()
         return [dict(r) for r in res.data or []]
 
+    async def select_candidate(self, referral_id: str, service_id: str) -> None:
+        """Release, then flag — the same two steps advance_referral itself uses. Order
+        matters: flagging first and releasing second would clear the row just set."""
+        c = await self._c()
+        await c.table("referral_service_candidates").update(
+            {"selected": False, "candidate_status": "available"},
+        ).eq("referral_id", referral_id).eq("candidate_status", "selected").execute()
+        await c.table("referral_service_candidates").update(
+            {"selected": True, "candidate_status": "selected", "updated_at": "now()"},
+        ).eq("referral_id", referral_id).eq("service_id", service_id).execute()
+
     async def advance_referral(self, referral_id: str) -> dict:
         """Call the DB's own scheduler. It — not us — decides the next step (§7: one
         owner of transitions; here that owner is the database)."""

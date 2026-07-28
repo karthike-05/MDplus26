@@ -40,6 +40,7 @@ const GROUPS = [
     accent: C.warn,
     match: (r) =>
       r.needs_attention ||
+      r.awaiting_sw_selection ||
       (r.current_state === "outreach_in_progress" && r.outreach_channel === "form"),
   },
   {
@@ -58,7 +59,7 @@ const GROUPS = [
   },
 ];
 
-export default function Dashboard({ onReview, onOpen, onNew }) {
+export default function Dashboard({ onReview, onOpen, onChoose, onNew }) {
   const [rows, setRows] = useState(null);
   const [dbInfo, setDbInfo] = useState(null);
   const [error, setError] = useState(null);
@@ -167,10 +168,17 @@ export default function Dashboard({ onReview, onOpen, onNew }) {
                       </td>
                       <td style={{ ...s.td, color: C.sub, fontSize: 12 }}>{fmtTime(r.updated_at)}</td>
                       <td style={s.td}>
-                        {dbInfo?.mode === "supabase"
-                          // Live, advance_referral() owns the workflow (§7a) — our run /
-                          // simulated-inbound buttons are not the driver there, and
-                          // offering them would imply a control we don't have.
+                        {/* The SW selection gate is a REAL action in both modes — the
+                            referral is parked waiting for exactly this person, so it
+                            takes precedence over the "driven by the DB" note below. */}
+                        {r.awaiting_sw_selection
+                          ? <Btn small tone="ok" onClick={() => onChoose(r.referral_id)}>
+                              Choose service →
+                            </Btn>
+                          : dbInfo?.mode === "supabase"
+                          // Otherwise, live, advance_referral() owns the workflow (§7a) —
+                          // our run / simulated-inbound buttons are not the driver there,
+                          // and offering them would imply a control we don't have.
                           ? <span style={{ fontSize: 11, color: C.sub }}>driven by the DB scheduler</span>
                           : <RowActions row={r} onReview={onReview} onChange={load} small />}
                       </td>

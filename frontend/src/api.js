@@ -36,5 +36,8 @@ export const api = {
   createPatient: (p) => post("/api/patients", p),
   createReferral: (r) => post("/api/referrals", r),
   submit: (id, values) => post(`/api/submit/${id}`, { values }),
+  // The SW selection gate: read the ranked shortlist, then record the human's pick.
+  ranking: (id) => j(`/api/referrals/${id}/ranking`),
+  chooseService: (id, body) => post(`/api/referrals/${id}/choose-service`, body),
   pageImageUrl: (formId, page) => `${API}/api/form/${formId}/page/${page}.png`,
 };
