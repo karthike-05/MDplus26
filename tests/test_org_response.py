@@ -142,3 +142,23 @@ def test_attempt_number_defaults_to_the_next_free_one(client_and_db):
     client.post("/api/org/response", json={"referral_id": rid, "decision": "accepted"})
     enrolled = [a for a in db.shared_attempts if a.get("outcome") == "enrolled"][0]
     assert enrolled["attempt_number"] == 2
+
+
+def test_channel_is_validated_against_the_live_check(client_and_db):
+    """`attempts.channel` is CHECK-constrained. A bad value reaches PostgREST as an
+    opaque 500 from inside record_shared_attempt, and ONLY against the real DB — the
+    mock accepts anything, so nothing else would catch it."""
+    from backend.adapters.inbound import ATTEMPT_CHANNELS
+
+    client, db = client_and_db
+    rid = _at_submitted(db)
+
+    bad = client.post("/api/org/response", json={
+        "referral_id": rid, "decision": "accepted", "channel": "carrier_pigeon"})
+    assert bad.status_code == 422
+    assert not db.shared_attempts
+
+    for channel in ATTEMPT_CHANNELS:
+        assert client.post("/api/org/response", json={
+            "referral_id": rid, "decision": "accepted", "channel": channel,
+        }).status_code == 200

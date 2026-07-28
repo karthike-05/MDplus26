@@ -26,7 +26,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from backend.db.interface import ReferralDB
 from backend.orchestrator import scheduler
@@ -121,6 +121,13 @@ ORG_DECISION_STATUS: dict[str, str] = {
 }
 
 
+# The live `attempts.channel` CHECK, read off the deployed schema 2026-07-28. Validated
+# here rather than at the insert: PostgREST reports a CHECK violation as an opaque 500
+# from deep inside `record_shared_attempt`, and only ever against the real DB — the mock
+# accepts anything, so no test would catch it.
+ATTEMPT_CHANNELS = ("online_form", "phone", "email", "sms", "whatsapp")
+
+
 class OrgResponse(BaseModel):
     """The service organisation's answer to a submitted application.
 
@@ -132,10 +139,17 @@ class OrgResponse(BaseModel):
     referral_id: str
     decision: str                        # ORG_DECISION_OUTCOME keys
     attempt_no: int | None = None        # defaults to the next free number
-    channel: str = "email"               # how they answered; attempts.channel vocabulary
+    channel: str = "email"               # how they answered; ATTEMPT_CHANNELS
     confirmation_id: str | None = None
     note: str | None = None
     external_id: str | None = None       # their message id, for webhook dedupe
+
+    @field_validator("channel")
+    @classmethod
+    def _known_channel(cls, v: str) -> str:
+        if v not in ATTEMPT_CHANNELS:
+            raise ValueError(f"channel must be one of {list(ATTEMPT_CHANNELS)}, got {v!r}")
+        return v
 
 
 # --- The durable webhook log (A12) -------------------------------------------

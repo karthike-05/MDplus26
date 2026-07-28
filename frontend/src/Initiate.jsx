@@ -30,7 +30,11 @@ export default function Initiate({ preselectedServiceId, onDone, onCancel }) {
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
-  const [located, setLocated] = useState(null);   // geocoder result, or null if it missed
+  // Tri-state on purpose: undefined = never attempted, null = attempted and missed,
+  // object = resolved. A plain null start made the "couldn't resolve that address"
+  // warning fire for every EXISTING patient found via Find patient, where no geocode was
+  // ever run.
+  const [located, setLocated] = useState(undefined);
 
   useEffect(() => {
     api.services().then((d) => {
@@ -53,6 +57,7 @@ export default function Initiate({ preselectedServiceId, onDone, onCancel }) {
   const search = () =>
     call(async () => {
       const d = await api.findPatient(name, dob);
+      setLocated(undefined);                 // a new search hasn't geocoded anything yet
       if (d.found) { setPatient(d.patient); setDraft(null); }
       else setDraft({ name, dob, phone: "", referring_clinic: "", address: "", medicaid_id: "" });
     });
@@ -131,7 +136,7 @@ export default function Initiate({ preselectedServiceId, onDone, onCancel }) {
                 {" "}({Number(located.latitude).toFixed(4)}, {Number(located.longitude).toFixed(4)})
               </Note>
             )}
-            {located === null && patient.latitude == null && (
+            {located === null && (
               <Note tone="warn">
                 Couldn’t resolve that address to coordinates. The referral will still be
                 created, but service ranking needs a location — expect it to stall.
