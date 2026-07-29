@@ -250,10 +250,55 @@ def rank_referral(referral_id: str) -> list[dict]:
     reads to pick a service -- and hands control back to it, so a referral is never
     left parked at status='ranking' just because ranking_results was written
     (handoff-ranking-candidates.md §1-3).
+
+    The scored pipeline can raise on a sparse/partial patient profile (no
+    coordinates, no demographics -- e.g. a patient created through the clinic's
+    intake UI before every field is filled in). A bare 500 here is terminal for
+    the referral, not just the request: queue_referral_action upserts on
+    (referral_id, deduplication_key) without resetting action_status, so
+    rank:<referral_id> gets permanently poisoned and the referral sits looking
+    healthy while doing nothing forever (docs/changes-2026-07-28.md, "For
+    Ranking"). So we log the full traceback -- there was none to read on the
+    live run that surfaced this -- and degrade to an unfiltered, unscored
+    shortlist rather than throw.
     """
     referral = db.get_referral(referral_id)
     patient = db.get_patient(referral["patient_id"])
 
+    try:
+        candidate_rows = _run_scored_pipeline(referral_id, referral, patient)
+    except Exception:
+        logger.exception(
+            "scored ranking pipeline failed for referral_id=%s patient_id=%s -- "
+            "falling back to an unfiltered, unscored shortlist",
+            referral_id,
+            referral["patient_id"],
+        )
+        candidate_rows = _run_unfiltered_fallback(referral_id, referral)
+
+    # Best-effort: an unrelated hiccup here shouldn't hide ranking results that
+    # already wrote successfully. The candidate write above is the actual
+    # blocker (handoff-ranking-candidates.md §1) and is allowed to raise; closing
+    # the action + advancing the referral is a courtesy to the orchestrator.
+    try:
+        open_action = db.get_open_rank_resources_action(referral_id)
+        if open_action is not None:
+            db.close_rank_resources_action(open_action["id"], len(candidate_rows))
+        db.advance_referral(referral_id)
+    except Exception:
+        logger.exception(
+            "closing rank_resources / advance_referral failed for referral_id=%s",
+            referral_id,
+        )
+
+    return db.get_ranking_results(referral_id)
+
+
+def _run_scored_pipeline(referral_id: str, referral: dict, patient: dict) -> list[dict]:
+    """The hard filter + objective + subjective layers, writing ranking_results
+    and referral_service_candidates. Raises on unexpected input -- rank_referral
+    catches and degrades to _run_unfiltered_fallback instead of letting it
+    become a bare 500."""
     candidates = run_hard_filter(referral, patient)
     survivors = [c for c in candidates if c["passed_hard_filter"]]
     service_ids = [c["service"]["id"] for c in survivors]
@@ -318,23 +363,56 @@ def rank_referral(referral_id: str) -> list[dict]:
         for c in survivors
     ]
     db.upsert_referral_service_candidates(candidate_rows)
+    return candidate_rows
 
-    # Best-effort: an unrelated hiccup here shouldn't hide ranking results that
-    # already wrote successfully. The candidate write above is the actual
-    # blocker (handoff-ranking-candidates.md §1) and is allowed to raise; closing
-    # the action + advancing the referral is a courtesy to the orchestrator.
-    try:
-        open_action = db.get_open_rank_resources_action(referral_id)
-        if open_action is not None:
-            db.close_rank_resources_action(open_action["id"], len(candidate_rows))
-        db.advance_referral(referral_id)
-    except Exception:
-        logger.exception(
-            "closing rank_resources / advance_referral failed for referral_id=%s",
-            referral_id,
-        )
 
-    return db.get_ranking_results(referral_id)
+def _run_unfiltered_fallback(referral_id: str, referral: dict) -> list[dict]:
+    """Degrade path when the scored pipeline raises. Skips hard-filtering and
+    scoring entirely and lists every active service in the referral's
+    need_category as an unscored candidate, so the referral still reaches a
+    social worker instead of parking forever on a poisoned rank:<referral_id>
+    dedup key (docs/changes-2026-07-28.md, "For Ranking")."""
+    services = db.get_active_services_by_category(referral["need_category"])
+
+    ranking_rows = [
+        {
+            "referral_id": referral_id,
+            "service_id": service["id"],
+            "passed_hard_filter": True,
+            "filter_reject_reason": None,
+            "objective_score": None,
+            "objective_breakdown": None,
+            "subjective_score": None,
+            "subjective_rationale": None,
+            "combined_score": None,
+            "rank": rank,
+        }
+        for rank, service in enumerate(services, start=1)
+    ]
+    db.upsert_ranking_results(ranking_rows)
+
+    candidate_rows = [
+        {
+            "referral_id": referral_id,
+            "service_id": service["id"],
+            "rank": rank,
+            "score": None,
+            "eligibility_state": "unknown",
+            "candidate_status": "available",
+            "reasons": [
+                {
+                    "type": "note",
+                    "text": (
+                        "Unranked: scoring failed on this patient's profile. "
+                        "Showing all active services in this category."
+                    ),
+                }
+            ],
+        }
+        for rank, service in enumerate(services, start=1)
+    ]
+    db.upsert_referral_service_candidates(candidate_rows)
+    return candidate_rows
 
 
 def record_sw_feedback(

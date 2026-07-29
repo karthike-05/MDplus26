@@ -164,6 +164,21 @@ def _attempt_number_from(result: dict) -> int:
     return (attempt or {}).get("attempt_number", 1)
 
 
+def _close_action_and_advance(referral_id: str, status: str, call_id: Optional[str]) -> None:
+    """Best-effort: closes the open contact_service_by_phone/retell action (if any)
+    and hands control back to advance_referral, now that save_call_outcome has
+    recorded the attempt. Without this the referral freezes permanently on
+    advance_referral's open-action guard, even though the call already happened
+    (docs/whats-left.md A4) -- the attempts row alone isn't enough."""
+    try:
+        open_action = db.get_open_contact_service_action(referral_id)
+        if open_action is not None:
+            db.close_contact_service_action(open_action["id"], {"status": status, "call_id": call_id})
+        db.advance_referral(referral_id)
+    except Exception as e:
+        print(f"[log_outcome] closing contact_service_by_phone / advance_referral failed (non-fatal): {e}")
+
+
 async def _forward_to_orchestrator(body: "LogOutcomeRequest", call_id: Optional[str], result: dict) -> None:
     """Best-effort: tell the orchestrator's inbound adapter (backend/adapters/inbound.py
     POST /api/voice/call-outcome) about this outcome so its scheduler can advance the
@@ -216,6 +231,7 @@ async def log_outcome(request: Request):
         )
 
     result = db.save_call_outcome(body.model_dump(exclude_none=True), call_id)
+    _close_action_and_advance(body.case_id, body.status, call_id)
     await _forward_to_orchestrator(body, call_id, result)
     return {
         "success": True,

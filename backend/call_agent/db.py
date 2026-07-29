@@ -170,6 +170,51 @@ def save_call_outcome(payload: dict, call_id: str | None) -> dict:
     return {"attempt": attempt_result, "escalation": escalation_result, "booking": booking_result}
 
 
+# --- the shared action queue -------------------------------------------------
+# advance_referral() queues `contact_service_by_phone` to `retell` when it picks the
+# phone channel. Nothing polls for it (docs/whats-left.md A4) -- we dispatch calls via
+# direct HTTP instead -- so this action only ever closes here, right after we've
+# recorded the call's outcome above. Skipping this doesn't just stall the referral:
+# `advance_referral`'s FIRST guard is "any open action -> wait", so an unclosed row
+# freezes it permanently even though the call already happened.
+
+
+def get_open_contact_service_action(referral_id: str) -> dict | None:
+    """The `contact_service_by_phone` action addressed to us (`retell`). None if
+    nothing is open -- e.g. the call was triggered outside the queue entirely, or a
+    duplicate webhook fired for an action we already closed."""
+    rows = (
+        _supabase.table("referral_actions")
+        .select("id")
+        .eq("referral_id", referral_id)
+        .eq("action_type", "contact_service_by_phone")
+        .eq("assigned_component", "retell")
+        .in_("action_status", ["ready", "in_progress", "blocked"])
+        .execute()
+        .data
+    )
+    return rows[0] if rows else None
+
+
+def close_contact_service_action(action_id: str, result: dict) -> None:
+    _supabase.table("referral_actions").update(
+        {
+            "action_status": "completed",
+            "result": result,
+            "completed_at": "now()",
+            "updated_at": "now()",
+        }
+    ).eq("id", action_id).execute()
+
+
+def advance_referral(referral_id: str) -> dict:
+    """Hand control back to the DB's own scheduler once our attempt is recorded and
+    the action above is closed -- it, not us, decides the next step (retry, escalate
+    via try_next_resource, or move on)."""
+    res = _supabase.rpc("advance_referral", {"p_referral_id": referral_id}).execute()
+    return res.data if isinstance(res.data, dict) else {"result": res.data}
+
+
 def get_service_request_details(case_id: str) -> dict:
     return (
         _supabase.table("service_requests")
