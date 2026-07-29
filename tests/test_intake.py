@@ -91,3 +91,75 @@ def test_live_intake_guard_defaults_off_and_withholds_the_advance(monkeypatch):
     assert allow_live_intake() is True
     monkeypatch.setenv("ALLOW_LIVE_INTAKE", "0")
     assert allow_live_intake() is False
+
+
+def test_appointment_date_accepts_both_formats_and_rejects_garbage():
+    """`service_requests.requested_date` is a DATE column (same failure mode as patient
+    DOB, CLAUDE.md §7d-adjacent bug) — validate at the edge so a typo 422s instead of
+    surfacing Postgres's raw `invalid input syntax for type date` as a bare 500."""
+    from pydantic import ValidationError
+    from backend.main import NewReferral
+
+    iso = NewReferral(patient_id="pat_001", appointment_date="2026-08-05")
+    us = NewReferral(patient_id="pat_001", appointment_date="08/05/2026")
+    assert iso.appointment_date == us.appointment_date == "2026-08-05"
+
+    assert NewReferral(patient_id="pat_001").appointment_date is None  # optional
+
+    try:
+        NewReferral(patient_id="pat_001", appointment_date="not a date")
+    except ValidationError:
+        pass
+    else:
+        raise AssertionError("expected rejection of an unparseable appointment_date")
+
+
+def test_create_referral_writes_pickup_address_to_service_requests():
+    """B13: nothing created a `service_requests` row, so `transport_intake`'s
+    pickup_address/home_address fields (both sourced from service_request.* now — see
+    contracts/schemas/transport_intake_pdf.json) rendered blank on every UI-created
+    referral. `POST /api/referrals` must thread the collected address through rather
+    than dropping it (REFERRAL_COLS maps it to nothing on `referrals` itself)."""
+    from fastapi.testclient import TestClient
+
+    from backend.main import app, db
+
+    client = TestClient(app)
+    resp = client.post("/api/referrals", json={
+        "patient_id": "pat_001",
+        "category": "transportation",  # gates the service_requests write (§6a)
+        "pickup_address": "123 Main St, Austin, TX",
+        "appointment_date": "08/05/2026",
+    })
+    assert resp.status_code == 200
+    referral_id = resp.json()["referral_id"]
+
+    request = asyncio.run(db.get_service_request(referral_id))
+    assert request["pickup_address"] == "123 Main St, Austin, TX"
+    assert request["requested_date"] == "2026-08-05"
+
+
+def test_create_referral_with_no_trip_details_skips_the_service_request_write(monkeypatch):
+    """The common case for an existing patient found by name+DOB, where intake never
+    asked for an address — nothing should be written on their behalf. Asserted against
+    `save_service_request` directly (a spy), not `get_service_request`'s return value:
+    the mock derives a plausible-looking service_request from fixture patient data
+    (CLAUDE.md §9 — this exact derivation is what made B13 invisible offline), so an
+    empty-dict assertion there would pass for the wrong reason."""
+    from fastapi.testclient import TestClient
+
+    from backend.main import app, db
+
+    calls = []
+    real_save = db.save_service_request
+
+    async def spy(referral_id, fields):
+        calls.append((referral_id, fields))
+        return await real_save(referral_id, fields)
+
+    monkeypatch.setattr(db, "save_service_request", spy)
+
+    client = TestClient(app)
+    resp = client.post("/api/referrals", json={"patient_id": "pat_002"})
+    assert resp.status_code == 200
+    assert calls == []

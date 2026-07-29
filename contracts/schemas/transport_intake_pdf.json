@@ -50,7 +50,7 @@
     {
       "name": "home_address",
       "fill_policy": "review",
-      "source": "patient.address",
+      "source": "service_request.pickup_address",
       "required": true,
       "maxlength": 80,
       "page": 1,

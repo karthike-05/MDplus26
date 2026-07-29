@@ -242,11 +242,20 @@ One Railway service, Root Directory `.`. The `Procfile` is ready:
 web: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
 ```
 
-Build command must include the frontend, since the backend serves it:
+Build command is **just Python**:
 
 ```
-pip install -r requirements.txt && cd frontend && npm ci && npm run build
+pip install -r requirements.txt
 ```
+
+The frontend is *not* built on Railway. Railpack sees a Python project at the repo root
+and provisions Python only, so `npm` doesn't exist in the build image
+(`sh: 1: npm: not found` — hit on 2026-07-28; a root `package.json`, which Railway's docs
+give as the fix, didn't activate the Node provider). `frontend/dist/` is committed
+instead.
+
+> ⚠ **So a UI change needs `npm run build` + a commit of `frontend/dist/` to reach the
+> deploy.** Forget, and it silently serves the old bundle.
 
 Environment: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `ANTHROPIC_API_KEY`. Leave
 `VITE_API_BASE` **blank** — a production bundle uses same-origin relative URLs, which is

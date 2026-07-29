@@ -159,6 +159,23 @@ Remember to `npm run build` before testing the single-port setup again, or you'l
 looking at a stale bundle. (Symptom: your change isn't there and the JS filename in
 DevTools hasn't changed.)
 
+> ### ⚠ `frontend/dist/` is committed
+>
+> Railway's Railpack builder sees a Python project at the repo root and provisions Python
+> only — `npm` doesn't exist in the build image, so the frontend can't be built there
+> (`sh: 1: npm: not found`). A root `package.json` is the documented fix and didn't take,
+> so the bundle ships in git instead and the deploy is just `pip install` + `uvicorn`.
+>
+> **So a UI change isn't deployed until you rebuild *and* commit:**
+>
+> ```bash
+> npm run build && git add frontend/dist && git commit -m "rebuild frontend"
+> ```
+>
+> Forget, and the deploy silently serves the previous bundle — which looks exactly like
+> your change not working. Check the JS filename at `/` against your local `dist/` if
+> something seems stale.
+
 **Before you push:**
 
 ```bash

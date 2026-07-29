@@ -28,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
 from contracts.models import DashboardRow
+from backend import app_auth
 from backend.adapters.inbound import build_router as build_inbound_router
 from backend.db.interface import ReferralDB
 from backend.db.mock import MockReferralDB
@@ -163,6 +164,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# The shared-password gate (backend/app_auth.py). No-op unless APP_PASSWORD is set, so
+# local dev and the test suite are untouched. Registered AFTER CORSMiddleware so it runs
+# INSIDE it — `add_middleware` prepends, so the last one added is the outermost, and a
+# 401 must still carry CORS headers or the browser reports a CORS failure instead of an
+# auth prompt.
+app.middleware("http")(app_auth.middleware)
+
 db = DBSwitch(make_db())
 
 # Inbound seams to the Voice + Messaging services (docs/integration-plan.md). The
@@ -173,11 +181,12 @@ app.include_router(build_inbound_router(db, TOOLS))
 
 # --- Request models ----------------------------------------------------------
 
-def _normalize_dob(v: str) -> str:
-    """`patients.date_of_birth` is a DATE column, so anything Postgres can't parse comes
-    back as an opaque 500 (`invalid input syntax for type date: "j"` — hit live on
-    2026-07-28 by typing a letter into the intake form). Validate at the edge instead,
-    where FastAPI turns it into a 422 the UI can actually render.
+def _normalize_date(v: str, *, field: str = "date of birth") -> str:
+    """Any DATE column rejects what Postgres can't parse as an opaque 500
+    (`invalid input syntax for type date: "j"` — hit live on 2026-07-28 by typing a
+    letter into the DOB field). Validate at the edge instead, where FastAPI turns it
+    into a 422 the UI can actually render. Shared by `patients.date_of_birth` and
+    `service_requests.requested_date` — same column type, same failure mode.
 
     Accepts ISO `YYYY-MM-DD` and US `MM/DD/YYYY` — the fixtures use the latter
     (`tests/test_intake.py`) and a social worker is likelier to type it. Ambiguous
@@ -189,7 +198,7 @@ def _normalize_dob(v: str) -> str:
             return datetime.strptime(raw, fmt).date().isoformat()
         except ValueError:
             continue
-    raise ValueError(f"date of birth must be YYYY-MM-DD or MM/DD/YYYY, got {raw!r}")
+    raise ValueError(f"{field} must be YYYY-MM-DD or MM/DD/YYYY, got {raw!r}")
 
 
 def _normalize_phone(v: str) -> str:
@@ -252,7 +261,7 @@ class NewPatient(BaseModel):
     @field_validator("dob")
     @classmethod
     def _check_dob(cls, v: str) -> str:
-        return _normalize_dob(v)
+        return _normalize_date(v)
 
     @field_validator("phone")
     @classmethod
@@ -285,6 +294,11 @@ class NewReferral(BaseModel):
     emergency_contact: str | None = None
     special_instructions: str | None = None
     request_notes: str | None = None
+
+    @field_validator("appointment_date")
+    @classmethod
+    def _check_appointment_date(cls, v: str | None) -> str | None:
+        return _normalize_date(v, field="appointment date") if v else v
 
 
 class ReviewedValues(BaseModel):
@@ -899,6 +913,7 @@ async def create_referral(body: NewReferral) -> dict:
         sr_input["requested_date"] = fields.pop("appointment_date")
     if "appointment_time" in fields:
         sr_input["requested_start_time"] = fields.pop("appointment_time")
+
 
     # Backfill service_name / channel / form from the catalog when a service is given;
     # explicit values in the request win (the SW may override the channel, §4 answer).

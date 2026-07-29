@@ -80,14 +80,26 @@ the old code** — until they redeploy, live still only gets `ranking_results`.
 **`BACKEND_CLAIM_RANKING=1` is set and working.** Ranking redeployed, our `backend`
 worker claims `rank_resources` and proxies it. The mechanism below is all correct.
 
-What it revealed: **`POST /rank-referral/{id}` returns a bare 500** for patients with
-NULL `latitude`/`longitude` — i.e. every referral created through our intake UI, since
-intake wasn't populating them. Our half is fixed (see B5); the 500 is Ranking's to
-harden. Full diagnosis: [`changes-2026-07-28.md`](changes-2026-07-28.md#for-ranking-pranav).
+What it revealed: **`POST /rank-referral/{id}` returns a bare 500.** First guess was NULL
+`latitude`/`longitude` — **wrong**, reproduced live and root-caused instead: a sparse
+patient profile (`insurance_type`/`county` both NULL) lets the hard filter reject almost
+nothing, so 58 of 58 services survive to subjective scoring; that single structured tool
+call then truncates at `max_tokens=2048` and the missing `"scores"` key throws a bare
+`KeyError`. Not a coordinates bug — any patient sparse enough to under-filter can trigger
+it. Our half (geocoding) is done (see B5) but doesn't address this; the fix (cap
+candidates sent to subjective scoring, and never let a truncated tool call 500 the
+endpoint) is Ranking's. Full diagnosis:
+[`handoff-ranking-candidates.md`](handoff-ranking-candidates.md).
 
-⚠ And because a failed action **poisons its dedup key** (CLAUDE.md §7c), the two
-referrals that hit the 500 can't be re-queued without DELETEing the dead
-`rank:<referral_id>` rows.
+⚠ And because a failed action **poisons its dedup key** (CLAUDE.md §7c), any referral
+that hits the 500 can't be re-queued without DELETEing the dead `rank:<referral_id>` row.
+`BACKEND_CLAIM_RANKING` was paused, then flipped back to `1` on 2026-07-28 once geocoding
+shipped — it immediately re-poisoned `57bdcf5d` (Aneesh) for real, confirming the bug is
+still live on Ranking's deploy. **Update 2026-07-29: `af536831` (Karthik) is now
+confirmed poisoned too** — the first worker tick after that day's redeploy re-claimed his
+queued `rank_resources` action and it hit the same 500 (`action_status='failed'`,
+verified directly against `referral_actions`). Both are dead until Ranking ships a fix
+AND someone deletes the dead rows — don't bother re-triggering either in the meantime.
 
 <details><summary>Original mechanism notes (still accurate)</summary>
 **Owner: us.** Ranking deliberately has no poller — ranking stays on-demand behind
@@ -267,10 +279,14 @@ Ranking 500'd on every UI-created referral. Intake now **requires** an address a
 geocodes it into `postal_code`/`county`/`latitude`/`longitude`
 ([`backend/intake/geocode.py`](../backend/intake/geocode.py), CLAUDE.md §7e).
 
-**Still open for form-fill.** `food_assistance_pdf.json` sources `home_address` from
-`patient.address`, which has no column to read and will render **blank**. The address is
-now used but not stored, so the options are: add a column, source it from
-`service_requests`, or reverse-geocode. Still **a product decision**, narrower than before.
+**Resolved for form-fill too, 2026-07-29.** `food_assistance_pdf.json` (and
+`transport_intake_pdf.json`'s own `home_address` field) sourced `home_address` from
+`patient.address`, which has no column — always blank. Both now source from
+`service_request.pickup_address` instead, and intake (`POST /api/referrals`) writes the
+collected street address there via `save_service_request` (see B13 — same fix). No
+product decision needed: the address was never going to get a `patients` column (Ranking
+reads the geocoded four instead), and `service_requests` is exactly the shared row §6a
+already designed for trip-specific values.
 
 ### B6. Realtime dashboard
 The board refetches on action and on **↻ Refresh**; there's no live subscription. The
@@ -308,6 +324,34 @@ That control is a *manual trigger for a real seam*, not demo scaffolding: when M
 points `ORG_BACKEND_URL` at us, the parsed org email posts to the same endpoint and no
 code changes.
 
+### B13. Nothing creates a `service_requests` row 🟡 PARTLY RESOLVED 2026-07-29
+`transport_intake` sources four fields from `service_request.*` (`appointment_date`,
+`appointment_time`, `pickup_address`, `destination`); `home_address` (both forms, B5)
+now sources from `service_request.pickup_address` too. The live DB had **one**
+`service_requests` row, hand-seeded for Jordan Ellis — nothing in this codebase inserted
+one, because intake collected a patient and a service but never the trip details.
+
+**Two real bugs here, both fixed:**
+1. `POST /api/referrals` now writes a `service_requests` row up front with whatever
+   intake collected — the same street address already typed for geocoding
+   (`pickup_address`), plus `appointment_date`/`appointment_time` if given
+   (`requested_date`/`requested_start_time`). Only when there's something to write —
+   an existing patient found by name+DOB, with no address re-asked, still writes nothing.
+2. **`save_service_request` was a bare `UPDATE`** on both live adapters
+   (`supabase_api.py`, `supabase.py`) — so on a referral with no row yet, a reviewer's
+   first fill-in on the review screen silently matched 0 rows and vanished. The
+   documented "self-heals after one manual pass" behavior (§6a) was **false on live
+   data**. Both adapters now upsert: UPDATE if a row exists, else INSERT (defaulting
+   `request_status='draft'` and looking up `patient_id` when the caller doesn't supply
+   either — both NOT NULL with no default). Verified against the live schema in a
+   rolled-back transaction.
+
+**Still open:** `destination` (the service's own address) isn't collected or derivable
+anywhere yet — would need a join through `service_at_location` → `locations` →
+`addresses` (SERVICE_COLS maps `address` to `None` today). And intake still has no step
+asking for `appointment_time` specifically. Neither blocks the review screen — both
+remain reviewable/fillable-by-hand exactly as before, just still blank on the first pass.
+
 ### B10. Terminal status for "the patient used it"
 Currently recorded in the free-text `completion_outcome` because widening the
 `referrals.status` CHECK constraint would affect every service. A first-class terminal
@@ -338,7 +382,7 @@ Same items, grouped by owner. Roles per `CLAUDE.md` §4.
 | --- | --- | --- |
 | ~~A1~~ | ~~Write `referral_service_candidates`~~ | ✅ Shipped 2026-07-28 (`03e21fc`) |
 | ~~A1c~~ | ~~Merge the branch and redeploy Railway~~ | ✅ Redeployed 2026-07-28; endpoints confirmed live |
-| **A1e** | **`POST /rank-referral/{id}` 500s on a patient with NULL `latitude`/`longitude`** | 🔴 A 500 marks the action `failed`, which **poisons the `rank:` dedup key forever** (§7c) — the referral then looks healthy and does nothing. Degrade instead of throwing. [Diagnosis](changes-2026-07-28.md#for-ranking-pranav) |
+| **A1e** | **`POST /rank-referral/{id}` 500s when a sparse patient profile lets too many candidates survive the hard filter** | 🔴 Root-caused live: `run_subjective_scoring`'s tool call truncates at `max_tokens=2048` past ~50+ candidates, leaving `tool_use.input` empty and throwing `KeyError: 'scores'`. Not the coordinates. A 500 marks the action `failed`, which **poisons the `rank:` dedup key forever** (§7c). Fix: cap candidates sent to subjective scoring + degrade instead of throwing on a truncated/malformed response. [Diagnosis](handoff-ranking-candidates.md) |
 | A1f | SW ranking-review UI: show the agent's reasoning, approve/reject | In progress. `subjective_rationale`, `objective_breakdown` and `filter_reject_reason` already exist on `ranking_results` and nothing renders them. **Extend `ChooseService.jsx` rather than replacing the endpoint** — [the four things it must keep doing](changes-2026-07-28.md#if-youre-building-the-sw-ranking-review-ui) |
 | A1g | Delete the `demo_driver --bridge-candidates` shim rows | They carry `"_source": "demo_driver shim"` in `reasons`; your service should own those writes now |
 | A1d | Note that `003_sw_selection_gate.sql` is applied — your "zero open actions" check now expects one | Your code needs no edit; the expectation changed and our stale doc caused it. |
