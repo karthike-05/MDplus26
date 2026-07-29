@@ -554,6 +554,7 @@ supabase db push                            # apply contracts/db_schema.sql (whe
 | `ALLOW_LIVE_INTAKE` | `0` | You're demoing intake. On, "+ New referral" sends a **real WhatsApp** to whatever number was typed, on the team's Twilio. The app has no auth — **leave off on any permanent URL** |
 | `GEOCODING_ENABLED` | `1` | Off only for offline work; `conftest` forces it off so the suite stays hermetic |
 | `WORKER_ENABLED` | `1` | `0` disables the background poller entirely |
+| `APP_PASSWORD` | *unset* | Any public deploy. HTTP Basic, any username, one shared secret. Unset = no gate, which is what keeps a fresh clone working unconfigured. Webhook seams + `/health` stay open — see [`backend/app_auth.py`](backend/app_auth.py) |
 
 > Names match the sibling services deliberately, so one value pastes across all four
 > deploys: it's `SUPABASE_SERVICE_ROLE_KEY` (not `..._SERVICE_KEY`) and `DATABASE_URL`

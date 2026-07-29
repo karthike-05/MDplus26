@@ -28,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
 from contracts.models import DashboardRow
+from backend import app_auth
 from backend.adapters.inbound import build_router as build_inbound_router
 from backend.db.interface import ReferralDB
 from backend.db.mock import MockReferralDB
@@ -162,6 +163,13 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+# The shared-password gate (backend/app_auth.py). No-op unless APP_PASSWORD is set, so
+# local dev and the test suite are untouched. Registered AFTER CORSMiddleware so it runs
+# INSIDE it — `add_middleware` prepends, so the last one added is the outermost, and a
+# 401 must still carry CORS headers or the browser reports a CORS failure instead of an
+# auth prompt.
+app.middleware("http")(app_auth.middleware)
 
 db = DBSwitch(make_db())
 
