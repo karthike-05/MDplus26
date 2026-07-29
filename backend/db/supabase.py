@@ -474,12 +474,37 @@ class SupabaseReferralDB(ReferralDB):
         return dict(row) if row else {}
 
     async def save_service_request(self, referral_id: str, fields: dict) -> None:
+        """Update the newest row for this referral, or INSERT one if none exists yet.
+
+        See the twin in `supabase_api.py` for why: a bare UPDATE silently no-ops when
+        intake never created a row (B13), which meant a reviewer's write-back on the
+        first fill never actually persisted on live data.
+        """
         if not fields:
             return
-        assignments = ", ".join(f"{col} = ${i + 2}" for i, col in enumerate(fields))
         pool = await self._p()
+        exists = await pool.fetchval(
+            f"SELECT 1 FROM {TABLES['service_requests']} WHERE referral_id = $1 LIMIT 1",
+            referral_id,
+        )
+        if exists:
+            assignments = ", ".join(f"{col} = ${i + 2}" for i, col in enumerate(fields))
+            await pool.execute(
+                f"UPDATE {TABLES['service_requests']} SET {assignments}, updated_at = now() "
+                f"WHERE referral_id = $1",
+                referral_id, *fields.values(),
+            )
+            return
+        row = {"request_status": "draft", **fields}
+        if "patient_id" not in row:
+            row["patient_id"] = await pool.fetchval(
+                f"SELECT {REFERRAL_COLS['patient_id']} FROM {TABLES['referrals']} "
+                f"WHERE {REFERRAL_COLS['id']} = $1", referral_id,
+            )
+        columns = ["referral_id", *row.keys()]
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(columns)))
         await pool.execute(
-            f"UPDATE {TABLES['service_requests']} SET {assignments}, updated_at = now() "
-            f"WHERE referral_id = $1",
-            referral_id, *fields.values(),
+            f"INSERT INTO {TABLES['service_requests']} ({', '.join(columns)}) "
+            f"VALUES ({placeholders})",
+            referral_id, *row.values(),
         )

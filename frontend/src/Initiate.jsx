@@ -30,6 +30,9 @@ export default function Initiate({ preselectedServiceId, onDone, onCancel }) {
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  // Kept after `draft` clears so `create()` can still send it — it's what populates the
+  // shared `service_requests` row's pickup_address (CLAUDE.md §6a; whats-left B13).
+  const [pickupAddress, setPickupAddress] = useState("");
   // Tri-state on purpose: undefined = never attempted, null = attempted and missed,
   // object = resolved. A plain null start made the "couldn't resolve that address"
   // warning fire for every EXISTING patient found via Find patient, where no geocode was
@@ -71,12 +74,17 @@ export default function Initiate({ preselectedServiceId, onDone, onCancel }) {
       // say so HERE: unresolved, the referral reaches Ranking and dies with a 500 that
       // looks like their bug. See backend/intake/geocode.py.
       setLocated(d.geocoded ? d.location : null);
+      setPickupAddress(draft.address);
       setDraft(null);
     });
 
   const create = () =>
     call(async () => {
-      const d = await api.createReferral({ patient_id: patient.id, ...clean(ref) });
+      const d = await api.createReferral({
+        patient_id: patient.id,
+        ...clean(ref),
+        ...(pickupAddress ? { pickup_address: pickupAddress } : {}),
+      });
       onDone?.(d.referral_id);
     });
 

@@ -42,6 +42,50 @@ immediately behind it.
 
 ---
 
+> ## ✅ Update 2026-07-28 (later) — the `/rank-referral` 500 is not the coordinates
+>
+> `changes-2026-07-28.md` guessed "distance scoring doing arithmetic on a `None`
+> coordinate" — that guess was **wrong**, and we've now reproduced the real cause
+> directly against the live DB and the live Claude API (referral `57bdcf5d…`), so this
+> isn't speculation anymore.
+>
+> **`_distance_score` already degrades correctly on `None` lat/long** — returns
+> `NEUTRAL_SCORE`, no crash. The actual break is in `run_subjective_scoring`:
+>
+> - This patient has `insurance_type` and `county` both `NULL`, so the hard filter
+>   (`_hard_filter_reject_reason`) has nothing to reject on. **58 of 58** active
+>   transportation services survive to subjective scoring — Jordan's referral, by
+>   contrast, has real insurance/county data and gets filtered down to 4.
+> - The subjective-scoring prompt asks Claude for a score + one-line rationale for
+>   **every surviving candidate in one structured tool call**, capped at
+>   `max_tokens=2048`. With 58 candidates the response hits `stop_reason: "max_tokens"`
+>   mid-JSON, so `tool_use.input` comes back `{}`.
+> - `return {row["service_id"]: row for row in tool_use.input["scores"]}` then throws a
+>   bare `KeyError: 'scores'` — which FastAPI surfaces as the undetailed 500 we saw live.
+>
+> **Reproduced directly:** calling `_anthropic.messages.create(...)` with this exact
+> prompt (44,671 chars, 58 candidates) returns `usage.output_tokens=2048`,
+> `stop_reason='max_tokens'`, `tool_use.input == {}`.
+>
+> So the trigger is **sparse patient data → weak hard filter → too many survivors →
+> truncated tool call**, not any single null field — it'll recur for **any** patient
+> missing `insurance_type`/`county`, not just these two. Two fixes, not mutually
+> exclusive:
+>
+> 1. **Cap the candidate set sent to subjective scoring** (e.g. top 15–20 by
+>    `objective_score`) — bounds prompt/output size regardless of how sparse the patient
+>    profile is. Probably the right fix either way: a SW doesn't want 58 subjective
+>    rationales.
+> 2. **Never let a truncated/malformed tool call 500 the endpoint.** If `"scores"` is
+>    missing or incomplete, degrade — skip subjective scoring for the candidates that
+>    didn't get a row rather than raising. `run_hard_filter` + `compute_objective_score`
+>    already produce a usable ranking without it.
+>
+> We're not patching this ourselves — `ranking.py` is your service, your deploy. Wanted
+> you to have the precise repro rather than the "probably coordinates" guess.
+
+---
+
 ## TL;DR
 
 1. **Write `referral_service_candidates`.** It is the *only* table the orchestrator reads

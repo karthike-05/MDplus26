@@ -253,11 +253,33 @@ class SupabaseAPIReferralDB(ReferralDB):
         return dict(res.data[0]) if res.data else {}
 
     async def save_service_request(self, referral_id: str, fields: dict) -> None:
+        """Update the newest row for this referral, or INSERT one if none exists yet.
+
+        Used two ways: intake creates the row up front with whatever it collected
+        (pickup_address, requested_date/time), and `fill_form.submit()` writes reviewed
+        values back afterwards. Before this was a bare UPDATE, so a referral with no row
+        yet (B13 — nothing created one) silently dropped every write-back: 0 rows
+        matched, no error, and the "first fill is manual, every later one autofills"
+        promise (CLAUDE.md §6a) was false on live data. `request_status`/`patient_id`
+        are NOT NULL with no default, so the insert branch fills them defensively even
+        when the caller (fill_form) doesn't pass them.
+        """
         if not fields:
             return
         c = await self._c()
-        await c.table(TABLES["service_requests"]).update(fields).eq(
-            "referral_id", referral_id).execute()
+        existing = await c.table(TABLES["service_requests"]).select("id").eq(
+            "referral_id", referral_id).limit(1).execute()
+        if existing.data:
+            await c.table(TABLES["service_requests"]).update(fields).eq(
+                "referral_id", referral_id).execute()
+            return
+        row = {"referral_id": referral_id, "request_status": "draft", **fields}
+        if "patient_id" not in row:
+            referral = await c.table(TABLES["referrals"]).select(
+                REFERRAL_COLS["patient_id"]).eq(REFERRAL_COLS["id"], referral_id).limit(1).execute()
+            if referral.data:
+                row["patient_id"] = referral.data[0][REFERRAL_COLS["patient_id"]]
+        await c.table(TABLES["service_requests"]).insert(row).execute()
 
     async def set_referral_service(self, referral_id: str, service_id: str, **fields) -> None:
         c = await self._c()

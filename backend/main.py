@@ -181,11 +181,12 @@ app.include_router(build_inbound_router(db, TOOLS))
 
 # --- Request models ----------------------------------------------------------
 
-def _normalize_dob(v: str) -> str:
-    """`patients.date_of_birth` is a DATE column, so anything Postgres can't parse comes
-    back as an opaque 500 (`invalid input syntax for type date: "j"` — hit live on
-    2026-07-28 by typing a letter into the intake form). Validate at the edge instead,
-    where FastAPI turns it into a 422 the UI can actually render.
+def _normalize_date(v: str, *, field: str = "date of birth") -> str:
+    """Any DATE column rejects what Postgres can't parse as an opaque 500
+    (`invalid input syntax for type date: "j"` — hit live on 2026-07-28 by typing a
+    letter into the DOB field). Validate at the edge instead, where FastAPI turns it
+    into a 422 the UI can actually render. Shared by `patients.date_of_birth` and
+    `service_requests.requested_date` — same column type, same failure mode.
 
     Accepts ISO `YYYY-MM-DD` and US `MM/DD/YYYY` — the fixtures use the latter
     (`tests/test_intake.py`) and a social worker is likelier to type it. Ambiguous
@@ -197,7 +198,7 @@ def _normalize_dob(v: str) -> str:
             return datetime.strptime(raw, fmt).date().isoformat()
         except ValueError:
             continue
-    raise ValueError(f"date of birth must be YYYY-MM-DD or MM/DD/YYYY, got {raw!r}")
+    raise ValueError(f"{field} must be YYYY-MM-DD or MM/DD/YYYY, got {raw!r}")
 
 
 def _normalize_phone(v: str) -> str:
@@ -249,7 +250,7 @@ class NewPatient(BaseModel):
     @field_validator("dob")
     @classmethod
     def _check_dob(cls, v: str) -> str:
-        return _normalize_dob(v)
+        return _normalize_date(v)
 
     @field_validator("phone")
     @classmethod
@@ -266,6 +267,18 @@ class NewReferral(BaseModel):
     referring_clinic: str | None = None
     appointment_date: str | None = None
     appointment_time: str | None = None
+    # Trip details for the shared `service_requests` row (CLAUDE.md §6a) — NOT columns
+    # on `referrals` (see REFERRAL_COLS). Without this nothing ever created that row
+    # (B13), so `transport_intake`'s pickup_address/appointment fields rendered blank
+    # on every UI-created referral. `pickup_address` is the same street address intake
+    # already collects and geocodes; `service_requests.requested_date` is a DATE
+    # column, so it gets the same edge validation as patient DOB.
+    pickup_address: str | None = None
+
+    @field_validator("appointment_date")
+    @classmethod
+    def _check_appointment_date(cls, v: str | None) -> str | None:
+        return _normalize_date(v, field="appointment date") if v else v
 
 
 class ReviewedValues(BaseModel):
@@ -850,6 +863,12 @@ async def create_patient(body: NewPatient) -> dict:
 async def create_referral(body: NewReferral) -> dict:
     fields = body.model_dump(exclude_none=True)
     patient_id = fields.pop("patient_id")
+    # Trip details belong on `service_requests`, not `referrals` (no such columns —
+    # REFERRAL_COLS maps appointment_date/appointment_time to None). Pulled out here so
+    # they're written explicitly below instead of being silently dropped on live.
+    pickup_address = fields.pop("pickup_address", None)
+    appointment_date = fields.pop("appointment_date", None)
+    appointment_time = fields.pop("appointment_time", None)
     # Backfill service_name / channel / form from the catalog when a service is given;
     # explicit values in the request win (the SW may override the channel, §4 answer).
     if body.service_id:
@@ -861,6 +880,23 @@ async def create_referral(body: NewReferral) -> dict:
             fields.setdefault(key, value)
     form_id = fields.pop("form_id", None)
     referral_id = await db.create_referral(patient_id, form_id, **fields)
+
+    # Create the shared `service_requests` row up front with whatever trip details
+    # intake collected (B13 — nothing did this before, so `transport_intake`'s
+    # pickup_address/appointment_date/appointment_time rendered blank on every
+    # UI-created referral). Only when there's something to write: `save_service_request`
+    # now upserts, so a reviewer's first fill-in still persists even when this is empty.
+    service_request_fields = {
+        k: v for k, v in {
+            "pickup_address": pickup_address,
+            "requested_date": appointment_date,
+            "requested_start_time": appointment_time,
+            "patient_id": patient_id,
+            "service_id": body.service_id,
+        }.items() if v is not None
+    }
+    if pickup_address or appointment_date or appointment_time:
+        await db.save_service_request(referral_id, service_request_fields)
 
     # Live, a referral that nobody advances is inert: `advance_referral()` is a function,
     # not a daemon, so a brand-new row sits at `status='not_started'` and the consent

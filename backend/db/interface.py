@@ -47,6 +47,13 @@ class ReferralDB(Protocol):
     # this is where form-fill sources its request-specific values from and writes the
     # reviewed values back to — rather than duplicating them onto the referral.
     # Returns {} when there is no row yet. CONTRACT TOUCH — announced.
+    #
+    # save_service_request UPSERTS: update the newest row for this referral if one
+    # exists, else INSERT it (defaulting request_status='draft' and looking up
+    # patient_id when the caller didn't supply either — both NOT NULL with no default).
+    # A bare UPDATE silently no-ops on a referral with no row yet, which is exactly the
+    # B13 gap this closes: intake now creates the row up front, and a reviewer's first
+    # write-back on a referral that still has no row persists instead of vanishing.
     async def get_service_request(self, referral_id: str) -> dict: ...
     async def save_service_request(self, referral_id: str, fields: dict) -> None: ...
 
