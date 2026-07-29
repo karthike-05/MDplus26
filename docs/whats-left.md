@@ -95,8 +95,11 @@ endpoint) is Ranking's. Full diagnosis:
 that hits the 500 can't be re-queued without DELETEing the dead `rank:<referral_id>` row.
 `BACKEND_CLAIM_RANKING` was paused, then flipped back to `1` on 2026-07-28 once geocoding
 shipped — it immediately re-poisoned `57bdcf5d` (Aneesh) for real, confirming the bug is
-still live on Ranking's deploy. `af536831` (Karthik) is the other sparse legacy patient
-and is likely to hit it the next time it's claimed.
+still live on Ranking's deploy. **Update 2026-07-29: `af536831` (Karthik) is now
+confirmed poisoned too** — the first worker tick after that day's redeploy re-claimed his
+queued `rank_resources` action and it hit the same 500 (`action_status='failed'`,
+verified directly against `referral_actions`). Both are dead until Ranking ships a fix
+AND someone deletes the dead rows — don't bother re-triggering either in the meantime.
 
 <details><summary>Original mechanism notes (still accurate)</summary>
 **Owner: us.** Ranking deliberately has no poller — ranking stays on-demand behind
