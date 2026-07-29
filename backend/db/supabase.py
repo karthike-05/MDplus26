@@ -86,6 +86,17 @@ PATIENT_COLS = {
     "medicaid_id": "insurance_member_id",
     "mobility_needs": "mobility_needs",
     "household_size": "household_size",
+    # The rest of `patients`' writable, non-derived columns (§ intake form additions) —
+    # same key name on both sides, so 1:1.
+    "need_description": "need_description",
+    "education_level": "education_level",
+    "employment_status": "employment_status",
+    "marital_status": "marital_status",
+    "income_status": "income_status",
+    "preferred_language": "preferred_language",
+    "insurance_type": "insurance_type",
+    "is_veteran": "is_veteran",
+    "preferred_contact_method": "preferred_contact_method",
     # NOT NULL, no default -> an INSERT must supply these two (plus `name`).
     "referring_clinic": "referring_clinic_name",
     # The consent gate `advance_referral()` reads before dispatching any outreach;
@@ -380,6 +391,20 @@ class SupabaseReferralDB(ReferralDB):
         out = await pool.fetchval("SELECT advance_referral($1)", referral_id)
         return json.loads(out) if isinstance(out, str) else (out or {})
 
+    async def queue_action(self, referral_id: str, service_id: str | None,
+                           action_type: str, component: str, key: str, reason: str,
+                           payload: dict | None = None) -> str:
+        """Direct RPC to the same `queue_referral_action()` SQL primitive
+        `advance_referral()` calls internally — its ON CONFLICT(referral_id,
+        deduplication_key) dedup and agent_decisions audit row apply here too."""
+        pool = await self._p()
+        action_id = await pool.fetchval(
+            "SELECT queue_referral_action($1, $2, $3, $4, $5, $6, $7::jsonb)",
+            referral_id, service_id, action_type, component, key, reason,
+            json.dumps(payload or {}),
+        )
+        return str(action_id)
+
     async def next_attempt_number(self, referral_id: str, service_id: str | None) -> int:
         """`attempts.attempt_number` is NOT NULL with no default and carries a UNIQUE
         (referral_id, service_id, attempt_number). `IS NOT DISTINCT FROM` so a NULL
@@ -483,3 +508,15 @@ class SupabaseReferralDB(ReferralDB):
             f"WHERE referral_id = $1",
             referral_id, *fields.values(),
         )
+
+    async def create_service_request(self, referral_id: str, patient_id: str, fields: dict) -> str:
+        base = {"referral_id": referral_id, "patient_id": patient_id, **fields}
+        cols = list(base)
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))
+        pool = await self._p()
+        rid = await pool.fetchval(
+            f"INSERT INTO {TABLES['service_requests']} ({', '.join(cols)}) VALUES ({placeholders}) "
+            f"RETURNING id",
+            *base.values(),
+        )
+        return str(rid)

@@ -157,6 +157,13 @@ class OrgResponse(BaseModel):
 # so an inbound event is logged under the SENDING service's provider name, not ours.
 PROVIDER_FOR_SEAM = {"voice": "retell", "patient_comms": "twilio"}
 
+# Queued directly onto the live bus (via ReferralDB.queue_action) once Voice confirms an
+# actual booking — not by advance_referral() itself, which never emits this action type.
+# `backend/patient_comms`'s poller (repo.py NOTIFY_ACTION) already listens for exactly
+# this (action_type, component) pair; this is the first thing that ever queues it.
+NOTIFY_PATIENT_ACTION_TYPE = "notify_patient"
+NOTIFY_PATIENT_COMPONENT = "twilio"
+
 
 async def _log_event(db: ReferralDB, *, provider: str, event_type: str, payload: dict,
                      referral_id: str, external_id: str | None,
@@ -256,11 +263,64 @@ def build_router(db: ReferralDB, tools: Tools) -> APIRouter:
 
     @router.post("/api/voice/call-outcome")
     async def voice_call_outcome(body: VoiceCallOutcome) -> dict:
-        return await _handle(
-            body, provider=PROVIDER_FOR_SEAM["voice"], event_type=body.status,
-            mapped=VOICE_STATUS_MAP.get(body.status), known=sorted(VOICE_STATUS_MAP),
-            channel_for="phone", data_key="voice_status",
-        )
+        """Record Retell's call result and hand control back to whichever scheduler
+        owns transitions (§7a).
+
+        Unlike the org/patient-comms seams, `call_agent` already writes the shared
+        `attempts` row itself — its own Supabase client, `db.py`'s `save_call_outcome`
+        — *before* this forward ever arrives. So live, this seam doesn't write attempts
+        again; it re-runs `advance_referral()` so the DB actually sees that row, and —
+        only when the call really confirmed a booking — queues the patient's
+        booking-confirmed WhatsApp (`notify_patient`/`twilio`), which nothing else in
+        the live pipeline queues today (`advance_referral()` only ever emits
+        `confirm_consent` and `confirm_service_utilization` to that component;
+        `backend/patient_comms`'s poller already listens for `notify_patient` — it's
+        just never been queued from anywhere).
+        """
+        mapped = VOICE_STATUS_MAP.get(body.status)
+        payload = body.model_dump()
+        provider = PROVIDER_FOR_SEAM["voice"]
+
+        if mapped is None:
+            await _log_event(db, provider=provider, event_type=body.status,
+                             payload=payload, referral_id=body.referral_id,
+                             external_id=body.call_id, status="failed",
+                             error=f"unknown voice status; expected one of {sorted(VOICE_STATUS_MAP)}")
+            raise HTTPException(
+                422, f"unknown voice status '{body.status}'; expected one of "
+                     f"{sorted(VOICE_STATUS_MAP)}")
+
+        try:
+            referral = await db.get_referral(body.referral_id)
+        except KeyError:
+            await _log_event(db, provider=provider, event_type=body.status,
+                             payload=payload, referral_id=None, external_id=body.call_id,
+                             status="failed", error=f"unknown referral '{body.referral_id}'")
+            raise HTTPException(404, f"unknown referral '{body.referral_id}'")
+
+        if getattr(db, "kind", type(db).__name__) != "MockReferralDB":
+            advanced = await db.advance_referral(body.referral_id)
+            notify_action_id = None
+            if mapped == "success":   # Retell's "confirmed" -- a real booking now exists
+                notify_action_id = await db.queue_action(
+                    body.referral_id, referral.get("service_id"),
+                    NOTIFY_PATIENT_ACTION_TYPE, NOTIFY_PATIENT_COMPONENT,
+                    f"notify:{body.referral_id}:{body.call_id or 'nocall'}",
+                    "Voice confirmed a booking; notify the patient",
+                )
+            result = {"advanced": advanced, "notify_action_id": notify_action_id}
+        else:
+            data = body.model_dump(exclude_none=True, exclude={"referral_id", "attempt_no"})
+            data["voice_status"] = body.status
+            result = await _apply_and_cascade(
+                body.referral_id, status=mapped, channel="phone",
+                attempt_no=body.attempt_no, data=data,
+            )
+
+        await _log_event(db, provider=provider, event_type=body.status,
+                         payload=payload, referral_id=body.referral_id,
+                         external_id=body.call_id)
+        return result
 
     @router.post("/api/patient-comms/event")
     async def patient_comms_event(body: PatientCommsEvent) -> dict:

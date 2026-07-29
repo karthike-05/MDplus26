@@ -118,6 +118,12 @@ class MockReferralDB:
         row.update({k: v for k, v in fields.items() if v is not None})
         self._service_requests[referral_id] = row
 
+    async def create_service_request(self, referral_id: str, patient_id: str, fields: dict) -> str:
+        self._service_requests[referral_id] = {
+            "referral_id": referral_id, "patient_id": patient_id, **fields,
+        }
+        return referral_id
+
     # --- The shared action queue, mirrored ----------------------------------
     # A Python mirror of the live DB's orchestration bus (`referral_actions`,
     # `attempts`, and the `advance_referral()` plpgsql function) so the SAME worker in

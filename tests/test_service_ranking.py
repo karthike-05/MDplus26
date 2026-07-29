@@ -12,6 +12,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+from fastapi import HTTPException
 
 from backend.db.mock import MockReferralDB
 from backend.main import (
@@ -79,14 +80,17 @@ def test_rank_referral_unknown_referral_is_404(monkeypatch):
 
 
 def test_rank_referral_requires_base_url():
+    """A bare KeyError -> opaque 500 gives the ChooseService screen's "Run service
+    ranking" button nothing to show the SW, so this must surface as a clean 503."""
     db = MockReferralDB()
     rid = asyncio.run(db.create_referral("pat_001", None, service_id="svc_capmetro"))
     try:
         asyncio.run(_rank_referral(rid, db))
-    except KeyError:
-        pass
+    except HTTPException as e:
+        assert e.status_code == 503
+        assert "SERVICE_RANKING_BASE_URL" in e.detail
     else:
-        raise AssertionError("expected KeyError when SERVICE_RANKING_BASE_URL is unset")
+        raise AssertionError("expected an HTTPException when SERVICE_RANKING_BASE_URL is unset")
 
 
 def test_get_ranking_proxies_and_returns_results(monkeypatch):

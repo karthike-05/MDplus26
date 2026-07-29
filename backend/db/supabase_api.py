@@ -259,6 +259,12 @@ class SupabaseAPIReferralDB(ReferralDB):
         await c.table(TABLES["service_requests"]).update(fields).eq(
             "referral_id", referral_id).execute()
 
+    async def create_service_request(self, referral_id: str, patient_id: str, fields: dict) -> str:
+        c = await self._c()
+        base = {"referral_id": referral_id, "patient_id": patient_id, **fields}
+        res = await c.table(TABLES["service_requests"]).insert(base).execute()
+        return str(res.data[0]["id"])
+
     async def set_referral_service(self, referral_id: str, service_id: str, **fields) -> None:
         c = await self._c()
         await c.table(TABLES["referrals"]).update({
@@ -360,6 +366,18 @@ class SupabaseAPIReferralDB(ReferralDB):
         c = await self._c()
         res = await c.rpc("advance_referral", {"p_referral_id": referral_id}).execute()
         return res.data if isinstance(res.data, dict) else {"result": res.data}
+
+    async def queue_action(self, referral_id: str, service_id: str | None,
+                           action_type: str, component: str, key: str, reason: str,
+                           payload: dict | None = None) -> str:
+        """Same RPC as SupabaseReferralDB, over PostgREST — see interface.py."""
+        c = await self._c()
+        res = await c.rpc("queue_referral_action", {
+            "p_referral_id": referral_id, "p_service_id": service_id,
+            "p_action_type": action_type, "p_component": component,
+            "p_key": key, "p_reason": reason, "p_payload": payload or {},
+        }).execute()
+        return str(res.data)
 
     def list_forms(self) -> list[dict]:
         """UI sugar (not on the Protocol; from the JSON schemas, like the mock)."""

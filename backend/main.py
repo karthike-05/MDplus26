@@ -231,6 +231,17 @@ class NewPatient(BaseModel):
     medicaid_id: str | None = None
     mobility_needs: str | None = None
     household_size: str | None = None
+    # The rest of `patients`' writable, non-derived columns (verified via the live
+    # schema) — added so intake can populate them instead of leaving them NULL forever.
+    need_description: str | None = None
+    education_level: str | None = None
+    employment_status: str | None = None
+    marital_status: str | None = None
+    income_status: str | None = None
+    preferred_language: str | None = None
+    insurance_type: str | None = None
+    is_veteran: bool | None = None
+    preferred_contact_method: str | None = None
     # Normally derived from `address`; accepted explicitly so a caller can supply them
     # when the geocoder can't resolve an address (rural, PO box, brand-new street).
     postal_code: str | None = None
@@ -258,6 +269,22 @@ class NewReferral(BaseModel):
     referring_clinic: str | None = None
     appointment_date: str | None = None
     appointment_time: str | None = None
+    # `category` picks which trip-detail block the intake UI shows ("transportation" is
+    # the only one wired up so far). When it's "transportation", everything below is
+    # peeled off into its own `service_requests` row (§6a) rather than onto `referrals` —
+    # see SERVICE_REQUEST_FIELDS in create_referral().
+    category: str | None = None
+    pickup_address: str | None = None
+    destination_address: str | None = None
+    pickup_notes: str | None = None
+    destination_notes: str | None = None
+    requested_end_time: str | None = None
+    companion_required: bool | None = None
+    interpreter_required: bool | None = None
+    contact_email: str | None = None
+    emergency_contact: str | None = None
+    special_instructions: str | None = None
+    request_notes: str | None = None
 
 
 class ReviewedValues(BaseModel):
@@ -838,10 +865,41 @@ async def create_patient(body: NewPatient) -> dict:
                          ("postal_code", "county", "latitude", "longitude")}}
 
 
+# `service_requests` columns the intake form supplies with the same name it uses
+# itself — everything else on NewReferral either belongs to `referrals` or needs a
+# name translation (appointment_date/time below).
+_SERVICE_REQUEST_DIRECT_FIELDS = (
+    "pickup_address", "destination_address", "pickup_notes", "destination_notes",
+    "requested_end_time", "companion_required", "interpreter_required",
+    "contact_email", "emergency_contact", "special_instructions", "request_notes",
+)
+
+
 @app.post("/api/referrals")
 async def create_referral(body: NewReferral) -> dict:
     fields = body.model_dump(exclude_none=True)
     patient_id = fields.pop("patient_id")
+    try:
+        patient = await db.get_patient(patient_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown patient '{patient_id}'")
+    category = fields.pop("category", None)
+    # `referrals.need_category` is NOT NULL live, and service_ranking's very first
+    # read (get_active_services_by_category) filters candidates by it. The intake
+    # UI no longer collects a service up front (§ ChooseService hand-off), so the
+    # Category picker (CATEGORY_OPTIONS in Initiate.jsx) is now this column's only
+    # source — set here, ahead of the service_id backfill below so an explicit
+    # service_id (if one is ever passed some other way) can't silently override it.
+    if category:
+        fields["need_category"] = _slugify_category(category)
+    # `service_requests` is a separate table (§6a) — split its fields off before
+    # `referrals` is created, so neither adapter has to guess which keys belong where.
+    sr_input = {k: fields.pop(k) for k in _SERVICE_REQUEST_DIRECT_FIELDS if k in fields}
+    if "appointment_date" in fields:
+        sr_input["requested_date"] = fields.pop("appointment_date")
+    if "appointment_time" in fields:
+        sr_input["requested_start_time"] = fields.pop("appointment_time")
+
     # Backfill service_name / channel / form from the catalog when a service is given;
     # explicit values in the request win (the SW may override the channel, §4 answer).
     if body.service_id:
@@ -853,6 +911,22 @@ async def create_referral(body: NewReferral) -> dict:
             fields.setdefault(key, value)
     form_id = fields.pop("form_id", None)
     referral_id = await db.create_referral(patient_id, form_id, **fields)
+
+    # `service_requests` is what fill_form/Voice actually read (§6a), and nothing else
+    # creates this row — a transportation referral born here needs one or the phone/
+    # form tools have nothing to fill in later (verified via supabase MCP: no DB trigger
+    # creates it either). Values not asked on the intake form come from the patient
+    # record instead of duplicating a second box for them (mobility/insurance/phone).
+    if category == "transportation":
+        sr_fields = {
+            **sr_input,
+            "mobility_requirements": patient.get("mobility_needs"),
+            "contact_phone": patient.get("phone"),
+            "insurance_provider": patient.get("insurance_type"),
+            "insurance_member_id": patient.get("medicaid_id"),
+        }
+        sr_fields = {k: v for k, v in sr_fields.items() if v is not None}
+        await db.create_service_request(referral_id, patient_id, sr_fields)
 
     # Live, a referral that nobody advances is inert: `advance_referral()` is a function,
     # not a daemon, so a brand-new row sits at `status='not_started'` and the consent
@@ -909,10 +983,20 @@ async def _rank_referral(referral_id: str, db: ReferralDB) -> dict:
         await db.get_referral(referral_id)
     except KeyError:
         raise HTTPException(404, f"unknown referral '{referral_id}'")
-    base_url = os.environ["SERVICE_RANKING_BASE_URL"]  # required; no silent fallback
+    # Required; no silent fallback (Layer 3 is a live Claude call, unlike _get_ranking's
+    # read path, which can fall back to referral_service_candidates). Surfaced as a
+    # clean 503 instead of a bare KeyError -> opaque 500, since the ChooseService
+    # screen's "Run service ranking" button needs something to actually show the SW.
+    base_url = os.environ.get("SERVICE_RANKING_BASE_URL")
+    if not base_url:
+        raise HTTPException(503, "SERVICE_RANKING_BASE_URL is not configured — the "
+                                  "ranking service isn't reachable from this environment.")
     async with httpx.AsyncClient(timeout=30.0) as client:  # Layer 3 is a live Claude call
-        response = await client.post(f"{base_url}/rank-referral/{referral_id}")
-        response.raise_for_status()
+        try:
+            response = await client.post(f"{base_url}/rank-referral/{referral_id}")
+            response.raise_for_status()
+        except httpx.HTTPError as e:
+            raise HTTPException(502, f"ranking service call failed: {e}")
         return response.json()
 
 

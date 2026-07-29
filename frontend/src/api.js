@@ -36,7 +36,9 @@ export const api = {
   createPatient: (p) => post("/api/patients", p),
   createReferral: (r) => post("/api/referrals", r),
   submit: (id, values) => post(`/api/submit/${id}`, { values }),
-  // The SW selection gate: read the ranked shortlist, then record the human's pick.
+  // The SW selection gate: run ranking, read the ranked shortlist, then record the
+  // human's pick.
+  rankReferral: (id) => post(`/api/referrals/${id}/rank`),
   ranking: (id) => j(`/api/referrals/${id}/ranking`),
   chooseService: (id, body) => post(`/api/referrals/${id}/choose-service`, body),
   // MILESTONE 1 — the ORG's answer, distinct from the patient having used the service.

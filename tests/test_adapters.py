@@ -121,6 +121,78 @@ def test_voice_every_mapped_status_is_a_known_transition():
         assert r.json()["state"] != sm.SUBMITTED, voice_status
 
 
+# --- Voice — the live-mode branch (not MockReferralDB) -----------------------
+# Real MockReferralDB underneath (so advance_referral()/queue_action() actually run and
+# are observable), just with `.kind` forced to something other than "MockReferralDB" —
+# the exact idiom `getattr(db, "kind", type(db).__name__)` branches on in inbound.py,
+# mirroring how the real DBSwitch reports the wrapped adapter's class name.
+class _LiveKindDB:
+    def __init__(self, impl, kind="SupabaseAPIReferralDB"):
+        self._impl = impl
+        self.kind = kind
+
+    def __getattr__(self, name):
+        return getattr(self._impl, name)
+
+
+def test_voice_confirmed_queues_notify_patient_live():
+    """A real booking (Retell's "confirmed") is the one case that should queue the
+    patient's booking-confirmed WhatsApp — nothing else in the live pipeline does."""
+    db, ref = _seed_at(sm.SUBMITTED, channel="phone")
+    db._referrals[ref]["service_id"] = "svc_capmetro"
+    live = _LiveKindDB(db)
+    app = FastAPI()
+    app.include_router(build_router(live, TOOLS))
+
+    r = TestClient(app).post("/api/voice/call-outcome", json={
+        "referral_id": ref, "status": "confirmed", "call_id": "call_abc123",
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["notify_action_id"] is not None
+    assert "advanced" in body
+
+    notify_actions = [a for a in db._actions
+                     if a["action_type"] == "notify_patient"
+                     and a["assigned_component"] == "twilio"]
+    assert len(notify_actions) == 1
+    action = notify_actions[0]
+    assert action["referral_id"] == ref
+    assert action["service_id"] == "svc_capmetro"
+    assert action["deduplication_key"] == f"notify:{ref}:call_abc123"
+
+
+def test_voice_non_confirmed_does_not_queue_notify_patient_live():
+    """Everything short of an actual confirmed booking (needs_human / failed
+    territory) must NOT tell the patient their appointment is booked."""
+    db, ref = _seed_at(sm.SUBMITTED, channel="phone")
+    live = _LiveKindDB(db)
+    app = FastAPI()
+    app.include_router(build_router(live, TOOLS))
+
+    r = TestClient(app).post("/api/voice/call-outcome", json={
+        "referral_id": ref, "status": "alt_slot_offered",
+    })
+    assert r.status_code == 200
+    assert r.json()["notify_action_id"] is None
+    assert not [a for a in db._actions if a["action_type"] == "notify_patient"]
+
+
+def test_voice_live_does_not_write_a_duplicate_attempts_row():
+    """call_agent already wrote the shared attempts row itself before forwarding —
+    this seam must not write a second one against the same call."""
+    db, ref = _seed_at(sm.SUBMITTED, channel="phone")
+    live = _LiveKindDB(db)
+    app = FastAPI()
+    app.include_router(build_router(live, TOOLS))
+
+    before = len(db.shared_attempts)
+    TestClient(app).post("/api/voice/call-outcome", json={
+        "referral_id": ref, "status": "confirmed", "call_id": "call_xyz",
+    })
+    assert len(db.shared_attempts) == before
+
+
 # --- Messaging (whatsapp/sms) ------------------------------------------------
 
 def test_consent_confirmed_cascades_to_outreach():

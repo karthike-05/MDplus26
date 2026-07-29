@@ -50,6 +50,14 @@ class ReferralDB(Protocol):
     async def get_service_request(self, referral_id: str) -> dict: ...
     async def save_service_request(self, referral_id: str, fields: dict) -> None: ...
 
+    # Nothing else creates this row (no DB trigger, verified via supabase MCP) — a
+    # referral needing service_requests data must call this once, right after
+    # create_referral. save_service_request above is UPDATE-only (the later
+    # review/submit correction path) and is a no-op against a row that was never
+    # inserted. CONTRACT TOUCH — announced.
+    async def create_service_request(self, referral_id: str, patient_id: str,
+                                      fields: dict) -> str: ...
+
     # --- The shared action queue (backend/orchestrator/actions.py) -----------
     # The live DB owns a scheduler, `advance_referral()`, which queues work into
     # `referral_actions` addressed to a component; we are `karthik_form`. These four
@@ -62,6 +70,19 @@ class ReferralDB(Protocol):
                                result: dict | None = None, error: str | None = None) -> None: ...
     async def record_shared_attempt(self, row: dict) -> None: ...
     async def advance_referral(self, referral_id: str) -> dict: ...
+
+    # Queues a NEW row directly into the bus — the same primitive `advance_referral()`
+    # calls internally (SQL `queue_referral_action()`), reused here rather than
+    # reimplemented so the ON CONFLICT dedup key + agent_decisions audit row stay
+    # identical to every other action on the bus. The only Python caller today is the
+    # Voice call-outcome seam (backend/adapters/inbound.py), queuing `notify_patient`
+    # once a call actually confirms a booking — every other action type is queued BY
+    # advance_referral() itself, never from Python. Already satisfied by
+    # MockReferralDB's existing internal `queue_action`, used by its own
+    # advance_referral mirror. CONTRACT TOUCH — announced.
+    async def queue_action(self, referral_id: str, service_id: str | None,
+                           action_type: str, component: str, key: str, reason: str,
+                           payload: dict | None = None) -> str: ...
 
     # `attempts.attempt_number` is NOT NULL with NO default, and the table carries a
     # UNIQUE (referral_id, service_id, attempt_number). So a shared attempt cannot be

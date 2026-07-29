@@ -60,8 +60,7 @@ function App() {
       {view.name === "services" && <Services onStart={(svc) => setView({ name: "initiate", serviceId: svc.id })} />}
       {view.name === "initiate" && (
         <Initiate
-          preselectedServiceId={view.serviceId}
-          onDone={(id) => setView({ name: "detail", id })}
+          onDone={(id) => setView({ name: "choose", id })}
           onCancel={() => setView({ name: "dashboard" })}
         />
       )}
