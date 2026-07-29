@@ -440,6 +440,27 @@ columns (US Census — free, keyless, authoritative for county). Geocoding degra
 reports `geocoded: false` rather than failing silently, because unresolved coordinates
 kill the referral later inside a service we don't own.
 
+### 7g. ⚠ Nothing creates a `service_requests` row — 5 of 11 form fields go blank
+
+`transport_intake` sources **four** fields from `service_request.*` (`appointment_date`,
+`appointment_time`, `pickup_address`, `destination`) and one from `patient.address`, which
+has no column (§7e, B5). So on a referral created through our own intake UI, **5 of the
+11 agent-fillable fields render blank** — not an error, just empty boxes on the PDF.
+
+As of 2026-07-28 the live DB has exactly **one** `service_requests` row, hand-seeded for
+Jordan Ellis (`c1a1e002…`). Nothing in this codebase inserts one: intake collects a
+patient and a service, never the trip details. **Jordan is therefore the only referral
+whose form meaningfully autofills**, which is why he's the demo referral.
+
+Two consequences to hold onto:
+
+- A "create a fresh referral and walk it end to end" demo will reach the review screen
+  with most trip fields empty. The reviewer can type them, and `submit()` writes them
+  back to `service_requests` (§6a) — so the *first* fill is manual and every later one
+  autofills.
+- The real fix is collecting trip details at intake (a step 4 on the New referral form)
+  and inserting the `service_requests` row. Not built.
+
 ### 7f. `attempts.outcome='enrolled'` is the only thing that closes milestone 1
 
 `advance_referral` promotes a referral to `status='enrolled'` **only** if an `attempts`

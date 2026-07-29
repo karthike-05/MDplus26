@@ -308,6 +308,21 @@ That control is a *manual trigger for a real seam*, not demo scaffolding: when M
 points `ORG_BACKEND_URL` at us, the parsed org email posts to the same endpoint and no
 code changes.
 
+### B13. Nothing creates a `service_requests` row 🟠 blocks a fresh-referral demo
+`transport_intake` sources four fields from `service_request.*` (`appointment_date`,
+`appointment_time`, `pickup_address`, `destination`); `food_assistance` also wants
+`patient.address`, which has no column (B5). The live DB has **one** `service_requests`
+row, hand-seeded for Jordan Ellis — nothing in this codebase inserts one, because intake
+collects a patient and a service but never the trip details.
+
+So **Jordan is the only referral whose form meaningfully autofills.** A referral created
+through our UI reaches the review screen with 5 of 11 agent-fillable fields blank.
+
+Self-healing after the first pass: `submit()` writes reviewed values back to
+`service_requests` (§6a), so a hand-typed first fill makes every later one automatic. The
+real fix is a step 4 on the New referral form that collects trip details and inserts the
+row. See CLAUDE.md §7g.
+
 ### B10. Terminal status for "the patient used it"
 Currently recorded in the free-text `completion_outcome` because widening the
 `referrals.status` CHECK constraint would affect every service. A first-class terminal
