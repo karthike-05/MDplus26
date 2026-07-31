@@ -106,6 +106,7 @@ async def _place_call(referral_id: str) -> dict:
         raise RuntimeError(
             "CALL_AGENT_BASE_URL is unset -- refusing to complete a "
             "contact_service_by_phone action whose call never actually got placed.")
+    base_url = base_url.rstrip("/")
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         response = await client.post(
