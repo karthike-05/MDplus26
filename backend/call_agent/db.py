@@ -367,9 +367,29 @@ def get_call_request(booking_id: str, referral_id: str) -> dict:
         .data
     )
     patient_name = patient.pop("name")
+
+    # The patient's requested pickup/return window lives on service_requests, not
+    # patients.appointment_date (that's the clinic appointment's date, a separate
+    # thing -- CLAUDE.md §6a). Default to None so the dynamic_variables build below
+    # can index these keys unconditionally even when no service_requests row exists.
+    service_request_rows = (
+        _supabase.table("service_requests")
+        .select("requested_start_time, requested_end_time")
+        .eq("referral_id", referral_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+        .data
+    )
+    service_request = service_request_rows[0] if service_request_rows else {
+        "requested_start_time": None,
+        "requested_end_time": None,
+    }
+
     return {
         **booking,
         **patient,
+        **service_request,
         "service_name": service["name"],
         "organization_name": organization["name"],
         "patient_name": patient_name,

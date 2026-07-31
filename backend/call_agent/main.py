@@ -66,8 +66,10 @@ async def _call_retell(booking_id: str, referral_id: str, request_data: dict) ->
         "patient_insurance_id": request_data["insurance_member_id"],
         "mobility_needs": request_data["mobility_needs"],
         "referring_clinic_name": request_data["referring_clinic_name"],
-        "appointment_time": request_data["appointment_date"],
+        "appointment_date": request_data["appointment_date"],
         "appointment_location": request_data["appointment_location"],
+        "requested_start_time": request_data["requested_start_time"],
+        "requested_end_time": request_data["requested_end_time"],
     }
     # Retell rejects the whole request if any dynamic variable is non-string;
     # fields like confirmation_number/scheduled_start_at are legitimately NULL
