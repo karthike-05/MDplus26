@@ -15,7 +15,19 @@ const API =
 
 async function j(path, opts) {
   const r = await fetch(API + path, opts);
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  if (!r.ok) {
+    // FastAPI's HTTPException bodies are {"detail": "..."} — surface that message
+    // (e.g. RankingUnavailable's clean text) instead of a generic "422 Unprocessable
+    // Entity" that tells the SW nothing. Falls back to status text if the body isn't
+    // JSON or has no detail field.
+    let detail;
+    try {
+      detail = (await r.json())?.detail;
+    } catch {
+      // not JSON — fall through to the generic message below
+    }
+    throw new Error(detail || `${r.status} ${r.statusText}`);
+  }
   return r.json();
 }
 const post = (path, body) =>

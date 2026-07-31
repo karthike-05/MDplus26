@@ -259,8 +259,10 @@ async def place_referral_call_endpoint(request: PlaceReferralCallRequest):
     trigger_call.py exercises directly for manual testing.
 
     booking_id is optional — if omitted, the latest booking for referral_id is
-    looked up (db.get_latest_booking_id, mirrors trigger_call.py's manual lookup),
-    so callers only need referral_id (database_usage.md: "Receives: referral_id").
+    resolved, CREATING one from service_requests + service_application_channels if
+    this referral has none yet (db.get_or_create_booking_id — nothing upstream of us
+    creates this row today), so callers only need referral_id
+    (database_usage.md: "Receives: referral_id").
     """
-    booking_id = request.booking_id or db.get_latest_booking_id(request.referral_id)
+    booking_id = request.booking_id or db.get_or_create_booking_id(request.referral_id)
     return await place_referral_call(booking_id, request.referral_id)

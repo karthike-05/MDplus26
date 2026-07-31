@@ -25,6 +25,42 @@ DISTANCE_CAP_MILES = 50.0
 COST_CAP_DOLLARS = 100.0
 RESPONSE_TIME_CAP_HOURS = 168.0  # 1 week
 
+# How many hard-filter survivors advance to subjective (LLM) scoring and get shown to
+# the SW. Selecting this many BY OBJECTIVE SCORE before the subjective step is what
+# keeps run_subjective_scoring's single batched prompt bounded and comparative
+# regardless of how many services survive the hard filter — an over-permissive filter
+# (e.g. every service in the category qualifies because accepted_insurance/
+# service_areas is unset) degrades to "the top 5 by objective score" instead of
+# overloading the LLM with everything that passed.
+SW_SHORTLIST_SIZE = 5
+
+# Zero survivors is a different kind of problem than "too many" above: a service
+# catalog/category mismatch, or a filter rejecting everything. That's not something to
+# silently degrade past — a human needs to see it, not a normal-looking empty result.
+MIN_ELIGIBLE_CANDIDATES = 1
+
+
+class RankingUnavailable(Exception):
+    """Raised when the hard filter rejects every candidate for a referral.
+
+    Deliberately NOT caught by rank_referral()'s generic fallback
+    (_run_unfiltered_fallback): that fallback exists for the scored pipeline raising on
+    unexpected/sparse input, and degrades by listing every active service in the
+    category unscored. Zero survivors hides a real data problem (service catalog
+    category mismatch, or a filter that's rejecting everything) behind a
+    normal-looking empty result — a human needs to see it explicitly instead.
+    """
+
+    def __init__(self):
+        super().__init__(
+            "No services passed eligibility screening for this referral. This "
+            "usually means either the patient's profile doesn't match any active "
+            "service in this need category (insurance, age, or service area), or "
+            "the service catalog for this category is empty/misconfigured. "
+            "A social worker should review the patient's profile and the service "
+            "catalog directly rather than re-running ranking."
+        )
+
 SUBJECTIVE_SCORING_TOOL = {
     "name": "submit_subjective_scores",
     "description": (
@@ -241,9 +277,10 @@ def _candidate_reasons(c: dict) -> list[dict]:
     ]
 
 
-def rank_referral(referral_id: str) -> list[dict]:
+def rank_referral(referral_id: str) -> dict:
     """Backs POST /rank-referral/{referral_id}. Runs all three layers for a
-    referral, writes ranking_results, and returns the SW-facing ranked list
+    referral, writes ranking_results, and returns the SW-facing view: the
+    top-SW_SHORTLIST_SIZE shortlist plus how many services were eligible in total
     (plan §7).
 
     Also writes referral_service_candidates -- the only table advance_referral()
@@ -267,6 +304,12 @@ def rank_referral(referral_id: str) -> list[dict]:
 
     try:
         candidate_rows = _run_scored_pipeline(referral_id, referral, patient)
+    except RankingUnavailable:
+        # Deliberately not degraded to the unfiltered fallback below -- see the
+        # exception's own docstring for why. Nothing has been written yet (the check
+        # runs before any db.upsert_* call), so the referral is left exactly as it was
+        # before this call; the caller (main.py's route) turns this into a clean 4xx.
+        raise
     except Exception:
         logger.exception(
             "scored ranking pipeline failed for referral_id=%s patient_id=%s -- "
@@ -291,7 +334,25 @@ def rank_referral(referral_id: str) -> list[dict]:
             referral_id,
         )
 
-    return db.get_ranking_results(referral_id)
+    return get_sw_ranking_view(referral_id)
+
+
+def get_sw_ranking_view(referral_id: str) -> dict:
+    """The SW-facing shape: only the shortlist that was actually scored end-to-end
+    (<=SW_SHORTLIST_SIZE), plus how many services were eligible in total so the screen
+    can say "eligible for N services, the most appropriate are below" even though only
+    the shortlist itself is shown.
+
+    Reads ranking_results fresh rather than threading state through
+    _run_scored_pipeline/_run_unfiltered_fallback, so GET /ranking-results (no
+    recompute) renders identically to the POST /rank-referral response that just
+    computed it. get_ranking_results() already filters to passed_hard_filter=True
+    (survivors), so len(rows) IS the eligible count; rows without a rank are survivors
+    that didn't make the objective-score shortlist and were never subjectively scored.
+    """
+    rows = db.get_ranking_results(referral_id)
+    shortlist = [r for r in rows if r.get("rank") is not None]
+    return {"results": shortlist, "eligible_count": len(rows)}
 
 
 def _run_scored_pipeline(referral_id: str, referral: dict, patient: dict) -> list[dict]:
@@ -301,6 +362,15 @@ def _run_scored_pipeline(referral_id: str, referral: dict, patient: dict) -> lis
     become a bare 500."""
     candidates = run_hard_filter(referral, patient)
     survivors = [c for c in candidates if c["passed_hard_filter"]]
+
+    # Check BEFORE any objective/subjective scoring or DB writes -- a malfunctioning
+    # hard filter shouldn't burn a Claude call (subjective scoring) or write ranking
+    # rows for a candidate set that's the wrong shape either way. See RankingUnavailable.
+    # No upper bound anymore: selecting the top SW_SHORTLIST_SIZE by objective score
+    # below, before subjective scoring runs, is what keeps that call bounded now.
+    if len(survivors) < MIN_ELIGIBLE_CANDIDATES:
+        raise RankingUnavailable()
+
     service_ids = [c["service"]["id"] for c in survivors]
 
     locations_by_service = db.get_service_locations(service_ids)
@@ -319,8 +389,14 @@ def _run_scored_pipeline(referral_id: str, referral: dict, patient: dict) -> lis
         c["objective_score"] = objective_score
         c["objective_breakdown"] = breakdown
 
-    subjective_by_service = run_subjective_scoring(patient, survivors)
-    for c in survivors:
+    # Qualification filter -> objective score -> top SW_SHORTLIST_SIZE by objective
+    # score -> subjective score on ONLY those -> present to SW. Survivors that don't
+    # make this cut keep their objective_score (written to ranking_results below for
+    # the audit trail / eligible_count) but are never subjectively scored or ranked.
+    finalists = sorted(survivors, key=lambda c: c["objective_score"], reverse=True)[:SW_SHORTLIST_SIZE]
+
+    subjective_by_service = run_subjective_scoring(patient, finalists)
+    for c in finalists:
         result = subjective_by_service.get(c["service"]["id"])
         c["subjective_score"] = result["subjective_score"] if result else None
         c["subjective_rationale"] = result["rationale"] if result else None
@@ -329,8 +405,10 @@ def _run_scored_pipeline(referral_id: str, referral: dict, patient: dict) -> lis
             + (c["subjective_score"] or 0) * COMBINED_WEIGHTS["subjective"]
         )
 
-    survivors.sort(key=lambda c: c["combined_score"], reverse=True)
-    for rank, c in enumerate(survivors, start=1):
+    # Final display order is by COMBINED score, not the objective score used to pick
+    # the shortlist -- subjective scoring can reorder within these SW_SHORTLIST_SIZE.
+    finalists.sort(key=lambda c: c["combined_score"], reverse=True)
+    for rank, c in enumerate(finalists, start=1):
         c["rank"] = rank
 
     rows = [
@@ -360,7 +438,7 @@ def _run_scored_pipeline(referral_id: str, referral: dict, patient: dict) -> lis
             "candidate_status": "available",
             "reasons": _candidate_reasons(c),
         }
-        for c in survivors
+        for c in finalists
     ]
     db.upsert_referral_service_candidates(candidate_rows)
     return candidate_rows

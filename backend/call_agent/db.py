@@ -75,6 +75,85 @@ def get_latest_booking_id(referral_id: str) -> str:
     return booking["id"]
 
 
+def get_or_create_booking_id(referral_id: str) -> str:
+    """Like get_latest_booking_id, but materializes the row the first time it's
+    needed instead of requiring it to already exist.
+
+    Nothing upstream of us ever creates a service_bookings row: advance_referral()
+    decides to dispatch a phone call (queues contact_service_by_phone/retell) but has
+    no row to point at, and nothing polls that action type (docs/whats-left.md A4) --
+    we're dispatched via direct HTTP instead. get_call_request() then READS this row
+    to build the Retell request itself (provider_contact_phone, pickup/destination
+    address+instructions), so it has to exist BEFORE the call is placed, not after.
+
+    Sourced from what's already collected by the time a phone dispatch happens:
+    service_requests (pickup/destination -- CLAUDE.md §6a) and
+    service_application_channels.channel_contact where channel='phone' (the org's
+    number for this service -- there is no phone column on `services` itself).
+    """
+    existing = (
+        _supabase.table("service_bookings")
+        .select("id")
+        .eq("referral_id", referral_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+        .data
+    )
+    if existing:
+        return existing[0]["id"]
+
+    referral = (
+        _supabase.table("referrals")
+        .select("patient_id, service_id")
+        .eq("id", referral_id)
+        .single()
+        .execute()
+        .data
+    )
+    service_id = referral["service_id"]
+    if service_id is None:
+        raise ValueError(
+            f"referral {referral_id} has no service_id yet -- can't build a booking "
+            "before a service has been selected")
+
+    requests = (
+        _supabase.table("service_requests")
+        .select("pickup_address, destination_address, pickup_notes, destination_notes")
+        .eq("referral_id", referral_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+        .data
+    )
+    request = requests[0] if requests else {}
+
+    channels = (
+        _supabase.table("service_application_channels")
+        .select("channel_contact")
+        .eq("service_id", service_id)
+        .eq("channel", "phone")
+        .limit(1)
+        .execute()
+        .data
+    )
+    provider_contact_phone = channels[0]["channel_contact"] if channels else None
+
+    booking = {
+        "referral_id": referral_id,
+        "patient_id": referral["patient_id"],
+        "service_id": service_id,
+        "booking_status": "pending",
+        "pickup_address": request.get("pickup_address"),
+        "pickup_instructions": request.get("pickup_notes"),
+        "destination_address": request.get("destination_address"),
+        "destination_instructions": request.get("destination_notes"),
+        "provider_contact_phone": provider_contact_phone,
+    }
+    inserted = _supabase.table("service_bookings").insert(booking).execute().data
+    return inserted[0]["id"]
+
+
 def create_escalation(referral_id: str, reason_code: str, handoff_summary: str) -> dict:
     escalation = {
         "referral_id": referral_id,
@@ -142,10 +221,16 @@ def save_call_outcome(payload: dict, call_id: str | None) -> dict:
         booking_update["booking_status"] = booking_status
     if payload.get("confirmation_id") is not None:
         booking_update["confirmation_number"] = payload["confirmation_id"]
-    if status == "confirmed" and payload.get("pickup_window") is not None:
+    # `payload.get(...)` alone isn't enough: Retell sends "" rather than omitting a
+    # field it has nothing to report, and scheduled_start_at is a timestamptz column --
+    # writing "" to it is a type error that fails the WHOLE update below (one bad field
+    # kills every field in the same statement), silently stranding booking_status at
+    # 'pending' forever even though the call was confirmed. `or None` treats "" the
+    # same as missing/None, which the `is not None` checks below did not.
+    if status == "confirmed" and payload.get("pickup_window"):
         booking_update["scheduled_start_at"] = payload["pickup_window"]
         booking_update["booked_at"] = datetime.now(timezone.utc).isoformat()
-    elif status == "alt_slot_offered" and payload.get("offered_datetime") is not None:
+    elif status == "alt_slot_offered" and payload.get("offered_datetime"):
         booking_update["scheduled_start_at"] = payload["offered_datetime"]
     if payload.get("pickup_instructions") is not None:
         booking_update["pickup_instructions"] = payload["pickup_instructions"]
@@ -156,16 +241,26 @@ def save_call_outcome(payload: dict, call_id: str | None) -> dict:
     if payload.get("patient_message") is not None:
         booking_update["patient_instructions"] = payload["patient_message"]
 
-    booking_result = (
-        _supabase.table("service_bookings")
-        .update(booking_update)
-        .eq("id", booking_id)
-        .eq("referral_id", referral_id)
-        .execute()
-        .data
-        if booking_update
-        else None
-    )
+    booking_result = None
+    if booking_update:
+        try:
+            booking_result = (
+                _supabase.table("service_bookings")
+                .update(booking_update)
+                .eq("id", booking_id)
+                .eq("referral_id", referral_id)
+                .execute()
+                .data
+            )
+        except Exception as exc:                      # noqa: BLE001
+            # The attempt row above already recorded the call outcome -- don't let an
+            # unexpected field in Retell's payload also block closing the action,
+            # advancing the referral, or notifying the patient, all of which happen
+            # AFTER this function returns (main.py's log_outcome). Surface the failure
+            # in the response instead of raising.
+            print(f"[save_call_outcome] service_bookings update failed (non-fatal): "
+                  f"{type(exc).__name__}: {exc}")
+            booking_result = {"error": f"{type(exc).__name__}: {exc}"}
 
     return {"attempt": attempt_result, "escalation": escalation_result, "booking": booking_result}
 

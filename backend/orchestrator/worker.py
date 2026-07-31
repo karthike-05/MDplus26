@@ -32,12 +32,16 @@ import os
 from datetime import datetime, timezone
 
 from backend.db.interface import ReferralDB
-from backend.orchestrator import actions, backend_component
+from backend.orchestrator import actions, backend_component, voice_component
 
-# The two components we service. `karthik_form` is us by original design; `backend` was
+# The components we service. `karthik_form` is us by original design; `backend` was
 # confirmed ours on 2026-07-27 (A2) and had no poller at all, which deadlocked every
-# referral that reached it. Same claim/do/close/advance contract for both.
-COMPONENTS = (actions, backend_component)
+# referral that reached it. `retell` was Voice's per docs/whats-left.md A4, but nobody
+# had built a poller for it either -- confirmed ours too on 2026-07-31, since we own
+# both ends of this integration for testing. Same claim/do/close/advance contract for
+# all three (voice_component's "close" is deferred to call_agent's own webhook on the
+# common path -- see its module docstring).
+COMPONENTS = (actions, backend_component, voice_component)
 
 # These read the environment at CALL time, not at import. `backend.main` imports this
 # module (line 37) BEFORE it calls `load_dotenv()` (line 47), so a module-level
