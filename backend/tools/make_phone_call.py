@@ -53,6 +53,8 @@ async def make_phone_call(
     **params,
 ) -> ToolOutcome:
     base_url = os.environ.get("CALL_AGENT_BASE_URL")
+    if base_url:
+        base_url = base_url.rstrip("/")
 
     if not base_url:
         # Offline: no call_agent configured. Advance the loop, but record that the

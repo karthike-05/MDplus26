@@ -10,8 +10,9 @@
 //     bottom of backend/main.py), so "" makes every call same-origin and relative. That
 //     is what lets the deployed URL change — a new tunnel, a new Railway domain —
 //     without rebuilding the bundle.
-const API =
-  import.meta.env.VITE_API_BASE ?? (import.meta.env.PROD ? "" : "http://localhost:8000");
+const API = (
+  import.meta.env.VITE_API_BASE ?? (import.meta.env.PROD ? "" : "http://localhost:8000")
+).replace(/\/$/, "");
 
 async function j(path, opts) {
   const r = await fetch(API + path, opts);

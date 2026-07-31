@@ -25,6 +25,8 @@ RETELL_CREATE_CALL_URL = "https://api.retellai.com/v2/create-phone-call"
 # integration_plan_call_agent.md. Forwarding is skipped, not a startup error, when
 # it's absent, so this service keeps running standalone either way.
 ORCHESTRATOR_BASE_URL = os.environ.get("ORCHESTRATOR_BASE_URL")
+if ORCHESTRATOR_BASE_URL:
+    ORCHESTRATOR_BASE_URL = ORCHESTRATOR_BASE_URL.rstrip("/")
 
 
 # def _next_available_call_time(service_id: str) -> Optional[datetime]:
