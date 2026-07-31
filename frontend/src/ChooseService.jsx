@@ -47,11 +47,18 @@ export default function ChooseService({ referralId, onBack, onChosen }) {
   const [busy, setBusy] = useState(false);
   const [rankBusy, setRankBusy] = useState(false);
   const [rankError, setRankError] = useState(null);
+  const [eligibleCount, setEligibleCount] = useState(null);
 
   const loadRanking = () =>
     api.ranking(referralId).then((d) => {
       const rows = d.results || [];
       setResults(rows);
+      // Total eligible (post hard-filter), not just the shortlist shown below —
+      // backend/service_ranking/ranking.py only subjectively scores/ranks the top
+      // SW_SHORTLIST_SIZE by objective score, but the SW should still see how many
+      // passed eligibility overall. Undefined (fallback-to-candidates path has no
+      // count) degrades to the shortlist's own length.
+      setEligibleCount(d.eligible_count ?? rows.length);
       // Keep the current pick if it's still in the (re-ranked) list; otherwise fall
       // back to the new #1 — the default selection the SW sees.
       if (rows.length) {
@@ -122,13 +129,12 @@ export default function ChooseService({ referralId, onBack, onChosen }) {
 
       <div style={{ marginTop: 14, marginBottom: 4 }}>
         <div style={s.h1}>Choose a service</div>
-        <div style={s.sub}>
-          {results.length
-            ? `${results.length} option${results.length === 1 ? "" : "s"} passed eligibility, ranked by fit. `
-            : "Ranking hasn’t been run for this referral yet. "}
-          Your choice is what moves the referral forward — and the label you attach is
-          what teaches the ranker.
-        </div>
+        {results.length > 0 && (
+          <div style={s.sub}>
+            The patient was identified as eligible for {eligibleCount} service
+            {eligibleCount === 1 ? "" : "s"}. The most appropriate are displayed below.
+          </div>
+        )}
       </div>
 
       <div style={{ display: "flex", gap: 10, alignItems: "center", margin: "10px 0 18px" }}>

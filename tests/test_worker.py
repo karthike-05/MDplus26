@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from backend.db.mock import MockReferralDB
-from backend.orchestrator import actions, backend_component, worker
+from backend.orchestrator import actions, backend_component, voice_component, worker
 
 
 def _consenting_db():
@@ -348,6 +349,106 @@ def test_one_tick_clears_a_cross_component_chain():
     reports = asyncio.run(worker.tick(db))
     assert [r["action"] for r in reports] == ["complete_referral", "prepare_online_form"]
     assert reports[-1]["state"] == "awaiting_review"
+
+
+# --- the `retell` component (A4) -----------------------------------------------
+
+def _phone_ready_db():
+    """A consented referral whose chosen service's next unused channel is `phone` --
+    the state that makes advance_referral emit `contact_service_by_phone` to `retell`."""
+    db = _consenting_db()
+    rid = asyncio.run(db.create_referral("pat_001", None, service_id="svc_drive_senior"))
+    asyncio.run(db.advance_referral(rid))
+    return db, rid
+
+
+def _mock_call_agent_response(json_body):
+    """A fake httpx.Response for call_agent's /place-referral-call, so these tests
+    never hit the real (deployed) network (CLAUDE.md §9: layered tests, no I/O)."""
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.json = MagicMock(return_value=json_body)
+    return response
+
+
+def test_retell_queue_ignored_when_empty():
+    assert asyncio.run(voice_component.run_once(MockReferralDB())) is None
+
+
+def test_placed_call_leaves_the_action_blocked_awaiting_the_webhook(monkeypatch):
+    """The common path. call_agent's own /log-call-outcome webhook is what eventually
+    writes the attempts row and closes this action (main.py's
+    _close_action_and_advance) -- so this module must NOT call advance_referral itself
+    on this path, and must NOT mark the action completed (that would let
+    advance_referral re-queue the same channel under a now-dead dedup key, §7c)."""
+    db, rid = _phone_ready_db()
+    monkeypatch.setenv("CALL_AGENT_BASE_URL", "http://call-agent.test")
+    with patch("httpx.AsyncClient.post",
+               new=AsyncMock(return_value=_mock_call_agent_response({"call_id": "call_123"}))):
+        report = asyncio.run(voice_component.run_once(db))
+
+    assert report["action"] == voice_component.DISPATCH
+    assert report["state"] == "awaiting_call_outcome"
+    action = next(a for a in db._actions if a["referral_id"] == rid)
+    assert action["action_status"] == "blocked"
+    assert db.shared_attempts == []                     # nothing written -- not our job
+    # still open, so a re-poll must not re-dispatch
+    assert asyncio.run(db.advance_referral(rid))["state"] == "waiting"
+
+
+def test_call_agent_unreachable_marks_the_action_failed(monkeypatch):
+    """Mirrors actions.py / backend_component.py: a servicing error is recorded on the
+    action, never raised -- an action left `in_progress` would deadlock the referral."""
+    db, rid = _phone_ready_db()
+    monkeypatch.setenv("CALL_AGENT_BASE_URL", "http://call-agent.test")
+    import httpx
+    with patch("httpx.AsyncClient.post",
+               new=AsyncMock(side_effect=httpx.ConnectError("ngrok tunnel down"))):
+        report = asyncio.run(voice_component.run_once(db))
+
+    assert report["state"] == "failed"
+    assert "ngrok tunnel down" in report["error"]
+    action = next(a for a in db._actions if a["referral_id"] == rid)
+    assert action["action_status"] == "failed"
+
+
+def test_missing_call_agent_base_url_fails_cleanly(monkeypatch):
+    db, rid = _phone_ready_db()
+    monkeypatch.delenv("CALL_AGENT_BASE_URL", raising=False)
+    report = asyncio.run(voice_component.run_once(db))
+    assert report["state"] == "failed"
+    assert "CALL_AGENT_BASE_URL" in report["error"]
+
+
+def test_escalated_response_closes_the_action_and_advances(monkeypatch):
+    """call_agent's own MAX_ATTEMPTS cap already hit -- no call was placed, so no
+    webhook is ever coming. Unlike the normal path, this module has to close the
+    action and advance the referral itself, since nobody else will."""
+    db, rid = _phone_ready_db()
+    monkeypatch.setenv("CALL_AGENT_BASE_URL", "http://call-agent.test")
+    escalated = {"escalated": True, "reason": "max_attempts_exceeded"}
+    with patch("httpx.AsyncClient.post",
+               new=AsyncMock(return_value=_mock_call_agent_response(escalated))):
+        report = asyncio.run(voice_component.run_once(db))
+
+    assert report["state"] == "escalated"
+    assert report["result"]["escalated"] is True
+    assert "state" in report["advanced"]
+    action = next(a for a in db._actions if a["referral_id"] == rid)
+    assert action["action_status"] == "completed"
+
+
+def test_worker_tick_drains_the_retell_queue_too(monkeypatch):
+    """End to end through the actual COMPONENTS tuple, not just the module directly --
+    confirms voice_component is really registered on the worker's drain loop."""
+    db, rid = _phone_ready_db()
+    monkeypatch.setenv("CALL_AGENT_BASE_URL", "http://call-agent.test")
+    with patch("httpx.AsyncClient.post",
+               new=AsyncMock(return_value=_mock_call_agent_response({"call_id": "call_123"}))):
+        reports = asyncio.run(worker.tick(db))
+
+    assert any(r.get("action") == voice_component.DISPATCH for r in reports)
+    assert asyncio.run(db.list_ready_actions("retell")) == []   # claimed, not left ready
 
 
 # --- The social-worker selection gate (003_sw_selection_gate.sql) --------------

@@ -32,6 +32,17 @@ def _mock_response(json_body):
     return response
 
 
+def _mock_error_response(status_code, detail):
+    response = MagicMock()
+    response.status_code = status_code
+    response.json = MagicMock(return_value={"detail": detail})
+    response.text = detail
+    response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("error", request=MagicMock(), response=response)
+    )
+    return response
+
+
 # --- _slugify_category / _service_backfill: pure functions -------------------
 
 def test_slugify_category():
@@ -91,6 +102,43 @@ def test_rank_referral_requires_base_url():
         assert "SERVICE_RANKING_BASE_URL" in e.detail
     else:
         raise AssertionError("expected an HTTPException when SERVICE_RANKING_BASE_URL is unset")
+
+
+def test_rank_referral_forwards_clean_4xx_detail_from_ranking_service(monkeypatch):
+    """A 422 from RankingUnavailable (backend/service_ranking/ranking.py — zero
+    candidates survived the hard filter) is the ranking service's own clean
+    rejection, not an infra failure. It must reach the SW as that message, not get
+    flattened into a generic 502 with no explanation."""
+    monkeypatch.setenv("SERVICE_RANKING_BASE_URL", "http://service-ranking.test")
+    db = MockReferralDB()
+    rid = asyncio.run(db.create_referral("pat_001", None, service_id="svc_capmetro"))
+    error_response = _mock_error_response(
+        422, "No services passed eligibility screening for this referral.")
+    with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=error_response)):
+        try:
+            asyncio.run(_rank_referral(rid, db))
+        except HTTPException as e:
+            assert e.status_code == 422
+            assert "No services passed eligibility screening" in e.detail
+        else:
+            raise AssertionError("expected the 422 + detail to be forwarded")
+
+
+def test_rank_referral_still_502s_on_a_real_infra_failure(monkeypatch):
+    """A 5xx (or an unparseable body) from the ranking service is a genuine infra
+    failure, distinct from RankingUnavailable's clean 4xx rejection — stays a 502
+    rather than being mistaken for a clean rejection to forward verbatim."""
+    monkeypatch.setenv("SERVICE_RANKING_BASE_URL", "http://service-ranking.test")
+    db = MockReferralDB()
+    rid = asyncio.run(db.create_referral("pat_001", None, service_id="svc_capmetro"))
+    error_response = _mock_error_response(500, "internal error")
+    with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=error_response)):
+        try:
+            asyncio.run(_rank_referral(rid, db))
+        except HTTPException as e:
+            assert e.status_code == 502
+        else:
+            raise AssertionError("expected a 502 for a 5xx from the ranking service")
 
 
 def test_get_ranking_proxies_and_returns_results(monkeypatch):

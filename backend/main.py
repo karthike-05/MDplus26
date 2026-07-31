@@ -631,7 +631,7 @@ COMPONENTS = [
     {"name": "karthik_form", "owner": "Form-fill (us)", "polled_by_us": True},
     {"name": "backend", "owner": "Form-fill (us) — confirmed 2026-07-27", "polled_by_us": True},
     {"name": "twilio", "owner": "Messaging", "polled_by_us": False},
-    {"name": "retell", "owner": "Voice", "polled_by_us": False},
+    {"name": "retell", "owner": "Voice — polled by us since 2026-07-31", "polled_by_us": True},
     {"name": "social_worker", "owner": "the dashboard (B2: no screen yet)",
      "polled_by_us": False},
 ]
@@ -1010,6 +1010,20 @@ async def _rank_referral(referral_id: str, db: ReferralDB) -> dict:
         try:
             response = await client.post(f"{base_url}/rank-referral/{referral_id}")
             response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            # A 4xx here is the ranking service's OWN clean rejection (e.g.
+            # RankingUnavailable — zero or >15 candidates survived its hard filter,
+            # backend/service_ranking/ranking.py), not an infra failure. Forward its
+            # status + detail as-is so the SW sees the actual reason rather than a
+            # flattened 502; only a genuinely erroring/unreachable service (5xx, or a
+            # body we can't parse) falls through to the generic 502 below.
+            if e.response.status_code < 500:
+                try:
+                    detail = e.response.json().get("detail") or e.response.text
+                except ValueError:
+                    detail = e.response.text
+                raise HTTPException(e.response.status_code, detail)
+            raise HTTPException(502, f"ranking service call failed: {e}")
         except httpx.HTTPError as e:
             raise HTTPException(502, f"ranking service call failed: {e}")
         return response.json()
