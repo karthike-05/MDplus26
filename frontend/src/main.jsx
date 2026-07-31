@@ -27,7 +27,7 @@ function App() {
   return (
     <div style={{ fontFamily: "system-ui, sans-serif", minHeight: "100vh", background: C.bg }}>
       <header style={h.bar}>
-        <span style={h.brand}>Catalyst · <span style={{ color: C.sub, fontWeight: 500 }}>referral completion</span></span>
+        <span style={h.brand}>Catalyst · <span style={{ color: C.sub, fontWeight: 500 }}>Relay</span></span>
         <nav style={{ display: "flex", gap: 4 }}>
           {nav.map(([key, label]) => (
             <button
