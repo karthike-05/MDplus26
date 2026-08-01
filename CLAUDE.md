@@ -489,10 +489,18 @@ collapsing the two milestones destroys the distinction the product exists to mak
 and `tests/test_org_response.py` asserts it can't happen.
 
 The org's answer arrives at **`POST /api/org/response`** (in the inbound adapter, beside
-the Voice and Messaging seams). Today a human clicks *Org accepted ✓* on the dashboard;
-once Messaging sets `ORG_BACKEND_URL`, the parsed email posts to the same endpoint. The
-live `attempts.outcome` CHECK vocabulary is pinned in `tests/test_org_response.py` — a
-value outside it fails the insert on the real DB and nowhere else.
+the Voice and Messaging seams). Today a human clicks *Org accepted ✓* on the dashboard,
+and that is currently the **only** caller: nothing parses org email yet, on either side.
+The live `attempts.outcome` CHECK vocabulary is pinned in `tests/test_org_response.py` —
+a value outside it fails the insert on the real DB and nowhere else.
+
+> ⚠ **`ORG_BACKEND_URL` is NOT the org-email seam** — an earlier version of this file
+> said it was, and the mistake propagated. It is Messaging's pointer at *us*, and
+> `patient_comms/org_events.py` uses it for exactly one thing:
+> `POST {ORG_BACKEND_URL}/api/patient-comms/event`, the **patient-reply** seam (consent
+> confirmed/declined, utilization verified). Setting it does nothing for org email.
+> Verified unset as of 2026-08-01: `integration_events` holds only `karthik_form` rows,
+> so Messaging has never posted to us.
 
 ---
 
@@ -641,7 +649,11 @@ Deferred on purpose — build only after the Aug-2 warm path is solid.
   versioned, with verification provenance — and it's empty.
 - **Persist inbound events to `integration_events`.** Our adapters currently apply and
   forget; that table is the durable webhook log.
-- **Inbound webhooks for real** (org email parse, Twilio "Y") replacing the simulated
-  `apply_inbound` in `run_demo.py` (§7). The Twilio leg already works in Messaging's
-  deploy; what's missing is `ORG_BACKEND_URL` pointing at us. **The receiving end is
-  built** — `POST /api/org/response` (§7f) — so that's a config change, not code.
+- **Inbound webhooks for real**, replacing the simulated `apply_inbound` in
+  `run_demo.py` (§7). These are two separate legs and they are NOT at the same stage:
+  - **Patient replies (Twilio "Y")** — genuinely one config change. Messaging's
+    `org_events.py` already emits to `{ORG_BACKEND_URL}/api/patient-comms/event`, and
+    our receiving end is built; `ORG_BACKEND_URL` is simply unset in their deploy.
+  - **Org email parse** — *not* built, on either side. Our `POST /api/org/response`
+    receives it (§7f), but nothing produces it and there is no env var for it. Until
+    then the dashboard's *Org accepted ✓* button is the only caller.
