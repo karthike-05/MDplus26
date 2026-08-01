@@ -60,3 +60,32 @@ def test_compose_details_from_view():
                "confirmation_number": "ABC123"}
     s = service.compose_details(booking)
     assert "123 Main St" in s and "ABC123" in s
+
+
+def test_render_message_fills_slots():
+    body = service.render_message("ack_received",
+        {"patient_name": "Sam", "resource_name": "RideCo", "service_type": "transportation"})
+    assert "Sam" in body and "transportation" in body
+
+
+def test_send_body_sends_and_logs(db_session, monkeypatch):
+    prov = _FakeProvider()
+    monkeypatch.setattr(service, "get_sms_provider", lambda: prov, raising=False)
+    o = _mk(db_session)
+    out = service.send_body(db_session, o, "hello there", "ack")
+    db_session.commit()
+    assert out == "hello there"
+    assert prov.sent == [("+15551230000", "hello there")]
+    assert db_session.query(Message).filter_by(direction="outbound", body="hello there").count() == 1
+
+
+def test_recent_messages_oldest_first(db_session, monkeypatch):
+    prov = _FakeProvider()
+    monkeypatch.setattr(service, "get_sms_provider", lambda: prov, raising=False)
+    o = _mk(db_session)
+    service.log_message(db_session, o, "outbound", "ack", "first")
+    service.log_message(db_session, o, "inbound", "ack", "second")
+    db_session.commit()
+    hist = service.recent_messages(db_session, o, limit=6)
+    assert [h["body"] for h in hist] == ["first", "second"]
+    assert hist[1]["direction"] == "inbound"

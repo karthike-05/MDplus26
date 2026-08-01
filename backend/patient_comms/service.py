@@ -50,11 +50,9 @@ def log_message(session, outreach: PatientOutreach, direction: str, stage: str, 
     )
 
 
-def send_templated(session, outreach: PatientOutreach, template_key: str, ctx: dict, stage: str, **extra) -> str:
-    """Render `template_key` from the live context dict (patient/clinic/resource/
-    service_type pulled from `ctx`, plus any extra slots like `details`), send it
-    via the configured SMS provider, log it to the thread, and return the body.
-    Does not commit -- the caller decides transaction boundaries."""
+def render_message(template_key: str, ctx: dict, **extra) -> str:
+    """Render a template to its body from the logistics `ctx` dict (no send).
+    render_template only consumes the slots the chosen template declares."""
     from templates import render_template
 
     slots = {
@@ -64,21 +62,41 @@ def send_templated(session, outreach: PatientOutreach, template_key: str, ctx: d
         "service_type": ctx.get("service_type", ""),
     }
     slots.update(extra)
-    # render_template only consumes the slots the chosen template declares.
-    body = render_template(template_key, **slots)
-    provider = get_sms_provider()
-    if template_key in _FIRST_CONTACT:
-        # First contact -> send via the approved WhatsApp template (content_sid +
-        # variables). The variables map to the template's {{1}}/{{2}}/{{3}} =
-        # patient name / clinic / service type. Providers without a real template
-        # (SMS, mock) fall back to the freeform `body`.
-        provider.send_template(
-            outreach.patient_phone,
-            os.environ.get("WHATSAPP_CONSENT_CONTENT_SID"),
-            {"1": slots["patient_name"], "2": slots["clinic_name"], "3": slots["service_type"]},
-            body,
-        )
-    else:
-        provider.send_message(outreach.patient_phone, body)
+    return render_template(template_key, **slots)
+
+
+def send_body(session, outreach: PatientOutreach, body: str, stage: str) -> str:
+    """Send an already-composed body via the provider and log it. Acks are never
+    first contact, so there is no WhatsApp-template branch here."""
+    get_sms_provider().send_message(outreach.patient_phone, body)
     log_message(session, outreach, "outbound", stage, body)
     return body
+
+
+def recent_messages(session, outreach: PatientOutreach, limit: int = 6) -> list[dict]:
+    """Last `limit` thread messages, oldest-first, for the responder's context."""
+    rows = (session.query(Message)
+            .filter(Message.outreach_id == outreach.id)
+            .order_by(Message.created_at.desc())
+            .limit(limit).all())
+    return [{"direction": r.direction, "body": r.body} for r in reversed(rows)]
+
+
+def send_templated(session, outreach: PatientOutreach, template_key: str, ctx: dict,
+                   stage: str, **extra) -> str:
+    """Render `template_key`, send it via the configured provider, log it, and
+    return the body. First-contact templates go out as an approved WhatsApp
+    template (providers without one fall back to the freeform body). Does not
+    commit -- the caller decides transaction boundaries."""
+    body = render_message(template_key, ctx, **extra)
+    if template_key in _FIRST_CONTACT:
+        slots_pn = ctx.get("patient_name", "")
+        get_sms_provider().send_template(
+            outreach.patient_phone,
+            os.environ.get("WHATSAPP_CONSENT_CONTENT_SID"),
+            {"1": slots_pn, "2": ctx.get("clinic_name", ""), "3": ctx.get("service_type", "")},
+            body,
+        )
+        log_message(session, outreach, "outbound", stage, body)
+        return body
+    return send_body(session, outreach, body, stage)
