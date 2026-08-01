@@ -102,7 +102,7 @@ def test_submitting_a_form_is_not_the_org_accepting():
     from backend.orchestrator.actions import STATUS_TO_THEIRS
 
     assert "enrolled" not in {outcome for _, outcome in STATUS_TO_THEIRS.values()}
-    assert STATUS_TO_THEIRS["success"] == ("completed", "submitted")
+    assert STATUS_TO_THEIRS["success"] == ("sent", "submitted")
 
 
 def test_unknown_decision_is_422_and_still_logged(client_and_db):

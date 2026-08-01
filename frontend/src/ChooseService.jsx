@@ -25,13 +25,22 @@ import { useEffect, useState } from "react";
 import { api } from "./api.js";
 import { C, Btn } from "./ui.jsx";
 
-// backend/service_ranking's sw_feedback.label enum. Free-text notes ride alongside.
+// Written to `sw_feedback.label` (free text — no CHECK constraint on the live column).
+//
+// POSITIVE ONLY, DELIBERATELY. These are reasons the picked service IS right, never
+// reasons another one was wrong. Two reasons. For the SW it's less work: they're already
+// choosing this service, so the only question left is "why this one" — a one-tap answer,
+// not a triage of the four they rejected. And for the ranker, a label attached to the
+// row the SW *chose* is unambiguous training signal; `wrong_service` on a chosen row was
+// always contradictory, and the reject reasons it implied belong to services that aren't
+// on this record at all. Free-text notes still carry anything that doesn't fit.
 const LABELS = [
   ["good_fit", "Good fit"],
-  ["wrong_service", "Wrong service"],
-  ["too_far", "Too far"],
-  ["insurance_mismatch", "Insurance mismatch"],
-  ["other", "Other"],
+  ["close_by", "Close to patient"],
+  ["insurance_match", "Takes their insurance"],
+  ["fast_response", "Responds quickly"],
+  ["patient_preference", "Patient asked for them"],
+  ["prior_success", "Worked before"],
 ];
 
 const pct = (n) => (n == null ? "—" : `${Math.round(n)}`);
@@ -214,6 +223,7 @@ export default function ChooseService({ referralId, onBack, onChosen }) {
           </div>
           <div style={{ fontSize: 12, color: C.sub, marginBottom: 10 }}>
             Recorded to <code>sw_feedback</code> — this is what the ranker learns from.
+            Pick what made this the right call; anything else goes in the note.
           </div>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
             {LABELS.map(([value, text]) => (

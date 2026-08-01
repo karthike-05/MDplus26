@@ -541,6 +541,35 @@ async def get_form_page(form_id: str, page: int) -> Response:
     return Response(content=png, media_type="image/png")
 
 
+async def _close_open_form_action(referral_id: str, status: str) -> dict | None:
+    """Close whichever form action the reviewer just answered, mirroring what
+    `actions.py` does when the worker submits on its own.
+
+    Both action types count: `prepare_online_form` is what the worker leaves `blocked`
+    awaiting review, and `submit_online_form` is what a reviewer-approved dispatch queues.
+    Either one still open would freeze the referral. Best-effort and never fatal — the
+    submission itself already happened and is recorded; failing the request here would
+    tell the SW their submit failed when it didn't.
+    """
+    try:
+        actions = await db.list_actions(referral_id)
+    except Exception:                                     # noqa: BLE001 - diagnostics only
+        return None
+    for a in actions:
+        if (a.get("action_type") in (act.PREPARE, act.SUBMIT)
+                and a.get("action_status") in OPEN_STATUSES):
+            try:
+                await db.set_action_status(
+                    a["id"],
+                    "completed" if status == "success" else "failed",
+                    result={"closed_by": "review_ui_submit", "outcome_status": status},
+                )
+                return a
+            except Exception:                             # noqa: BLE001
+                return None
+    return None
+
+
 @app.post("/api/submit/{referral_id}")
 async def post_submit(referral_id: str, body: ReviewedValues) -> dict:
     """Run the real fill_form.submit on the reviewer's confirmed values, then advance
@@ -571,6 +600,15 @@ async def post_submit(referral_id: str, body: ReviewedValues) -> dict:
         await db.record_shared_attempt(
             act.attempt_row(referral, outcome, schema.target_type, attempt_no,
                             referral.get("outreach_channel")))
+        # CLOSE THE ACTION FIRST, THEN ADVANCE — in that order, or the referral wedges.
+        # The worker services `prepare_online_form` by marking it `blocked` and waiting
+        # for a human (actions.py), and this route IS that human. Recording the attempt
+        # without closing the action leaves it open forever, and `advance_referral`'s
+        # first guard is "any open action -> waiting", so the referral silently stops
+        # dead on the submit that just succeeded — the §7b failure shape exactly.
+        # Verified live 2026-08-01: without this, advance_referral returned
+        # {"state": "waiting", "reason": "An action is already open"} after a 200 submit.
+        await _close_open_form_action(referral_id, outcome.status)
         advanced = await db.advance_referral(referral_id)
 
     new = await db.get_referral(referral_id)

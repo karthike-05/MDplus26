@@ -13,7 +13,7 @@
  * attempt followed by a form attempt shows as two chips.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "./api.js";
 import { C, Badge, Btn, RowActions, ChannelsTried, PatientResponse, CHANNEL_LABEL } from "./ui.jsx";
 
@@ -65,20 +65,41 @@ export default function Dashboard({ onReview, onOpen, onChoose, onNew }) {
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
 
-  const load = async () => {
-    setBusy(true);
+  // `quiet` polls in the background without touching `busy` — otherwise every tick
+  // would flip the buttons to their disabled "…" state and the board would look like
+  // it's constantly reloading.
+  const load = async (quiet = false) => {
+    if (!quiet) setBusy(true);
     try {
       const d = await api.dashboard();
       setRows(d.rows);
       setDbInfo(d.db ?? (await api.dbMode()));
       setError(null);
     } catch (e) {
-      setError(String(e));
+      // A failed background poll is not worth blanking a board that's already
+      // rendering. Only a foreground load surfaces the error screen.
+      if (!quiet) setError(String(e));
     } finally {
-      setBusy(false);
+      if (!quiet) setBusy(false);
     }
   };
-  useEffect(() => { load(); }, []);
+
+  // Everything that moves a referral is asynchronous and happens off-screen — the
+  // worker drains actions every 15s, and Voice/Messaging post back whenever their call
+  // or text lands. Without a poll the SW sees a frozen board and assumes nothing
+  // happened. Integration.jsx already does this at 4s; the dashboard is a heavier query,
+  // so 5s, and only while the tab is actually visible.
+  const timer = useRef(null);
+  useEffect(() => {
+    load();
+    const tick = () => { if (!document.hidden) load(true); };
+    timer.current = setInterval(tick, 5000);
+    document.addEventListener("visibilitychange", tick);
+    return () => {
+      clearInterval(timer.current);
+      document.removeEventListener("visibilitychange", tick);
+    };
+  }, []);
 
   const switchDb = async () => {
     const next = dbInfo?.mode === "supabase" ? "mock" : "supabase";

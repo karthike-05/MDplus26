@@ -161,6 +161,14 @@ ATTEMPT_COLS = {
     "status": "status",                  # see WARNING above
     "data": "structured_result",         # jsonb, NOT NULL — never write None
     "error": "notes",
+    # -- read-only projections: surfaced to the UI, never written by us. --
+    # `status` alone is not renderable: Messaging writes 'sent' on the outbound consent
+    # text and 'delivered' on the patient's inbound reply, so a timeline that shows the
+    # raw value reads as two inconsistent states for the same channel when it's actually
+    # two different directions. Both write paths above list their columns explicitly, so
+    # these appear in _to_ours() output without ever reaching an INSERT.
+    "direction": "direction",            # 'outbound' (we sent) | 'inbound' (they did)
+    "purpose": "purpose",                # 'consent' | 'transportation' | ...
     # -- no column on `attempts` yet (additive migration): --
     "attempt_id": None,                  # our idempotency key (§10); needs a UNIQUE
                                          # index. Their nearest analogue is
@@ -225,24 +233,15 @@ class SupabaseReferralDB(ReferralDB):
     # --- Writes ---------------------------------------------------------------
 
     async def record_attempt(self, outcome: ToolOutcome) -> None:
-        """Idempotent upsert on ``attempt_id`` (§10). Needs a UNIQUE constraint on
-        that column — see docs/db-contract.md."""
-        c = ATTEMPT_COLS
-        cols = [c["attempt_id"], c["referral_id"], c["channel"], c["status"],
-                c["from_state"], c["data"], c["error"]]
-        sql = (
-            f"INSERT INTO {TABLES['outreach_attempts']} "
-            f"({', '.join(cols)}) VALUES ($1,$2,$3,$4,$5,$6,$7) "
-            f"ON CONFLICT ({c['attempt_id']}) DO UPDATE SET "
-            f"{c['status']} = EXCLUDED.{c['status']}, "
-            f"{c['data']} = EXCLUDED.{c['data']}, "
-            f"{c['error']} = EXCLUDED.{c['error']}"
-        )
-        pool = await self._p()
-        await pool.execute(
-            sql, outcome.attempt_id, outcome.referral_id, outcome.channel, outcome.status,
-            outcome.from_state, json.dumps(outcome.data), outcome.error,
-        )
+        """No-op against the live DB, on purpose — see SupabaseAPIReferralDB.record_attempt
+        for the full reasoning. Live, tool outcomes reach `attempts` through
+        `record_shared_attempt` in their vocabulary; writing our ToolOutcome here too
+        would double-count the row `advance_referral()` uses to pick the next channel.
+
+        (The previous body was also simply broken: `attempt_id`/`from_state` map to None,
+        so it built `INSERT INTO attempts (None, referral_id, …) ON CONFLICT (None)`.)
+        """
+        return None
 
     async def set_state(self, referral_id: str, state: str) -> None:
         """No-op against the live DB, on purpose (§7a).

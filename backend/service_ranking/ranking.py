@@ -474,7 +474,15 @@ def _run_unfiltered_fallback(referral_id: str, referral: dict) -> list[dict]:
             "referral_id": referral_id,
             "service_id": service["id"],
             "rank": rank,
-            "score": None,
+            # NOT score=None. `referral_service_candidates.score` is NOT NULL, so a null
+            # here made THIS fallback raise — the degrade path that exists to stop a
+            # referral parking on a poisoned `rank:<id>` key was itself the thing
+            # poisoning it. `ranking_results.score` IS nullable, which is why the symptom
+            # was so confusing live: 59 ranking_results rows written, 0 candidates, and a
+            # bare 500 (reproduced on af536831, 2026-08-01). Ordering is carried by
+            # `rank`, which is already set, so 0.0 loses nothing; the reasons note below
+            # is what tells the SW these are unscored.
+            "score": 0.0,
             "eligibility_state": "unknown",
             "candidate_status": "available",
             "reasons": [

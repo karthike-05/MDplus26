@@ -156,21 +156,29 @@ class SupabaseAPIReferralDB(ReferralDB):
     # --- Writes ---------------------------------------------------------------
 
     async def record_attempt(self, outcome: ToolOutcome) -> None:
-        """Idempotent upsert on ``attempt_id`` (§10). Needs the UNIQUE constraint on
-        that column (docs/db-contract.md); PostgREST's on_conflict relies on it."""
-        c = ATTEMPT_COLS
-        row = {
-            c["attempt_id"]: outcome.attempt_id,
-            c["referral_id"]: outcome.referral_id,
-            c["channel"]: outcome.channel,
-            c["status"]: outcome.status,
-            c["from_state"]: outcome.from_state,
-            c["data"]: outcome.data,     # dict -> jsonb (PostgREST serializes)
-            c["error"]: outcome.error,
-        }
-        client = await self._c()
-        await client.table(TABLES["outreach_attempts"]).upsert(
-            row, on_conflict=c["attempt_id"]).execute()
+        """No-op against the live DB, on purpose — the same call as `set_state` (§7a).
+
+        Every tool ends by calling this (`fill_form.submit`, `notify_patient`,
+        `send_email`, `make_phone_call`), which is right offline: it writes the
+        `outreach_attempts` row in OUR ToolOutcome vocabulary. Live, that row is written
+        instead by `record_shared_attempt` in THEIR vocabulary — translated channel,
+        `attempt_number`, `outcome` enum — from `actions.py`, `backend_component.py`,
+        `inbound.py` and `main.py`'s submit route. Doing both writes the same event twice.
+
+        That is not merely redundant, it is corrupting. `advance_referral()` picks the
+        next channel with `not exists(select 1 from attempts where ... a.channel =
+        ch.channel)` and enforces the three-attempt cap by counting these rows, so an
+        extra row silently burns a channel. Our `channel='form'` isn't even in
+        `attempts_channel_check` (online_form/phone/email/sms/whatsapp), and
+        `attempt_number` is NOT NULL with no default.
+
+        This used to be a broken write rather than a no-op: `attempt_id` and `from_state`
+        both map to None, so the row dict collapsed onto one literal `None` key and
+        `on_conflict=None` went to PostgREST as the string "null" — PGRST204 on every
+        call. Nothing caught it because the worker path never comes through here; only
+        `POST /api/submit` (the review UI) does, and it had never been run live.
+        """
+        return None
 
     async def set_state(self, referral_id: str, state: str) -> None:
         """No-op against the live DB, on purpose (§7a) — see SupabaseReferralDB.set_state.

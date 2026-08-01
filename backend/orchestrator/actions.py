@@ -45,8 +45,25 @@ HANDLED = (PREPARE, SUBMIT)
 # channel). The shared `attempts` table splits the same information across two
 # constrained columns, `status` (transport-level) and `outcome` (what it achieved),
 # and the ranker reads `outcome`. So one of ours maps to a PAIR of theirs.
+#
+# ⚠ `success` MAPS TO 'sent', NOT 'completed', AND THE DIFFERENCE IS THE WHOLE LOOP.
+# `advance_referral` decides whether a referral is waiting on anyone with:
+#
+#     if exists(select 1 from attempts where ... status in
+#               ('queued','started','sent','delivered'))
+#        then status='waiting_for_response'
+#
+# and only if that misses does it fall through to "this channel is used up, try the next
+# resource". A submitted application is *pending*, not concluded — the org hasn't
+# answered yet (§7f: submitting is not accepting). Writing 'completed' made a SUCCESSFUL
+# submit look like an exhausted channel, so the demo service (one channel) was instantly
+# marked `exhausted` and the referral abandoned the service it had just applied to.
+# Verified live 2026-08-01: advance_referral returned `try_next_resource` straight after
+# a 200 submit. With 'sent' it parks at `waiting_for_response`, which is exactly our
+# `submitted` state (§7, WAITING_FOR_INBOUND) — and `POST /api/org/response` is what
+# moves it on. `outcome` is untouched: the ranker still reads 'submitted'.
 STATUS_TO_THEIRS = {
-    "success":     ("completed", "submitted"),
+    "success":     ("sent",      "submitted"),
     "needs_human": ("completed", "needs_human_followup"),
     "failed":      ("failed",    "technical_failure"),
 }

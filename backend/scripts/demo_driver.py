@@ -293,7 +293,7 @@ def enable_form_channel(c, service_id: str | None, apply: bool) -> None:
             # advance_referral never reads it, so record where the form actually lives
             # rather than inventing a URL that 404s for anyone who clicks it.
             "application_url": None,
-            "notes": "Catalyst demo: PDF intake handled by the karthik_form component "
+            "notes": "Relay demo: PDF intake handled by the karthik_form component "
                      "(contracts/schemas/transport_intake_pdf.json).",
         }
         print(f"\nWOULD INSERT into service_application_channels:")
