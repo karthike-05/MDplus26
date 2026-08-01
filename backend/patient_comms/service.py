@@ -50,11 +50,10 @@ def log_message(session, outreach: PatientOutreach, direction: str, stage: str, 
     )
 
 
-def render_message(template_key: str, ctx: dict, **extra) -> str:
-    """Render a template to its body from the logistics `ctx` dict (no send).
-    render_template only consumes the slots the chosen template declares."""
-    from templates import render_template
-
+def _build_slots(ctx: dict, extra: dict) -> dict:
+    """Merge the logistics `ctx` dict with per-call `extra` overrides into the
+    single slot dict every consumer (rendering AND the WhatsApp template-variable
+    map) must derive from -- computed in exactly one place so they can't disagree."""
     slots = {
         "patient_name": ctx.get("patient_name", ""),
         "clinic_name": ctx.get("clinic_name", ""),
@@ -62,6 +61,15 @@ def render_message(template_key: str, ctx: dict, **extra) -> str:
         "service_type": ctx.get("service_type", ""),
     }
     slots.update(extra)
+    return slots
+
+
+def render_message(template_key: str, ctx: dict, **extra) -> str:
+    """Render a template to its body from the logistics `ctx` dict (no send).
+    render_template only consumes the slots the chosen template declares."""
+    from templates import render_template
+
+    slots = _build_slots(ctx, extra)
     return render_template(template_key, **slots)
 
 
@@ -88,13 +96,13 @@ def send_templated(session, outreach: PatientOutreach, template_key: str, ctx: d
     return the body. First-contact templates go out as an approved WhatsApp
     template (providers without one fall back to the freeform body). Does not
     commit -- the caller decides transaction boundaries."""
+    slots = _build_slots(ctx, extra)
     body = render_message(template_key, ctx, **extra)
     if template_key in _FIRST_CONTACT:
-        slots_pn = ctx.get("patient_name", "")
         get_sms_provider().send_template(
             outreach.patient_phone,
             os.environ.get("WHATSAPP_CONSENT_CONTENT_SID"),
-            {"1": slots_pn, "2": ctx.get("clinic_name", ""), "3": ctx.get("service_type", "")},
+            {"1": slots["patient_name"], "2": slots["clinic_name"], "3": slots["service_type"]},
             body,
         )
         log_message(session, outreach, "outbound", stage, body)

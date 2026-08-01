@@ -40,6 +40,21 @@ def test_consent_first_contact_uses_template(db_session, monkeypatch):
     assert db_session.query(Message).count() == 1  # still logged to the thread
 
 
+def test_consent_first_contact_template_vars_honor_extra_override(db_session, monkeypatch):
+    """extra kwargs must win over ctx for the WhatsApp template-variable map too,
+    not just the rendered fallback body -- they must never disagree."""
+    prov = _FakeProvider()
+    monkeypatch.setattr(service, "get_sms_provider", lambda: prov, raising=False)
+    monkeypatch.setenv("WHATSAPP_CONSENT_CONTENT_SID", "HXtest")
+    o = _mk(db_session)
+    ctx = {"patient_name": "Sam", "clinic_name": "KU Liberty",
+           "resource_name": "ModivCare", "service_type": "transportation"}
+    body = service.send_templated(db_session, o, "consent", ctx, "consent", patient_name="OVERRIDE")
+    assert prov.templates
+    _, _, variables, _ = prov.templates[0]
+    assert variables["1"] == "OVERRIDE"
+
+
 def test_followups_use_freeform(db_session, monkeypatch):
     """After the patient has replied, follow-ups (reminder/verification/ack) are
     inside the 24h window and send as freeform."""
