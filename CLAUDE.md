@@ -11,7 +11,7 @@ Guidance for Claude Code and for the team. **Read this before writing code.** It
 ## Table of contents
 
 1. [What we're building](#1-what-were-building)
-2. [Golden rules](#2-golden-rules-do-not-violate)
+2. [Golden rules](#2-golden-rules-do-not-violate) — incl. [🔴 the three real-world flags](#2a--the-three-flags-that-stand-between-this-app-and-the-real-world)
 3. [Tech stack](#3-tech-stack)
 4. [Repo structure](#4-repo-structure)
 5. [The shared contracts](#5-the-shared-contracts-freeze-first)
@@ -47,6 +47,21 @@ Incumbents (findhelp, Unite Us) *generate* referrals; our differentiator is **co
 ---
 
 ## 2. Golden rules (do not violate)
+
+### 2a. 🔴 The three flags that stand between this app and the real world
+
+**Read this before flipping anything on, and before handing anyone the URL.** These
+default OFF, and each one is off because turning it on reaches somebody outside the
+building. Every one of them was added after finding the app could already do the thing.
+
+| Flag | Default | What turning it ON actually does |
+| --- | --- | --- |
+| **`ALLOW_LIVE_CALLS`** | `0` | Lets the `retell` poller place a **real outbound phone call to a real organisation**. 23 services in the live catalog carry a real phone number and **11 have `phone` at priority 1** — `913-588-6970` is an actual county health department. Anyone who picks one of those on the Choose-service screen dials it. Off, the action is left `ready` and never claimed — deliberately *not* marked failed, because a failed action poisons its dedup key permanently (§7c) and the queue could never be drained later. |
+| **`ALLOW_LIVE_INTAKE`** | `0` | Makes "+ New referral" send a **real WhatsApp** to whatever number was typed, on the team's Twilio. Currently **on** by choice. `Initiate.jsx` names the number in a confirm dialog first — a generic "are you sure?" wouldn't catch the mistyped digit that guard exists for. |
+| **`VITE_DEV_TOOLS`** | `0` | Shows the **Integration tab** and the **Mock/Supabase data-source toggle**. That toggle calls `POST /api/db`, which swaps the adapter **process-wide** — one person clicking "Mock" changes the data source for *everyone* on the deployment at once, and the next visitor sees fixture data with nothing explaining why. It is a debugging control wired to global mutable state. **Build-time**, because Vite inlines `VITE_*` at build: `VITE_DEV_TOOLS=1 npm run build`. Locally, `?dev=1` works without a rebuild. |
+
+> The shared `APP_PASSWORD` is the *only* thing gating any of this. There is no
+> per-user auth, so "who can press it" and "who has the link" are the same set.
 
 - **Synthetic data only.** No real PHI anywhere. This is what lets us skip HIPAA/RBAC/audit infra — narrate those as production design, don't build them.
 - **Modules talk through the DB + the scheduler, never by importing each other.** `fill_form` does not call `notify_patient`. It writes an outcome; the scheduler decides what's next.
@@ -572,7 +587,9 @@ supabase db push                            # apply contracts/db_schema.sql (whe
 | --- | --- | --- |
 | `ORCHESTRATOR_TICK` | `0` | Voice/Messaging aren't calling `advance_referral()` after their steps, so chains stop dead. Currently **true**, so it's on |
 | `BACKEND_CLAIM_RANKING` | `0` | Nothing else triggers ranking runs. **Costs one Claude call per run** |
-| `ALLOW_LIVE_INTAKE` | `0` | You're demoing intake. On, "+ New referral" sends a **real WhatsApp** to whatever number was typed, on the team's Twilio. The app has no auth — **leave off on any permanent URL** |
+| `ALLOW_LIVE_INTAKE` | `0` | You're demoing intake. On, "+ New referral" sends a **real WhatsApp** to whatever number was typed, on the team's Twilio. Currently **on**; the UI now confirms the number first |
+| `ALLOW_LIVE_CALLS` | `0` | 🔴 See §2a below. On, a chosen phone-channel service is **really dialled**. Leave off unless you are watching it |
+| `VITE_DEV_TOOLS` | `0` | 🔴 See §2a. **Build-time** (`VITE_*` is inlined by Vite), so `VITE_DEV_TOOLS=1 npm run build`. `?dev=1` works locally without a rebuild |
 | `GEOCODING_ENABLED` | `1` | Off only for offline work; `conftest` forces it off so the suite stays hermetic |
 | `WORKER_ENABLED` | `1` | `0` disables the background poller entirely |
 | `APP_PASSWORD` | *unset* | Any public deploy. HTTP Basic, any username, one shared secret. Unset = no gate, which is what keeps a fresh clone working unconfigured. Webhook seams + `/health` stay open — see [`backend/app_auth.py`](backend/app_auth.py) |

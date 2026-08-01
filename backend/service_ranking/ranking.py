@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from datetime import date
@@ -259,7 +260,70 @@ def run_subjective_scoring(patient: dict, survivors: list[dict]) -> dict[str, di
     )
 
     tool_use = next(block for block in response.content if block.type == "tool_use")
-    return {row["service_id"]: row for row in tool_use.input["scores"]}
+    return _parse_subjective_scores(tool_use.input)
+
+
+def _parse_subjective_scores(tool_input: dict) -> dict[str, dict]:
+    """Read `scores` out of a tool_use input defensively.
+
+    THE ACTUAL CAUSE OF THE /rank-referral 500, root-caused 2026-08-01 by reproducing
+    it against the live DB. It was blamed on NULL lat/long, then on `max_tokens=2048`
+    truncating a 58-candidate prompt; it is neither. With five finalists and
+    `stop_reason='tool_use'` — nothing truncated — the model returned:
+
+        tool_use.input == {"scores": "[{\\"service_id\\": ...}]"}   # a 1052-char STRING
+
+    i.e. the array serialised as a JSON string inside the tool input rather than as a
+    JSON array. `for row in <str>` then iterates CHARACTERS, and the first `row` is
+    `"{"`, so `row["service_id"]` raised `TypeError: string indices must be integers`.
+    Because that propagated, rank_referral fell to the unfiltered fallback, which had
+    its own NOT NULL crash — two independent bugs stacked into one opaque 500.
+
+    Three consecutive calls on the same prompt returned three different shapes — a
+    proper list, that JSON string, and a bare dict — so this is flaky structured output,
+    not one deterministic bug to "fix" upstream. The prompt likely contributes
+    (`need_description` is NULL on patients created through our intake, so the model is
+    asked to score fit against "Not specified."), but the parser has to be tolerant
+    regardless.
+
+    So: accept every shape seen, and skip anything that still isn't a mapping rather than
+    throwing. A malformed row costs one candidate's subjective score (the caller already
+    handles a missing entry with `if result else None`); throwing costs the whole
+    referral, because a bare 500 poisons `rank:<referral_id>` permanently (§7c).
+    """
+    scores = tool_input.get("scores") if isinstance(tool_input, dict) else None
+
+    if isinstance(scores, str):
+        try:
+            scores = json.loads(scores)
+        except json.JSONDecodeError:
+            logger.error("subjective scoring returned an unparseable `scores` string: %r",
+                         scores[:200])
+            return {}
+
+    if isinstance(scores, dict):
+        # Either {service_id: {...}} or a single row returned unwrapped.
+        scores = ([scores] if scores.get("service_id")
+                  else [dict(v, service_id=v.get("service_id", k))
+                        for k, v in scores.items() if isinstance(v, dict)])
+
+    if not isinstance(scores, list):
+        logger.error("subjective scoring returned `scores` of unexpected type %s",
+                     type(scores).__name__)
+        return {}
+
+    out: dict[str, dict] = {}
+    for row in scores:
+        if isinstance(row, str):                      # a doubly-encoded element
+            try:
+                row = json.loads(row)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(row, dict) and row.get("service_id"):
+            out[row["service_id"]] = row
+        else:
+            logger.warning("skipping malformed subjective score row: %r", row)
+    return out
 
 
 def _candidate_reasons(c: dict) -> list[dict]:

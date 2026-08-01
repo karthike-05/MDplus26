@@ -995,6 +995,91 @@ async def create_referral(body: NewReferral) -> dict:
     return {"referral_id": referral_id, "advanced": advanced}
 
 
+# --- Escalations (B2) --------------------------------------------------------
+
+ESCALATION_ACTION = "escalate_to_social_worker"
+
+
+@app.get("/api/escalations")
+async def list_escalations() -> dict:
+    """Every referral that needs a human, with why.
+
+    THE PRODUCT HOLE THIS CLOSES (whats-left B2). `advance_referral` queues
+    `escalate_to_social_worker` to the `social_worker` component on four different
+    paths — consent declined, no eligible resource left, every channel exhausted, and
+    the patient reporting they never used the service. Nothing polls that component
+    *by design*, because a person is supposed to be the poller. But there was no screen,
+    so the person never saw it: a declined referral simply vanished from the board's
+    active groups and sat in a queue nobody could open. The failure mode of a referral
+    tool that loses failures is the exact one this product exists to fix.
+
+    Read-only and derived — an escalation is not new state, it's the open action plus
+    the referral's own `escalation_reason`. Nothing here writes; `resolve` is a separate
+    POST so the two can't be confused.
+    """
+    actions = await db.list_actions(limit=200)
+    open_escalations = [
+        a for a in actions
+        if a.get("action_type") == ESCALATION_ACTION
+        and a.get("action_status") in OPEN_STATUSES
+    ]
+
+    rows = []
+    for a in open_escalations:
+        try:
+            referral = await db.get_referral(a["referral_id"])
+            patient = await db.get_patient(referral["patient_id"])
+        except KeyError:
+            continue
+        rows.append({
+            "action_id": a["id"],
+            "referral_id": a["referral_id"],
+            "patient_name": patient.get("name"),
+            "patient_phone": patient.get("phone"),
+            "need_category": referral.get("need_category"),
+            "service_name": referral.get("service_name"),
+            # The DB's own words for why, which are more specific than the action's.
+            "reason": (referral.get("escalation_reason")
+                       or a.get("input_payload", {}).get("reason")
+                       or a.get("error_message")
+                       or "Needs a social worker"),
+            "status": referral.get("status"),
+            "display_state": _display_state(referral),
+            "queued_at": str(a.get("created_at")) if a.get("created_at") else None,
+        })
+    rows.sort(key=lambda r: r["queued_at"] or "", reverse=True)
+    return {"escalations": rows, "count": len(rows)}
+
+
+class ResolveEscalation(BaseModel):
+    action_id: str
+    note: str | None = None
+
+
+@app.post("/api/escalations/{referral_id}/resolve")
+async def resolve_escalation(referral_id: str, body: ResolveEscalation) -> dict:
+    """Mark an escalation handled offline (the SW called the patient, found another
+    service by hand, etc.) and hand back to the scheduler.
+
+    Closes the action rather than cancelling it — `advance_referral`'s first guard is
+    "any open action -> waiting", so an escalation left open freezes the referral even
+    after a human has dealt with it. Note that the dedup key
+    `escalate:<reason>:<referral>` is dead afterwards either way (§7c); that's correct
+    here, since the same escalation shouldn't re-fire.
+    """
+    try:
+        await db.get_referral(referral_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown referral '{referral_id}'")
+    await db.set_action_status(
+        body.action_id, "completed",
+        result={"resolved_by": "social_worker", "note": body.note})
+    advanced = None
+    if not _owns_transitions():
+        advanced = await db.advance_referral(referral_id)
+    return {"resolved": body.action_id, "advanced": advanced}
+
+
 @app.get("/api/forms")
 async def list_forms() -> dict:
     return {"forms": db.list_forms()}

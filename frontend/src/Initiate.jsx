@@ -186,11 +186,26 @@ export default function Initiate({ onDone, onCancel }) {
       setDraft(null);
     });
 
-  const create = () =>
-    call(async () => {
+  // CONFIRM BEFORE A REAL TEXT GOES OUT. Creating a referral live kicks
+  // advance_referral -> confirm_consent -> twilio, and Messaging's deployed poller sends
+  // a REAL WhatsApp to whatever number is on this form, on the team's account. There was
+  // no confirmation step, so one mistyped digit texted a stranger — and the person
+  // clicking has no way to know the button does that. Naming the number is the point:
+  // a generic "are you sure?" wouldn't catch the typo this exists to catch.
+  const create = () => {
+    const phone = (patient?.phone || "").trim();
+    const ok = window.confirm(
+      `Send a WhatsApp opt-in message to ${phone || "this patient"}?\n\n` +
+      `${patient?.name || "The patient"} will receive a real text asking them to ` +
+      `consent to this referral. Check the number is right — the message goes out ` +
+      `immediately and can't be recalled.`
+    );
+    if (!ok) return;
+    return call(async () => {
       const d = await api.createReferral({ patient_id: patient.id, ...clean(ref) });
       onDone?.(d.referral_id);
     });
+  };
 
   return (
     <div style={s.wrap}>

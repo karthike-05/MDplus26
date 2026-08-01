@@ -64,5 +64,9 @@ export const api = {
   // patient answers the check-in; this is the human stand-in for that.
   patientUtilization: (id, used, note) =>
     post("/api/patient/utilization", { referral_id: id, used, note }),
+  // Escalations (B2) — the SW's queue of referrals the agent couldn't finish.
+  escalations: () => j("/api/escalations"),
+  resolveEscalation: (id, actionId, note) =>
+    post(`/api/escalations/${id}/resolve`, { action_id: actionId, note }),
   pageImageUrl: (formId, page) => `${API}/api/form/${formId}/page/${page}.png`,
 };

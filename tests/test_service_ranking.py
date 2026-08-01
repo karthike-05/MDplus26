@@ -259,3 +259,59 @@ def test_choose_service_unknown_service_is_404(monkeypatch):
         assert getattr(e, "status_code", None) == 404
     else:
         raise AssertionError("expected a 404 for an unknown service")
+
+
+# --- subjective scoring returns three different shapes ------------------------
+# Root-caused live 2026-08-01 by reproducing the /rank-referral 500. It was blamed on
+# NULL lat/long, then on max_tokens truncation; it was neither. With five finalists and
+# stop_reason='tool_use', three consecutive identical calls returned a list, a
+# 1052-char JSON STRING, and a bare dict. Iterating the string yielded characters, so
+# `row["service_id"]` raised TypeError -> fell to the unfiltered fallback -> which had
+# its own NOT NULL crash -> one opaque 500.
+
+def _parse(tool_input):
+    import sys, pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root / "backend" / "service_ranking"))
+    from backend.service_ranking.ranking import _parse_subjective_scores
+    return _parse_subjective_scores(tool_input)
+
+
+ROWS = [
+    {"service_id": "svc_a", "subjective_score": 80, "rationale": "good"},
+    {"service_id": "svc_b", "subjective_score": 20, "rationale": "poor"},
+]
+
+
+def test_subjective_scores_as_a_proper_list():
+    assert _parse({"scores": ROWS})["svc_a"]["subjective_score"] == 80
+
+
+def test_subjective_scores_as_a_json_string():
+    """The shape that actually caused the 500."""
+    import json as _json
+    out = _parse({"scores": _json.dumps(ROWS)})
+    assert set(out) == {"svc_a", "svc_b"}
+    assert out["svc_b"]["subjective_score"] == 20
+
+
+def test_subjective_scores_as_a_dict_keyed_by_service():
+    out = _parse({"scores": {r["service_id"]: r for r in ROWS}})
+    assert set(out) == {"svc_a", "svc_b"}
+
+
+def test_subjective_scores_as_a_single_unwrapped_row():
+    assert set(_parse({"scores": ROWS[0]})) == {"svc_a"}
+
+
+def test_malformed_scores_degrade_to_empty_never_raise():
+    """A bare 500 here poisons rank:<referral_id> permanently (§7c), so losing the
+    subjective layer for one referral beats losing the referral."""
+    for bad in [{"scores": "not json at all"}, {"scores": 42}, {}, None,
+                {"scores": ["{", '"']}]:
+        assert _parse(bad) == {}
+
+
+def test_one_malformed_row_does_not_discard_the_good_ones():
+    out = _parse({"scores": [ROWS[0], "garbage", {"no_service_id": True}, ROWS[1]]})
+    assert set(out) == {"svc_a", "svc_b"}

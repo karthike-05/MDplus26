@@ -6,9 +6,11 @@ import Services from "./Services.jsx";
 import ChooseService from "./ChooseService.jsx";
 import Initiate from "./Initiate.jsx";
 import Integration from "./Integration.jsx";
+import Escalations from "./Escalations.jsx";
 import ReferralDetail from "./ReferralDetail.jsx";
 import { api } from "./api.js";
 import { C } from "./ui.jsx";
+import { DEV_TOOLS } from "./devtools.js";
 
 // ?referral=ref_1001 deep-links to that referral's detail (keeps demo links working).
 const DEEP = new URLSearchParams(location.search).get("referral");
@@ -17,11 +19,15 @@ function App() {
   // view: {name: 'dashboard'|'services'|'initiate'|'detail'|'review', ...params}
   const [view, setView] = useState(DEEP ? { name: "detail", id: DEEP } : { name: "dashboard" });
 
+  // Integration is a bus-debugging panel (dedup keys, unclaimed queues, component
+  // ownership) — engineering-facing, so it rides behind DEV_TOOLS. Escalations is the
+  // opposite: it's the SW's own work queue and belongs in front of everyone.
   const nav = [
     ["dashboard", "Dashboard"],
+    ["escalations", "Escalations"],
     ["services", "Services"],
     ["initiate", "New referral"],
-    ["integration", "Integration"],
+    ...(DEV_TOOLS ? [["integration", "Integration"]] : []),
   ];
 
   return (
@@ -57,6 +63,9 @@ function App() {
         />
       )}
       {view.name === "integration" && <Integration />}
+      {view.name === "escalations" && (
+        <Escalations onOpen={(id) => setView({ name: "detail", id })} />
+      )}
       {view.name === "services" && <Services onStart={(svc) => setView({ name: "initiate", serviceId: svc.id })} />}
       {view.name === "initiate" && (
         <Initiate

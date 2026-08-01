@@ -16,6 +16,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "./api.js";
 import { C, Badge, Btn, RowActions, ChannelsTried, PatientResponse, CHANNEL_LABEL } from "./ui.jsx";
+import { DEV_TOOLS } from "./devtools.js";
 
 const fmtTime = (iso) => {
   if (!iso) return "—";
@@ -141,7 +142,12 @@ export default function Dashboard({ onReview, onOpen, onChoose, onNew }) {
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <DataSource info={dbInfo} onSwitch={switchDb} busy={busy} />
+          {/* POST /api/db swaps the adapter PROCESS-WIDE, so one person clicking
+              "Mock" changes the data source for everyone on the deployment at once and
+              the next visitor sees fixture data with nothing explaining why. A
+              debugging control wired to global mutable state has no business on a
+              public URL — DEV_TOOLS only. */}
+          {DEV_TOOLS && <DataSource info={dbInfo} onSwitch={switchDb} busy={busy} />}
           <Btn tone="ghost" disabled={busy} onClick={load}>{busy ? "…" : "↻ Refresh"}</Btn>
           <Btn onClick={onNew}>+ New referral</Btn>
         </div>
