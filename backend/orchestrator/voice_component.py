@@ -61,6 +61,29 @@ DISPATCH = "contact_service_by_phone"
 HANDLED = (DISPATCH,)
 
 
+def allow_live_calls() -> bool:
+    """Whether this worker may place a REAL outbound phone call. Defaults OFF.
+
+    This guard exists because of who is on the other end. 23 services in the live
+    catalog carry a real phone number and 11 of them have `phone` at priority 1 —
+    913-588-6970 is an actual county health department. A social worker (or a judge
+    handed the URL) picking any of those makes `advance_referral` queue
+    `contact_service_by_phone`, this poller claim it, and Retell dial a real
+    organisation that never agreed to be part of a demo. That is not a billing
+    problem, it is calling strangers.
+
+    OFF means we simply DON'T CLAIM the action — it stays `ready` and visible on the
+    integration board, exactly like the `social_worker` queue that waits on a human.
+    Deliberately not "claim it and mark it failed": a failed action poisons its
+    `attempt:<referral>:<service>:phone` dedup key permanently (§7c), so flipping this
+    flag back on later would find nothing to re-run. Leaving it ready costs nothing and
+    drains the moment calls are enabled.
+
+    Read at call time, not import — `backend.main` imports before `load_dotenv()` (§7d).
+    """
+    return os.getenv("ALLOW_LIVE_CALLS", "0").strip().lower() in ("1", "true", "yes")
+
+
 async def run_once(db: ReferralDB) -> dict | None:
     """Claim and service ONE ready `retell` action. None when there's nothing for us.
 
@@ -73,6 +96,15 @@ async def run_once(db: ReferralDB) -> dict | None:
     action = next((a for a in queue if a.get("action_type") in HANDLED), None)
     if action is None:
         return None
+
+    if not allow_live_calls():
+        # Leave it `ready` — see allow_live_calls(). Reported so the board shows a
+        # withheld call rather than an empty tick that looks like nothing was queued.
+        return {"action": DISPATCH, "referral_id": action["referral_id"],
+                "state": "withheld",
+                "reason": "ALLOW_LIVE_CALLS=0 — a real call to a real organisation was "
+                          "not placed. The action stays ready and will drain when the "
+                          "flag is enabled."}
 
     action_id, referral_id = action["id"], action["referral_id"]
     await db.set_action_status(action_id, "in_progress")

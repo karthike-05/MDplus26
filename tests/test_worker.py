@@ -382,6 +382,7 @@ def test_placed_call_leaves_the_action_blocked_awaiting_the_webhook(monkeypatch)
     on this path, and must NOT mark the action completed (that would let
     advance_referral re-queue the same channel under a now-dead dedup key, §7c)."""
     db, rid = _phone_ready_db()
+    monkeypatch.setenv("ALLOW_LIVE_CALLS", "1")
     monkeypatch.setenv("CALL_AGENT_BASE_URL", "http://call-agent.test")
     with patch("httpx.AsyncClient.post",
                new=AsyncMock(return_value=_mock_call_agent_response({"call_id": "call_123"}))):
@@ -400,6 +401,7 @@ def test_call_agent_unreachable_marks_the_action_failed(monkeypatch):
     """Mirrors actions.py / backend_component.py: a servicing error is recorded on the
     action, never raised -- an action left `in_progress` would deadlock the referral."""
     db, rid = _phone_ready_db()
+    monkeypatch.setenv("ALLOW_LIVE_CALLS", "1")
     monkeypatch.setenv("CALL_AGENT_BASE_URL", "http://call-agent.test")
     import httpx
     with patch("httpx.AsyncClient.post",
@@ -413,6 +415,7 @@ def test_call_agent_unreachable_marks_the_action_failed(monkeypatch):
 
 
 def test_missing_call_agent_base_url_fails_cleanly(monkeypatch):
+    monkeypatch.setenv("ALLOW_LIVE_CALLS", "1")
     db, rid = _phone_ready_db()
     monkeypatch.delenv("CALL_AGENT_BASE_URL", raising=False)
     report = asyncio.run(voice_component.run_once(db))
@@ -425,6 +428,7 @@ def test_escalated_response_closes_the_action_and_advances(monkeypatch):
     webhook is ever coming. Unlike the normal path, this module has to close the
     action and advance the referral itself, since nobody else will."""
     db, rid = _phone_ready_db()
+    monkeypatch.setenv("ALLOW_LIVE_CALLS", "1")
     monkeypatch.setenv("CALL_AGENT_BASE_URL", "http://call-agent.test")
     escalated = {"escalated": True, "reason": "max_attempts_exceeded"}
     with patch("httpx.AsyncClient.post",
@@ -442,6 +446,7 @@ def test_worker_tick_drains_the_retell_queue_too(monkeypatch):
     """End to end through the actual COMPONENTS tuple, not just the module directly --
     confirms voice_component is really registered on the worker's drain loop."""
     db, rid = _phone_ready_db()
+    monkeypatch.setenv("ALLOW_LIVE_CALLS", "1")
     monkeypatch.setenv("CALL_AGENT_BASE_URL", "http://call-agent.test")
     with patch("httpx.AsyncClient.post",
                new=AsyncMock(return_value=_mock_call_agent_response({"call_id": "call_123"}))):
@@ -754,3 +759,65 @@ def test_sweep_still_fires_on_the_first_tick(monkeypatch):
 
     asyncio.run(worker.tick(db))
     assert worker.status.referrals_advanced > 0
+
+
+# --- ALLOW_LIVE_CALLS: the guard between a demo and dialling a stranger -------
+
+def _queued_phone_action() -> tuple[MockReferralDB, str]:
+    db = MockReferralDB()
+    ref = "ref_1003"
+    asyncio.run(db.queue_action(ref, "svc_1", voice_component.DISPATCH, "retell",
+                                f"attempt:{ref}:svc_1:phone", "phone outreach"))
+    return db, ref
+
+
+def test_live_calls_are_withheld_by_default(monkeypatch):
+    """Default OFF. 23 live services carry a real phone number and 11 have `phone` at
+    priority 1, so anyone with the URL picking one of those would make Retell dial an
+    actual county health department. The flag has to be opted into, never defaulted."""
+    monkeypatch.delenv("ALLOW_LIVE_CALLS", raising=False)
+    monkeypatch.setenv("CALL_AGENT_BASE_URL", "http://call-agent.test")
+    db, _ = _queued_phone_action()
+
+    report = asyncio.run(voice_component.run_once(db))
+
+    assert report["state"] == "withheld"
+    assert "ALLOW_LIVE_CALLS" in report["reason"]
+
+
+def test_a_withheld_call_leaves_the_action_ready_not_failed(monkeypatch):
+    """NOT marked failed. A failed action poisons `attempt:<ref>:<svc>:phone`
+    permanently (§7c), so enabling the flag later would find nothing to re-run. Leaving
+    it `ready` means the queue drains the moment calls are turned on."""
+    monkeypatch.delenv("ALLOW_LIVE_CALLS", raising=False)
+    db, _ = _queued_phone_action()
+
+    asyncio.run(voice_component.run_once(db))
+
+    assert [a["action_status"] for a in db._actions] == ["ready"]
+    # ...and it is still claimable, which is the whole point.
+    monkeypatch.setenv("ALLOW_LIVE_CALLS", "1")
+    monkeypatch.setenv("CALL_AGENT_BASE_URL", "http://call-agent.test")
+    with patch.object(voice_component, "_place_call",
+                      new=AsyncMock(return_value={"call_id": "c1"})):
+        assert asyncio.run(voice_component.run_once(db))["state"] == "awaiting_call_outcome"
+
+
+def test_withholding_never_reaches_the_call_agent(monkeypatch):
+    monkeypatch.delenv("ALLOW_LIVE_CALLS", raising=False)
+    monkeypatch.setenv("CALL_AGENT_BASE_URL", "http://call-agent.test")
+    db, _ = _queued_phone_action()
+
+    place = AsyncMock()
+    with patch.object(voice_component, "_place_call", new=place):
+        asyncio.run(voice_component.run_once(db))
+    place.assert_not_awaited()
+
+
+def test_allow_live_calls_is_read_at_call_time_not_import(monkeypatch):
+    """§7d — a module-level os.getenv would evaluate before load_dotenv() and report its
+    default forever. Drive the env var, don't patch the attribute."""
+    monkeypatch.setenv("ALLOW_LIVE_CALLS", "1")
+    assert voice_component.allow_live_calls() is True
+    monkeypatch.setenv("ALLOW_LIVE_CALLS", "0")
+    assert voice_component.allow_live_calls() is False

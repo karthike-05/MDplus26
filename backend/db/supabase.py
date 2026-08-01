@@ -469,6 +469,15 @@ class SupabaseReferralDB(ReferralDB):
             referral_id, service_id,
         )
 
+    async def set_patient_utilization(self, referral_id: str, used: bool) -> None:
+        """Milestone 2 — see SupabaseAPIReferralDB.set_patient_utilization."""
+        pool = await self._p()
+        await pool.execute(
+            f"UPDATE {TABLES['referrals']} SET patient_confirmed_utilization = $2, "
+            "patient_confirmed_at = now(), updated_at = now() WHERE id = $1",
+            referral_id, used,
+        )
+
     async def record_integration_event(self, event: dict) -> None:
         cols = list(event)
         placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))

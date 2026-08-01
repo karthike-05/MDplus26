@@ -152,6 +152,20 @@ class OrgResponse(BaseModel):
         return v
 
 
+class PatientUtilization(BaseModel):
+    """Whether the patient actually used the resource — MILESTONE 2 (§7).
+
+    Posted today by the dashboard's "Patient used it ✓" control; later by Messaging when
+    the patient answers the check-in text. Deliberately NOT folded into `OrgResponse`:
+    the two milestones are different facts about different people, and every incumbent
+    in this space collapses them.
+    """
+
+    referral_id: str
+    used: bool
+    note: str | None = None
+
+
 # --- The durable webhook log (A12) -------------------------------------------
 # `integration_events.provider` is CHECK-constrained to twilio / retell / karthik_form,
 # so an inbound event is logged under the SENDING service's provider name, not ours.
@@ -163,6 +177,36 @@ PROVIDER_FOR_SEAM = {"voice": "retell", "patient_comms": "twilio"}
 # this (action_type, component) pair; this is the first thing that ever queues it.
 NOTIFY_PATIENT_ACTION_TYPE = "notify_patient"
 NOTIFY_PATIENT_COMPONENT = "twilio"
+
+
+# `advance_referral`'s open-action guard treats all three as "someone is still working".
+OPEN_ACTION_STATUSES = ("ready", "in_progress", "blocked")
+
+
+async def _close_open_actions(db: ReferralDB, referral_id: str,
+                              action_types: tuple[str, ...], status: str) -> list[str]:
+    """Close every open action of `action_types` on this referral. Best-effort.
+
+    Used where a human records a signal a teammate's service would normally record: the
+    action that service was holding open has to be closed too, or `advance_referral`'s
+    first guard ("any open action -> waiting") freezes the referral on the very event
+    that should have moved it.
+    """
+    closed: list[str] = []
+    try:
+        actions = await db.list_actions(referral_id)
+    except Exception:                                    # noqa: BLE001 — best effort
+        return closed
+    for a in actions:
+        if (a.get("action_type") in action_types
+                and a.get("action_status") in OPEN_ACTION_STATUSES):
+            try:
+                await db.set_action_status(a["id"], status,
+                                           result={"closed_by": "dashboard_human_signal"})
+                closed.append(a["id"])
+            except Exception:                            # noqa: BLE001
+                pass
+    return closed
 
 
 async def _log_event(db: ReferralDB, *, provider: str, event_type: str, payload: dict,
@@ -402,6 +446,71 @@ def build_router(db: ReferralDB, tools: Tools) -> APIRouter:
         await _log_event(db, provider="karthik_form", event_type=body.decision,
                          payload=payload, referral_id=body.referral_id,
                          external_id=body.external_id)
+        return result
+
+    @router.post("/api/patient/utilization")
+    async def patient_utilization(body: PatientUtilization) -> dict:
+        """Record whether the patient actually USED the resource — MILESTONE 2 (§7).
+
+        The counterpart to `/api/org/response`, and the more important of the two: "the
+        org said yes" is what every incumbent already reports, and "the patient got
+        helped" is the one this product exists to prove.
+
+        Live, the only writer of `referrals.patient_confirmed_utilization` is Messaging's
+        own poller when the patient answers the check-in text. So with that service
+        degraded — or simply with nobody's phone joined to the Twilio sandbox — a live
+        referral reached `enrolled` and stopped, and the loop could not be shown closing
+        on real data at all. Same escape hatch as milestone 1: a human records the signal
+        the webhook will record later, through the same column, so wiring the real leg
+        needs no new code path here.
+
+        We set the column and hand straight back to whichever scheduler owns transitions
+        — `advance_referral` derives `completion_outcome` from it. Deriving that here too
+        would make us a second owner of the same decision.
+        """
+        payload = body.model_dump()
+        try:
+            await db.get_referral(body.referral_id)
+        except KeyError:
+            await _log_event(db, provider="karthik_form", event_type="utilization",
+                             payload=payload, referral_id=None, external_id=None,
+                             status="failed",
+                             error=f"unknown referral '{body.referral_id}'")
+            raise HTTPException(404, f"unknown referral '{body.referral_id}'")
+
+        await db.set_patient_utilization(body.referral_id, body.used)
+        # Close the check-in action this answer resolves, or nothing moves. Milestone 2
+        # is queued as `confirm_service_utilization` -> twilio, and `advance_referral`'s
+        # FIRST guard is "any open action -> waiting" — so setting the column alone left
+        # it returning {"state":"waiting","reason":"An action is already open"} forever
+        # (verified live 2026-08-01). Messaging normally closes it when the patient
+        # replies; a human recording that same answer has to do the same job.
+        # Best-effort: the answer is already stored, and failing here would report the
+        # click as failed when it wasn't.
+        await _close_open_actions(
+            db, body.referral_id,
+            ("confirm_service_utilization", "notify_patient"),
+            "completed" if body.used else "failed",
+        )
+
+        if getattr(db, "kind", type(db).__name__) != "MockReferralDB":
+            result = {"advanced": await db.advance_referral(body.referral_id),
+                      "used": body.used}
+        else:
+            result = await _apply_and_cascade(
+                body.referral_id,
+                status="success" if body.used else "failed",
+                channel="whatsapp",
+                attempt_no=None,
+                data={"patient_utilization": body.used},
+            )
+            result["used"] = body.used
+
+        await _log_event(db, provider="karthik_form",
+                         event_type="utilization_confirmed" if body.used
+                                    else "utilization_declined",
+                         payload=payload, referral_id=body.referral_id,
+                         external_id=None)
         return result
 
     return router

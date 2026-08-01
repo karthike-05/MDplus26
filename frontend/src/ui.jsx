@@ -199,6 +199,30 @@ export function RowActions({ row, onReview, onChange, small, live }) {
       </div>
     );
 
+  // MILESTONE 2, live. `confirmed` means the org accepted; whether the PATIENT used the
+  // resource is the separate, later fact (§7) and the one the pitch turns on. Live, the
+  // only writer of that column is Messaging's poller when the patient answers the
+  // check-in — so with that service degraded, or nobody's number in the Twilio sandbox,
+  // a real referral reached `confirmed` and stopped there and the loop could never be
+  // seen closing on real data. Same human stand-in as "Org accepted ✓" above.
+  if (live && (row.current_state === "confirmed"
+               || row.current_state === "check_in_scheduled"))
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <span style={{ fontSize: 11, color: C.sub }}>Did the patient use it?</span>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          <Btn small={small} disabled={busy}
+               onClick={() => go(() => api.patientUtilization(row.referral_id, true))}>
+            {busy ? "…" : "Patient used it ✓"}
+          </Btn>
+          <Btn small tone="ghost" disabled={busy}
+               onClick={() => go(() => api.patientUtilization(row.referral_id, false))}>
+            Didn’t use it ✕
+          </Btn>
+        </div>
+      </div>
+    );
+
   // Every other live state: `advance_referral()` owns transitions (CLAUDE.md §7a) and
   // /run + /inbound answer 409 by design. Review still works — it's our component either
   // way — but a button whose only possible outcome is an error reads as a broken app, so

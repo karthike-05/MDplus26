@@ -390,6 +390,15 @@ class SupabaseAPIReferralDB(ReferralDB):
             {"selected": True, "candidate_status": "selected", "updated_at": "now()"},
         ).eq("referral_id", referral_id).eq("service_id", service_id).execute()
 
+    async def set_patient_utilization(self, referral_id: str, used: bool) -> None:
+        """Milestone 2 — the same column Messaging's poller writes when the patient
+        answers the check-in. `advance_referral` turns it into `completion_outcome` on
+        its next pass; writing that here too would be a second owner of the decision."""
+        c = await self._c()
+        await c.table(TABLES["referrals"]).update(
+            {"patient_confirmed_utilization": used, "patient_confirmed_at": "now()"},
+        ).eq("id", referral_id).execute()
+
     async def advance_referral(self, referral_id: str) -> dict:
         """Call the DB's own scheduler. It — not us — decides the next step (§7: one
         owner of transitions; here that owner is the database)."""

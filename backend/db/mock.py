@@ -247,6 +247,14 @@ class MockReferralDB:
             elif row.get("candidate_status") == "selected":
                 row["candidate_status"] = "available"
 
+    async def set_patient_utilization(self, referral_id: str, used: bool) -> None:
+        """Milestone 2. `advance_referral` (mirrored above) reads this on the next pass
+        and turns it into `completion_outcome`; setting that here would be a second
+        owner of the same decision."""
+        r = self._referrals[referral_id]
+        r["patient_confirmed_utilization"] = used
+        r["patient_confirmed_at"] = datetime.now(timezone.utc).isoformat()
+
     async def record_integration_event(self, event: dict) -> None:
         """Append-only inbound log. Deduped on (provider, external_id, event_type) only
         when external_id is set — matching Postgres, where NULLs never collide."""

@@ -135,3 +135,16 @@ class ReferralDB(Protocol):
     # different row was chosen, and any later `try_next_resource` would reason from it.
     # CONTRACT TOUCH — announced.
     async def select_candidate(self, referral_id: str, service_id: str) -> None: ...
+
+    # MILESTONE 2 — did the patient actually USE the resource (§7)? Live, the only
+    # writer of `referrals.patient_confirmed_utilization` is Messaging's own poller
+    # (backend/patient_comms/repo.py), when the patient answers the check-in text. So
+    # when that service is down — or nobody's phone is in the Twilio sandbox — a live
+    # referral can reach `enrolled` and never close, and the differentiator the whole
+    # product is built around is undemonstrable on real data.
+    #
+    # This is the same escape hatch `POST /api/org/response` already is for milestone 1
+    # (§7f): a human records the signal that a webhook will record later, through the
+    # same column, so wiring the real leg needs no new code path.
+    # CONTRACT TOUCH — announced.
+    async def set_patient_utilization(self, referral_id: str, used: bool) -> None: ...

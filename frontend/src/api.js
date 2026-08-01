@@ -59,5 +59,10 @@ export const api = {
   // org-email webhook will post to this same endpoint once ORG_BACKEND_URL points here.
   orgResponse: (id, decision, extra = {}) =>
     post("/api/org/response", { referral_id: id, decision, ...extra }),
+  // MILESTONE 2 — the PATIENT actually used it. The loop closing, and the one signal
+  // no incumbent reports. Live, Messaging's poller writes the same column when the
+  // patient answers the check-in; this is the human stand-in for that.
+  patientUtilization: (id, used, note) =>
+    post("/api/patient/utilization", { referral_id: id, used, note }),
   pageImageUrl: (formId, page) => `${API}/api/form/${formId}/page/${page}.png`,
 };
