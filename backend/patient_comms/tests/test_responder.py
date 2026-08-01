@@ -34,3 +34,51 @@ def test_is_enabled_defaults_on(monkeypatch):
     assert responder.is_enabled() is True
     monkeypatch.setenv("RESPONDER", "off")
     assert responder.is_enabled() is False
+
+
+class _FakeBlock:
+    def __init__(self, text): self.type = "text"; self.text = text
+
+class _FakeResp:
+    def __init__(self, text): self.content = [_FakeBlock(text)]
+
+class _FakeClient:
+    def __init__(self, text=None, raises=False):
+        self._text = text; self._raises = raises
+        class _Msgs:
+            def create(_self, **kw):
+                if raises: raise RuntimeError("api down")
+                return _FakeResp(text)
+        self.messages = _Msgs()
+
+_FACTS = {"patient_name": "Sam", "service_type": "transportation",
+          "details": "Scheduled for Tue 2 PM. Pickup: 123 Main St."}
+
+
+def test_disabled_returns_template_verbatim(monkeypatch):
+    monkeypatch.setenv("RESPONDER", "off")
+    out = responder.compose_reply("TEMPLATE", facts=_FACTS, patient_question="?", history=[])
+    assert out == "TEMPLATE"
+
+
+def test_valid_completion_is_returned(monkeypatch):
+    monkeypatch.setenv("RESPONDER", "on")
+    monkeypatch.setattr(responder, "_get_client",
+                        lambda: _FakeClient(text="Your ride is Tue at 2 PM, pickup 123 Main St."))
+    out = responder.compose_reply("TEMPLATE", facts=_FACTS,
+                                  patient_question="what time?", history=[])
+    assert out == "Your ride is Tue at 2 PM, pickup 123 Main St."
+
+
+def test_api_error_falls_back_to_template(monkeypatch):
+    monkeypatch.setenv("RESPONDER", "on")
+    monkeypatch.setattr(responder, "_get_client", lambda: _FakeClient(raises=True))
+    out = responder.compose_reply("TEMPLATE", facts=_FACTS, patient_question="?", history=[])
+    assert out == "TEMPLATE"
+
+
+def test_invalid_completion_falls_back_to_template(monkeypatch):
+    monkeypatch.setenv("RESPONDER", "on")
+    monkeypatch.setattr(responder, "_get_client", lambda: _FakeClient(text="x" * 400))
+    out = responder.compose_reply("TEMPLATE", facts=_FACTS, patient_question="?", history=[])
+    assert out == "TEMPLATE"

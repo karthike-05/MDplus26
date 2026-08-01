@@ -72,3 +72,42 @@ def _render_user_prompt(template_body: str, allowed: dict, patient_question: str
             lines.append(f"- {who}: {m.get('body', '')}")
     lines += ["", f"The patient just said: {patient_question}", "", "Write the reply."]
     return "\n".join(lines)
+
+
+def _get_client():
+    import anthropic  # deferred so RESPONDER=off needs no anthropic dep
+
+    return anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
+
+
+def compose_reply(template_body: str, *, facts: dict, patient_question: str,
+                  history: list[dict]) -> str:
+    if not is_enabled():
+        return template_body
+
+    allowed = _build_allowed_context(facts)
+    try:
+        resp = _get_client().messages.create(
+            model=DEFAULT_MODEL,
+            max_tokens=256,
+            system=_SYSTEM_PROMPT,
+            messages=[{"role": "user",
+                       "content": _render_user_prompt(template_body, allowed,
+                                                       patient_question, history)}],
+        )
+        raw = next(b.text for b in resp.content if b.type == "text")
+    except Exception as e:  # noqa: BLE001 -- never raise into the webhook
+        logger.warning("responder failed (%s); using template", e)
+        _audit.info("model=%s keys=%s q=%r decision=fallback:error",
+                    DEFAULT_MODEL, sorted(allowed), patient_question)
+        return template_body
+
+    clean = _validate(raw)
+    if clean is None:
+        _audit.info("model=%s keys=%s q=%r completion=%r decision=fallback:validation",
+                    DEFAULT_MODEL, sorted(allowed), patient_question, raw)
+        return template_body
+
+    _audit.info("model=%s keys=%s q=%r completion=%r decision=accepted",
+                DEFAULT_MODEL, sorted(allowed), patient_question, clean)
+    return clean
