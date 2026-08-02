@@ -140,7 +140,6 @@ def test_execute_inbound_no_escalation_on_plain_consent_yes(db_session, monkeypa
 
 
 import responder
-import service
 
 
 def test_ack_routes_through_responder_when_enabled(db_session, monkeypatch):
