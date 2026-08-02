@@ -217,7 +217,12 @@ link is real (`changes-2026-08-01.md` §1). On **Rosa**, in order:
 | 2 | Correct a field, **Submit** | Real PDF injected; the correction is written **back** to `service_requests`, so the next fill starts from the fixed value |
 | 3 | The row moves to *Awaiting service response* | One `attempts` row, `status='sent'`. Submitting is **not** the org accepting (§7f) — that distinction is the product |
 | 4 | **Org accepted ✓** | Writes `outcome='enrolled'`; `advance_referral` promotes the referral and queues the check-in |
-| 5 | **Patient used it ✓** | ← **the loop closing.** Milestone 2, on live data. Row lands in *Closed the loop* |
+| 5 | **Patient used it ✓** *(wait ~5s after step 4)* | ← **the loop closing.** Milestone 2, on live data. Row lands in *Closed the loop* |
+
+> ⏱ **Leave a beat between steps 4 and 5.** Accepting queues a `complete_referral`
+> bookkeeping action, and clicking straight through hits the open-action guard — the
+> answer is recorded but the board doesn't move for up to 60s while the worker drains it.
+> A few seconds' pause and it's instant. (`form-failure-paths.md` F9.)
 
 Step 5 is new. Live, the only writer of `patient_confirmed_utilization` is Messaging's
 poller when the patient answers the check-in — so with that service degraded the loop

@@ -183,6 +183,26 @@ rather than a guess.
 
 ---
 
+## 🟢 F9. "Patient used it ✓" needs a beat after "Org accepted ✓"
+
+Not a defect — a race worth knowing before a demo. Accepting on behalf of the org promotes
+the referral to `enrolled` and `advance_referral` queues `complete_referral` to `backend`.
+Clicking **Patient used it ✓** in the next second hits the open-action guard, so the
+response is `{"state": "waiting", "reason": "An action is already open"}` and the board
+doesn't move.
+
+The utilization *is* recorded (`patient_confirmed_utilization = true`); only the
+transition waits. Our worker drains `complete_referral` within one poll (15s) and the
+sweep advances the referral within 60s, after which the row lands in **Closed the loop**
+on its own. Observed and confirmed to self-heal, 2026-08-01.
+
+**On camera: pause a few seconds between the two clicks.** If a fix is wanted later, the
+honest one is for `POST /api/patient/utilization` to also close `complete_referral` —
+`backend` is our component, so it's ours to close — but racing our own worker for it needs
+care, which is why it wasn't done under time pressure.
+
+---
+
 ## 🟢 F8. Two reviewers on the same referral
 
 Nothing serialises `POST /api/submit`. Two SWs with the review screen open both submit;
