@@ -105,6 +105,16 @@ Design guarantees (see CLAUDE.md §7):
 - The reply text itself can carry patient-volunteered PHI → use a HIPAA/BAA
   Anthropic endpoint before real patient traffic.
 
+### Conversational replies (responder)
+
+Inbound replies are answered conversationally: the LLM rephrases the approved
+ack template and answers logistics questions ("what time?", "where?") from a
+live booking read. It is **template-anchored** — the rendered template is the
+content contract and the fallback, so any model/validation failure sends the
+plain template. It never changes state (consent/utilization/escalation stay
+deterministic) and never sees clinical data (a code allowlist limits the prompt
+to name/clinic/resource/service/booking-details). Toggle with `RESPONDER=off`.
+
 ## Still open / needs a team decision
 
 - **No-response escalation queue**: silent-through-day7 patients get
