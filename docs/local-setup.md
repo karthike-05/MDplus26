@@ -77,8 +77,14 @@ If those three pass, your environment is good and anything you break afterwards 
 
 ## 3. UI walkthrough (mock data)
 
-Four tabs: **Dashboard · Services · New referral · Integration**. The data-source pill is
-top-right; it should say **Mock**.
+> **Open `http://localhost:8000/?dev=1` for this walkthrough.** As of 2026-08-01 the
+> **data-source pill** and the **Integration** tab are hidden unless dev tools are on —
+> both are debugging controls, and the pill swaps the DB adapter *process-wide* for every
+> concurrent visitor, so it can't sit on a URL anyone might be handed (CLAUDE.md §2a).
+> `?dev=1` turns them on for your browser only, with no rebuild.
+
+Five tabs: **Dashboard · Escalations · Services · New referral · Integration** (the last
+one only with `?dev=1`). The data-source pill is top-right; it should say **Mock**.
 
 ### 3.1 Dashboard — the thing the product is actually about
 
@@ -234,10 +240,10 @@ Three things to know before writing to it:
 | UI change not showing | Stale bundle — `cd frontend && npm run build`, then hard-refresh (Cmd/Ctrl-Shift-R) |
 | `pytest` fails on `sqlalchemy` | You ran bare `pytest -q`; use `pytest tests -q` |
 | Vite build fails | Node too old — Vite 7 needs 20.19+ / 22.12+ |
-| Board empty on Supabase | Real state — check the Integration tab's blockers |
+| Board empty on Supabase | Real state — check the Integration tab's blockers (`?dev=1`) |
 | Review screen 404s live | `form_templates` isn't seeded for that service: `python -m backend.scripts.seed_form_templates --list` |
 | Row actions say "the DB scheduler drives this live" | Correct — `advance_referral()` owns transitions live, not our buttons |
-| A `409` from `/run` or `/inbound` | Same reason: those drive our *offline* scheduler. Switch the data source to Mock |
+| A `409` from `/run` or `/inbound` | Same reason: those drive our *offline* scheduler. Switch the data source to Mock (`?dev=1`) |
 | Worker says STOPPED | Check `/health`; `WORKER_ENABLED=0` disables it |
 | A flag set in `.env` seems ignored | If it's read at module scope in something `backend.main` imports, it's evaluated *before* `load_dotenv()`. See changes-2026-07-28 §1 |
 

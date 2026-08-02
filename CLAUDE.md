@@ -107,11 +107,13 @@ building. Every one of them was added after finding the app could already do the
 ├─ README.md                       # how to run the slice
 ├─ docs/
 │   ├─ local-setup.md              # clone -> running + a UI walkthrough (start here)
-│   ├─ changes-2026-07-28.md       # latest changes; incl. the Ranking handoff
+│   ├─ changes-2026-08-01.md       # latest changes; the live form walk + 6 root-caused bugs
+│   ├─ changes-2026-07-28.md       # incl. the Ranking handoff
 │   ├─ integration-status.md       # the four-service bus, in detail
 │   ├─ whats-left.md               # the task list, grouped by owner
 │   ├─ demo-walkthrough.md         # running a demo for an audience
 │   ├─ handoff-ranking-candidates.md
+│   ├─ form-failure-paths.md       # the form component's unhardened edges (post-Aug-2)
 │   └─ db-contract.md              # live columns + CHECK constraints
 ├─ contracts/                      # SHARED SOURCE OF TRUTH — freeze early
 │   ├─ models.py                   # FormSchema / FormField / ToolOutcome (Pydantic)
@@ -130,6 +132,8 @@ building. Every one of them was added after finding the app could already do the
 │   │   └─ worker.py               # the runner: drains both, recovers crashed actions
 │   ├─ scripts/
 │   │   ├─ demo_driver.py          # read-only verdict on every LIVE referral (+ demo setup)
+│   │   ├─ seed_demo_services.py   # [Demo] services + an armed demo referral (§2a-safe)
+│   │   ├─ geocode_locations.py    # locations.lat/long from addresses (US Census)
 │   │   └─ seed_form_templates.py  # contracts/schemas/*.json -> form_templates
 │   ├─ tools/
 │   │   └─ fill_form/
@@ -148,7 +152,9 @@ building. Every one of them was added after finding the app could already do the
 ├─ frontend/
 │   ├─ src/ReviewUI.jsx            # per-patient review screen
 │   ├─ src/ChooseService.jsx       # the SW selection gate (§7b)
-│   ├─ src/Integration.jsx         # the shared bus: queue, worker, named blockers
+│   ├─ src/Escalations.jsx         # referrals the agent couldn't finish (B2)
+│   ├─ src/devtools.js             # the VITE_DEV_TOOLS / ?dev=1 switch (§2a)
+│   ├─ src/Integration.jsx         # the shared bus — DEV_TOOLS only (§2a)
 │   └─ mock_form/                  # EMPTY — the web test double was never built
 ├─ sample_forms/                   # PDF fixtures + rendered previews
 ├─ tests/test_fill_form.py         # layered suite (runs with no DB/browser)
@@ -576,12 +582,16 @@ pytest -q               # layered suite
 
 ```bash
 uvicorn backend.main:app --reload           # backend (+ frontend/dist if built)
+                                            # UI at :8000 — add ?dev=1 for dev tools (§2a)
 python -m backend.scripts.make_sample_pdf   # regenerate the PDF fixture
 python run_demo.py                          # headless end-to-end (always the mock)
 pytest tests -q                             # our suite — `pytest -q` also collects
                                             # backend/patient_comms, which needs sqlalchemy
 python -m backend.scripts.demo_driver       # read-only: what the LIVE loop will do next
 python -m backend.scripts.seed_form_templates --list   # form_templates + candidate services
+python -m backend.scripts.seed_demo_services            # DRY RUN: [Demo] services (--yes to write,
+                                                        # --with-referral, --reset-referral, --delete)
+python -m backend.scripts.geocode_locations             # DRY RUN: fill locations.lat/long (--yes)
 cd frontend && npm run dev                  # frontend
 supabase db push                            # apply contracts/db_schema.sql (when using the CLI)
 ```

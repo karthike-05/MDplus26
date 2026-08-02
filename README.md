@@ -1,4 +1,6 @@
-# Catalyst-26 — Referral-to-Completion Agent
+# Relay — Referral-to-Completion Agent
+
+*(repo name `Catalyst-26`; the product is **Relay**)*
 
 An agent that closes the **referral-to-completion** loop for social services: a clinic
 initiates a referral (with patient consent), a backend agent attempts outreach
@@ -20,12 +22,14 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 python run_demo.py      # headless end-to-end (PDF) — always the fixture mock
-pytest tests -q         # layered suite — 123 tests, no DB / browser / network needed
+pytest tests -q         # layered suite — 184 tests, no DB / browser / network needed
 
 # The whole app on one port: the backend serves the built frontend (see the StaticFiles
 # mount at the bottom of backend/main.py), so this is the deployable shape too.
 cd frontend && npm install && npm run build && cd ..
 uvicorn backend.main:app --reload            # app on http://localhost:8000
+                                             # add ?dev=1 for the Integration tab
+                                             # + data-source pill (CLAUDE.md §2a)
 
 # ...or, while editing the UI, run Vite separately:
 cd frontend && npm run dev                   # UI on :5173, API still on :8000

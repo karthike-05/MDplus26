@@ -1,7 +1,24 @@
 # Running the demo — for a group walkthrough
 
-**Updated 2026-07-28.** How to actually show this working when four people own four
+**Updated 2026-08-01.** How to actually show this working when four people own four
 different pieces, and not all of them are ready.
+
+> ### ⚠ Read this first — the UI changed on 2026-08-01
+>
+> Two controls this walkthrough used to depend on are now **hidden by default**: the
+> **data-source pill** (Mock/Supabase) and the **Integration** tab. Both are debugging
+> tools that had no business on a URL anyone might be handed — the pill in particular
+> swaps the adapter *process-wide*, so one click changed the data source for every
+> concurrent visitor (CLAUDE.md §2a).
+>
+> **To run this walkthrough, open the app with `?dev=1`:**
+> **`http://localhost:8000/?dev=1`**. That restores both, for your browser only, with no
+> rebuild. Everything below assumes you did that.
+>
+> Also new since the last revision: an **Escalations** tab (always visible), a **Food
+> assistance** category at intake, and a **"Patient used it ✓"** control that closes
+> milestone 2 on live data. The live form path is now proven end to end — Demo B is a
+> stronger story than this doc used to claim.
 
 The short version: **there are two demos, and you should know which one you're running.**
 Conflating them is how a walkthrough dies — you spend ten minutes debugging someone
@@ -13,7 +30,7 @@ else's unset environment variable in front of the room.
 | Depends on | Nobody. Our repo alone. | Ranking, Voice and Messaging all being ready |
 | Data | Synthetic fixtures | The live Supabase |
 | Orchestrator | Our `scheduler.py` | The DB's `advance_referral()` |
-| Works today | ✅ yes | ✅ with three setup commands (see below) |
+| Works today | ✅ yes | ✅ — and the full loop now closes on live data (2026-08-01) |
 | Use it for | The pitch, the recording, the story | The engineering conversation |
 
 **Run Demo A as the main event.** It is the one that shows the differentiator — a
@@ -33,19 +50,21 @@ The whole walkthrough on one screen. Detail for each step is in the sections bel
 ```bash
 cd frontend && npm run build && cd ..     # backend serves dist/ — one process, one URL
 uvicorn backend.main:app --port 8000 &
-python -m pytest tests -q                 # 114 green, no DB / browser / network
+python -m pytest tests -q                 # 184 green, no DB / browser / network
 python run_demo.py                        # headless: prints the loop closing
 python -m backend.scripts.demo_driver     # read-only: what live will do with each referral
 ```
 
-Open **http://localhost:8000**. Four tabs: **Dashboard · Services · New referral ·
-Integration**. Deep-link any referral with `?referral=<uuid>`.
+Open **http://localhost:8000/?dev=1** (the `?dev=1` matters — see the box at the top).
+Five tabs: **Dashboard · Escalations · Services · New referral · Integration**. Without
+`?dev=1` the last one is hidden, which is the correct default for anyone else. Deep-link
+any referral with `?referral=<uuid>`.
 
 **Demo A — the product (5 min, mock data, always works)**
 
 | # | Do | Say |
 | --- | --- | --- |
-| 1 | Data-source pill top-right → **Use mock** | Fixtures are a deliberate choice: clean, repeatable, nobody else's deploy can break it |
+| 1 | Data-source pill top-right → **Use mock** (needs `?dev=1`) | Fixtures are a deliberate choice: clean, repeatable, nobody else's deploy can break it |
 | 2 | **Dashboard** — three groups, two right-hand columns | "Service accepted" and "Patient response" are *different facts*. findhelp and Unite Us stop at the first |
 | 3 | Transport referral → **Review** | Split screen; click a field, its box lights up on the PDF |
 | 4 | Point at the signature row | No value, "needs your signature" — `human_only` is enforced by `fillable_fields()`, not by asking a model to behave |
@@ -61,6 +80,7 @@ Integration**. Deep-link any referral with `?referral=<uuid>`.
 | 3 | Dashboard → the referral under **Needs you** → **Choose service →** | The SW choosing is what feeds `sw_feedback`, the only signal ranking's subjective layer learns from. Auto-selecting would starve it |
 | 4 | **Pick rank #1** | ⚠ See the warning below — #2 and #4 are phone-channel and will park |
 | 5 | The review screen opens on live data | Same `prepare` → review → `submit` path as Demo A, now driven by `advance_referral()` instead of our scheduler |
+| 6 | **Org accepted ✓** → **Patient used it ✓** | The loop closing on *live* data — new as of 2026-08-01, and the thing worth ending on |
 
 ---
 
@@ -81,7 +101,7 @@ works and is better while editing the UI.)
 Sanity check before anyone is watching:
 
 ```bash
-python -m pytest tests -q          # 114 green, no DB / browser / network
+python -m pytest tests -q          # 184 green, no DB / browser / network
 python run_demo.py                 # headless: prints the loop closing
 curl -s localhost:8000/health      # ok + db mode + worker state
 ```
@@ -91,7 +111,8 @@ curl -s localhost:8000/health      # ok + db mode + worker state
 ## Demo A — the product loop (5 minutes, always works)
 
 The board opens on whichever data source your `.env` selects. **For this demo you want
-Mock.** If the pill in the top right says "Supabase (live)", click **Use mock**.
+Mock.** If the pill in the top right says "Supabase (live)", click **Use mock**. The pill
+only appears with `?dev=1` — see the box at the top of this file.
 
 > Why mock for the product demo: the live referrals are mid-flight test data belonging to
 > the whole team, they don't have a form attached yet, and their state depends on three
@@ -127,7 +148,7 @@ about a second and prints each transition.
 
 ## Demo B — the live integration (the honest part)
 
-Switch the data source to **Supabase (live)** and open the **Integration** tab.
+Switch the data source to **Supabase (live)** and open the **Integration** tab. Both need `?dev=1`.
 
 This screen exists because every failure on the shared bus is *silent*. An action queued
 to a component nobody polls raises nothing. An empty candidate table raises nothing. A
@@ -156,25 +177,66 @@ do with each live referral, and nothing is written:
 python -m backend.scripts.demo_driver
 ```
 
-As of **2026-07-28** it reports three live referrals:
+As of **2026-08-01** it reports four live referrals:
 
 | Patient | State | Verdict |
 | --- | --- | --- |
-| Emily Martinez | `not_started`, consent pending | will queue `confirm_consent → twilio` |
-| **Jordan Ellis** | `ranking`, 4 candidates, 1 open action | **⏸ parked at the SW gate — this is the demo referral** |
-| Aneesh | `waiting_for_consent` but consent *confirmed* | will park at `ranking`; nothing triggers a run (A1b) |
+| **Rosa Delgado (Demo)** `d0000000…b01` | `prepare_online_form` **blocked** | **⏸ armed at the review gate — the safest live demo** |
+| **Jordan Ellis** `c1a1e002…` | `ranking`, 4 candidates, 1 open action | ⏸ parked at the SW gate — use this to show the *ranking* half |
+| Karthik `af536831` | `ranking`, `rank:` key poisoned | ⚠ **broken and will stay broken** — see below |
+| Aneesh `1340bf08` | `waiting_for_consent`, `consent:` key poisoned | ⚠ deadlocked; re-arming fires a real WhatsApp |
+
+**Rosa is the referral to use.** She was seeded by
+`python -m backend.scripts.seed_demo_services --with-referral --yes` and is pointed at
+`[Demo] Metro Lift Non-Emergency Medical Transport`, whose **only** application channel is
+`online_form` — so she cannot trigger a phone call, and her form autofills 11 of 11
+fields from live Supabase. Re-arm between takes with:
+
+```bash
+python -m backend.scripts.seed_demo_services --reset-referral --yes
+```
+
+**Karthik's row will 500 if anyone re-triggers ranking**, and it re-poisons its own dedup
+key each time (§7c). The cause is finally understood — Claude returns the tool's `scores`
+array as a JSON *string* rather than an array, so iterating it yields characters
+(`changes-2026-08-01.md` §8) — and it's fixed in this repo, but `service_ranking` is a
+separate Railway service that hasn't been redeployed. **Don't demo that referral.**
 
 Aneesh's row is worth a mention if someone asks: consent was confirmed and nothing called
-`advance_referral()` afterwards, so it sits with zero open actions and nothing to wake it.
-That is the "does every component advance the referral when it finishes?" question with a
-live specimen attached, not a bug in our code.
+`advance_referral()` afterwards. That is the "does every component advance the referral
+when it finishes?" question with a live specimen attached, not a bug in our code.
 
-### Setting up a live demo (the demo referral is already armed)
+### The live loop closes now — this is new, and it's the story
 
-**Jordan Ellis `c1a1e002-51a1-4f1a-9c11-000000000002` is parked at the SW gate right
-now** — no setup needed. The board shows it under **Needs you** with **Choose service →**.
-Pick one and it dispatches `prepare_online_form` to us, so the review screen opens on
-live data.
+Until 2026-08-01 the live path had never been walked end to end. It has now, and every
+link is real (`changes-2026-08-01.md` §1). On **Rosa**, in order:
+
+| # | Do | What actually happens |
+| --- | --- | --- |
+| 1 | Dashboard → Rosa → **Review & submit** | `prepare()` read live Supabase: 11 of 11 fields autofilled, both signature rows held back as *needs your signature* |
+| 2 | Correct a field, **Submit** | Real PDF injected; the correction is written **back** to `service_requests`, so the next fill starts from the fixed value |
+| 3 | The row moves to *Awaiting service response* | One `attempts` row, `status='sent'`. Submitting is **not** the org accepting (§7f) — that distinction is the product |
+| 4 | **Org accepted ✓** | Writes `outcome='enrolled'`; `advance_referral` promotes the referral and queues the check-in |
+| 5 | **Patient used it ✓** | ← **the loop closing.** Milestone 2, on live data. Row lands in *Closed the loop* |
+
+Step 5 is new. Live, the only writer of `patient_confirmed_utilization` is Messaging's
+poller when the patient answers the check-in — so with that service degraded the loop
+could never be *shown* closing on real data. The button is the same human stand-in that
+*Org accepted ✓* already was for milestone 1, through the same column, so wiring the real
+webhook later needs no new code path.
+
+**To show the ranking half instead, use Jordan** `c1a1e002-51a1-4f1a-9c11-000000000002`,
+parked at the SW gate under **Needs you** with **Choose service →**.
+
+### The Escalations tab (new)
+
+Always visible, no `?dev=1` needed. It's the queue of referrals the agent could not
+finish — consent declined, no eligible service left, every channel exhausted, or the
+patient reporting they never used the service. `advance_referral` has always queued these
+to a `social_worker` component that nothing polls *by design*, because a person is meant
+to be the poller; there was simply no screen, so a declined referral dropped off the board
+into a queue nobody could open. Worth 30 seconds: **a referral tool that silently loses
+its failures is the thing this product replaces.**
 
 > ### ⚠ Pick rank #1
 >
@@ -269,13 +331,13 @@ No separate frontend deploy, and no `ALLOWED_ORIGINS` to maintain.
 
 | Symptom | Cause |
 | --- | --- |
-| Board is empty on Supabase | Real state — check the Integration tab's blockers |
+| Board is empty on Supabase | Real state — check the Integration tab's blockers (`?dev=1`) |
 | Every live row says the same status | Was a real bug (`REFERRAL_COLS` dropped `status`), fixed 2026-07-27 — pull |
 | "no channel configured" on a row | The service has no `service_application_channels` row. `advance_referral` treats it as instantly exhausted, so the referral dead-ends |
 | Review screen 404s live | `form_templates` isn't seeded for that service: `python -m backend.scripts.seed_form_templates --list` |
 | Worker says STOPPED | Check `/health`; `WORKER_ENABLED=0` disables it |
 | Live rows say "the DB scheduler drives this live" | Correct — `advance_referral()` owns transitions there, not our buttons. Review still works |
-| A `409` from `/run` or `/inbound` | Same cause. Those drive our *offline* scheduler; switch the data source to Mock |
+| A `409` from `/run` or `/inbound` | Same cause. Those drive our *offline* scheduler; switch the data source to Mock (`?dev=1`) |
 | Nothing in "Inbound webhooks" | Voice/Messaging haven't set their URL at us, or haven't sent anything |
 | New referral sends no consent text | `ALLOW_LIVE_INTAKE` is off (the default). `/health` reports it. Otherwise: Messaging's poller, or the number never joined the Twilio WhatsApp sandbox |
 | Ranking action fails with a 500 | Patient has NULL `latitude`/`longitude`. Intake geocodes these now — a pre-2026-07-28 patient won't have them. See [changes-2026-07-28](changes-2026-07-28.md#for-ranking-pranav) |
