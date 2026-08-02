@@ -36,9 +36,18 @@ def compute_schedule(scheduled_start_at, now: datetime, *, reminder_lead: timede
     if scheduled_start_at is not None and scheduled_start_at.tzinfo is not None:
         scheduled_start_at = scheduled_start_at.astimezone(timezone.utc).replace(tzinfo=None)
     if scheduled_start_at is None:
-        return {"next_reminder_at": now, "next_verify_at": now + fallback_offset}
+        # No known appointment time -> nothing to "remind" about. Scheduling the
+        # reminder at `now` made the scheduler fire a near-duplicate of the
+        # booking_details text seconds later. Voice never populates
+        # scheduled_start_at (docs/changes-2026-07-31.md), so this null path is the
+        # NORMAL live case -> every referral got a redundant second text. Skip the
+        # reminder; the utilization verify still fires off the fallback offset.
+        return {"next_reminder_at": None, "next_verify_at": now + fallback_offset}
     reminder = scheduled_start_at - reminder_lead
-    return {"next_reminder_at": reminder if reminder > now else now,
+    # If the lead window has already passed, the appointment is imminent/past and a
+    # "coming up" reminder would just repeat what booking_details already said ->
+    # skip it (None) rather than clamp to `now` and fire an immediate duplicate.
+    return {"next_reminder_at": reminder if reminder > now else None,
             "next_verify_at": scheduled_start_at + verify_lag}
 
 

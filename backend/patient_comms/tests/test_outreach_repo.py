@@ -27,13 +27,27 @@ def test_compute_schedule_with_appointment(db_session):
     assert sched["next_verify_at"] == appt + timedelta(days=1)
 
 
-def test_compute_schedule_null_appointment_uses_fallback(db_session):
+def test_compute_schedule_null_appointment_skips_reminder(db_session):
+    # No appointment time -> NO reminder (it would fire immediately as a near-dup
+    # of booking_details). Verify still fires off the fallback offset.
     now = datetime(2026, 7, 20, 9, 0, 0)
     sched = oc.compute_schedule(None, now, reminder_lead=timedelta(days=1),
                                 verify_lag=timedelta(days=1),
                                 fallback_offset=timedelta(days=2))
-    assert sched["next_reminder_at"] == now  # no appt -> remind now
+    assert sched["next_reminder_at"] is None  # no appt -> no reminder
     assert sched["next_verify_at"] == now + timedelta(days=2)
+
+
+def test_compute_schedule_skips_reminder_when_lead_window_passed(db_session):
+    # Appointment is sooner than the reminder lead -> the "coming up" reminder would
+    # just repeat booking_details, so skip it rather than clamp to now.
+    appt = datetime(2026, 7, 20, 15, 0, 0)
+    now = datetime(2026, 7, 20, 9, 0, 0)  # only 6h out, lead is 1 day
+    sched = oc.compute_schedule(appt, now, reminder_lead=timedelta(days=1),
+                                verify_lag=timedelta(days=1),
+                                fallback_offset=timedelta(days=2))
+    assert sched["next_reminder_at"] is None
+    assert sched["next_verify_at"] == appt + timedelta(days=1)  # verify still set
 
 
 def test_compute_schedule_handles_tzaware_booking(db_session):

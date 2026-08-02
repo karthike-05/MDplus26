@@ -48,6 +48,19 @@ def _handle_notify(session, action, repo) -> None:
     booking = repo.get_booking_details(action["referral_id"])
     o = (session.query(PatientOutreach)
          .filter_by(referral_id=action["referral_id"]).first())
+    if o is not None and o.stage not in (Stage.CONSENT, Stage.AWAITING_BOOKING):
+        # Idempotency guard: this referral was already notified (stage advanced past
+        # AWAITING_BOOKING). A re-queued or duplicate notify/confirm_service_utilization
+        # action must NOT re-send booking_details or reset the stage cursor back to
+        # NOTIFIED -- that regresses an in-flight reminder/verify loop and orphans it
+        # (the scheduler's nudge/escalate tracks filter on stage). Just close the action
+        # so the queue doesn't stall, and leave state untouched.
+        conn = session.connection()
+        repo.finish_action(action["id"], {"notified": True, "skipped": "already_notified"}, conn=conn)
+        session.commit()
+        logger.info("notify skipped for %s: already at stage=%s",
+                    action["referral_id"], o.stage.value)
+        return
     if o is None:
         o = PatientOutreach(referral_id=action["referral_id"], patient_phone=patient["phone"])
         session.add(o); session.flush()

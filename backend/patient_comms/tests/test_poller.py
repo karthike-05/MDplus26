@@ -50,7 +50,9 @@ def test_confirm_consent_creates_row_and_holds_action(db_session, monkeypatch):
 
 def test_notify_patient_sends_and_schedules(db_session, monkeypatch):
     _patch_provider(monkeypatch)
-    booking = {"scheduled_start_at": datetime(2026, 8, 1, 14, 0),
+    # Far-future appointment so the reminder lead window has NOT passed -> a reminder
+    # IS scheduled (deterministic regardless of wall-clock / timescale).
+    booking = {"scheduled_start_at": datetime(2027, 6, 1, 14, 0),
                "organization_name": "ModivCare", "confirmation_number": "ABC",
                "pickup_address": "123 Main", "patient_instructions": "Bring ID"}
     db_session.add(PatientOutreach(referral_id="r-2", patient_phone="+15551230001",
@@ -83,6 +85,26 @@ def test_confirm_service_utilization_routes_to_notify(db_session, monkeypatch):
     assert counts["notify"] == 1 and r.notified == ["r-5"] and r.finished == ["a-5"]
     row = db_session.query(PatientOutreach).filter_by(referral_id="r-5").one()
     assert row.stage == Stage.NOTIFIED and row.next_verify_at is not None
+
+
+def test_duplicate_notify_is_idempotent_and_does_not_regress_stage(db_session, monkeypatch):
+    # A second notify/confirm_service_utilization action for an already-notified
+    # referral must NOT re-send booking_details or reset the stage cursor (which
+    # would orphan the in-flight verify loop). It just closes the action.
+    _patch_provider(monkeypatch)
+    verify_at = datetime(2027, 6, 3, 14, 0)
+    db_session.add(PatientOutreach(referral_id="r-dup", patient_phone="+15551239999",
+                                   stage=Stage.VERIFYING, next_verify_at=verify_at))
+    db_session.commit()
+    r = _FakeRepo([{"id": "a-dup", "referral_id": "r-dup", "service_id": "svc-1",
+                    "action_type": "confirm_service_utilization", "input_payload": {}}],
+                  {**_PATIENT, "phone": "+15551239999"}, None)
+    poller.run_action_poll(db_session, repo=r)
+    row = db_session.query(PatientOutreach).filter_by(referral_id="r-dup").one()
+    assert row.stage == Stage.VERIFYING          # NOT regressed to NOTIFIED
+    assert row.next_verify_at == verify_at       # verify schedule untouched
+    assert r.notified == []                       # send path skipped (no re-send)
+    assert r.finished == ["a-dup"]                # action still closed (queue not stalled)
 
 
 class _FlakyFinishRepo(_FakeRepo):
