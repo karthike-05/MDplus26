@@ -232,10 +232,20 @@ Every tool returns this and writes an `outreach_attempts` row. The scheduler onl
 
 ### 5c. Form schema JSON (serves web AND pdf)
 
-One shape for both targets. Every field carries `fill_policy` (`auto` / `review` / `human_only`), `source`, `maxlength`, `format`, `required`. The only per-target difference:
+One shape for both targets. Every field carries `fill_policy` (`auto` / `review` /
+`human_only`), `source`, `maxlength`, `format`, `required`. The only per-target difference:
 
 - **web** fields carry a `selector`.
 - **pdf** fields carry `page` + `rect`.
+
+> **`format` is not cosmetic — it's the type contract with the shared DB.** The vocabulary
+> is `date` / `phone` / `email` / `time` (`fill_form/validation.py`). It does two jobs:
+> `validate_field` rejects a malformed value *before* injection, and
+> `service_request_writeback` normalises through the same key on the way out. That second
+> job is why a missing `format` is a real bug and not a nicety — `appointment_time` had
+> none, so a reviewer's `2:45 PM` passed validation (7 chars, under an 8-char
+> `maxlength`) and only failed at the `time` column, *after* the PDF was injected. A
+> field whose `source` points at a typed column MUST declare its `format`.
 
 Full definition: [`contracts/models.py`](contracts/models.py) (`FormSchema` / `FormField`),
 with [`contracts/schemas/transport_intake_pdf.json`](contracts/schemas/transport_intake_pdf.json)
@@ -263,9 +273,33 @@ prepare(schema, patient)  -> map_values -> validate -> {values, needs_attention,
                                                         # this is the review-UI payload
 
 submit(referral_id, schema, reviewed_values, db)
+    -> re-validate  ->  needs_human, nothing injected      # malformed values never ship
     -> get_injector(target_type).inject(...)   # PdfInjector | WebInjector
+    -> write reviewed values back to service_requests      # guarded; see below
     -> ToolOutcome (+ db.record_attempt)
 ```
+
+**`needs_human` is not a failed outreach — it's an unfinished review, and the difference
+is load-bearing.** Re-validation rejecting a value means nothing was injected and nothing
+reached the service. So `POST /api/submit` deliberately does *none* of the three things it
+does on success:
+
+| | on `success` | on `needs_human` |
+| --- | --- | --- |
+| shared `attempts` row | written | **not** written — `advance_referral` counts these against a three-attempt cap and treats a channel with a row as *spent* |
+| the open form action | closed `completed` | **left `blocked`** — which is exactly what blocked means (awaiting human review) |
+| `advance_referral()` | called | **not** called — nothing changed |
+
+Doing any of them made one bad date abandon the service the referral was about to apply
+to, with the retry path already dead: the closed action poisons its dedup key (§7c) so
+nothing can re-queue it. See `docs/form-failure-paths.md` F1.
+
+**The write-back is guarded and must stay guarded.** It runs *after* injection, so if it
+raises and escapes, the PDF is out but no `ToolOutcome` is recorded, the action never
+closes, the open-action guard freezes the referral, and the reviewer is told their submit
+failed. It reports into `outcome.data["writeback_failed"]` instead. This is the same shape
+as the `save_call_outcome` bug (`changes-2026-07-31` §2) — **bookkeeping must never roll
+back a side effect that already left the building.**
 
 - **PdfInjector** — overlays text at each field's `rect` (PyMuPDF). Flat digital PDFs and scanned PDFs fill identically once a rect is verified.
 - **WebInjector** — ⚠ **written but never run.** Fills by `selector` (Playwright),

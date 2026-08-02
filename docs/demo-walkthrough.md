@@ -50,7 +50,7 @@ The whole walkthrough on one screen. Detail for each step is in the sections bel
 ```bash
 cd frontend && npm run build && cd ..     # backend serves dist/ — one process, one URL
 uvicorn backend.main:app --port 8000 &
-python -m pytest tests -q                 # 184 green, no DB / browser / network
+python -m pytest tests -q                 # 190 green, no DB / browser / network
 python run_demo.py                        # headless: prints the loop closing
 python -m backend.scripts.demo_driver     # read-only: what live will do with each referral
 ```
@@ -101,7 +101,7 @@ works and is better while editing the UI.)
 Sanity check before anyone is watching:
 
 ```bash
-python -m pytest tests -q          # 184 green, no DB / browser / network
+python -m pytest tests -q          # 190 green, no DB / browser / network
 python run_demo.py                 # headless: prints the loop closing
 curl -s localhost:8000/health      # ok + db mode + worker state
 ```

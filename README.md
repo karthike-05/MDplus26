@@ -22,7 +22,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 python run_demo.py      # headless end-to-end (PDF) — always the fixture mock
-pytest tests -q         # layered suite — 184 tests, no DB / browser / network needed
+pytest tests -q         # layered suite — 190 tests, no DB / browser / network needed
 
 # The whole app on one port: the backend serves the built frontend (see the StaticFiles
 # mount at the bottom of backend/main.py), so this is the deployable shape too.
