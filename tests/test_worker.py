@@ -19,6 +19,7 @@ import pytest
 
 from backend.db.mock import MockReferralDB
 from backend.orchestrator import actions, backend_component, voice_component, worker
+from backend.tools import send_email as send_email_mod
 
 
 def _consenting_db():
@@ -609,11 +610,18 @@ def test_claiming_ranking_without_a_ranking_url_refuses_rather_than_faking_it(mo
     assert "SERVICE_RANKING_BASE_URL" in report["error"]
 
 
-def test_email_action_writes_a_shared_attempt():
-    db = _consenting_db()
+def _queue_email_action(db):
     asyncio.run(db.queue_action("ref_1001", "svc_capmetro", "contact_service_by_email",
                                 "backend", "email:ref_1001", "email the service",
                                 {"attempt_number": 2}))
+
+
+def test_email_action_writes_a_shared_attempt(monkeypatch):
+    """With a provider configured, the email path records a normal sent attempt."""
+    monkeypatch.setenv("RESEND_API_KEY", "re_test")
+    db = _consenting_db()
+    _queue_email_action(db)
+
     report = asyncio.run(backend_component.run_once(db))
 
     assert report["result"]["sent"] is True
@@ -621,6 +629,27 @@ def test_email_action_writes_a_shared_attempt():
     assert row["channel"] == "email" and row["attempt_number"] == 2
     # attempts.provider is CHECK-constrained and has no `backend` value.
     assert row["provider"] == "internal"
+
+
+def test_email_action_with_no_provider_does_not_claim_a_send(monkeypatch):
+    """`send_email` is a stub until a provider is wired (whats-left B3), and the live bus
+    reaches it with no human involved — advance_referral picks the email channel from
+    service_application_channels by priority, and 12 services carry one. It used to
+    record a plain success, so the referral moved to "awaiting service response" for a
+    message that was never composed. It must land in the SW's escalations queue instead.
+    """
+    for name in send_email_mod.PROVIDER_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    db = _consenting_db()
+    _queue_email_action(db)
+
+    report = asyncio.run(backend_component.run_once(db))
+
+    assert report["result"]["sent"] is False
+    assert report["result"]["stub"] is True
+    row = db.shared_attempts[0]
+    assert row["channel"] == "email"
+    assert row["outcome"] == "needs_human_followup", "must not read as a delivered email"
 
 
 def test_orchestrator_tick_is_opt_in(monkeypatch):

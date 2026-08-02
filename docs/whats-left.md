@@ -426,7 +426,7 @@ Same items, grouped by owner. Roles per `CLAUDE.md` §4.
 | A11 | Get one ground-transport service an `online_form` channel row | 🔴 Without it the form component **never fires** on a live referral. |
 | B1 | ❌ **Cut 2026-08-01.** Online-application component + its `mock_form` fixture and web schema | Deferred on time. `WebInjector` has never run — don't describe web as working. |
 | B2 | ✅ **Done 2026-08-01.** Escalations queue in the UI | `GET /api/escalations` + resolve; `Escalations.jsx`. |
-| B3 | Wire a provider behind `send_email` | Now reachable via `contact_service_by_email`, but still a stub that records without sending. |
+| B3 | Wire a provider behind `send_email` | Still a stub — but it now reports `needs_human` and lands in Escalations instead of claiming a phantom send. Set `RESEND_API_KEY` / `SMTP_URL` / `EMAIL_PROVIDER_URL` and fill the TODO; all callers already wired. Free tiers cover demo volume. |
 | B4, B8, B9, B12 | Cold path; observability; retry/dead-letter; live-mode tests | Post-Aug-2 hardening. |
 
 ### Whole team (decide together, quickly)

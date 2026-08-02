@@ -158,6 +158,11 @@ function summarize(data) {
   if (data.event) return `patient event: ${String(data.event).replace(/_/g, " ")}`;
   if (data.reply_text) return `patient replied “${data.reply_text}”`;
 
+  // Never render a bare "email sent" — `send_email` is a stub until a provider is
+  // configured (whats-left B3), and the old line reported a phantom send for a message
+  // that was never composed. The tool now says needs_human in that case; this makes the
+  // timeline say the same thing rather than leaving the SW to infer it.
+  if (data.sent === false && data.stub) return "not sent — no email provider configured";
   if (data.sent) return "email sent";
   const keys = Object.keys(data).filter((k) => k !== "stub");
   return keys.map((k) => `${k}: ${JSON.stringify(data[k])}`).join(" · ");
