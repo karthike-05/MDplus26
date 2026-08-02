@@ -13,9 +13,10 @@
  * attempt followed by a form attempt shows as two chips.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "./api.js";
 import { C, Badge, Btn, RowActions, ChannelsTried, PatientResponse, CHANNEL_LABEL } from "./ui.jsx";
+import { DEV_TOOLS } from "./devtools.js";
 
 const fmtTime = (iso) => {
   if (!iso) return "—";
@@ -40,6 +41,7 @@ const GROUPS = [
     accent: C.warn,
     match: (r) =>
       r.needs_attention ||
+      r.awaiting_sw_selection ||
       (r.current_state === "outreach_in_progress" && r.outreach_channel === "form"),
   },
   {
@@ -58,26 +60,47 @@ const GROUPS = [
   },
 ];
 
-export default function Dashboard({ onReview, onOpen, onNew }) {
+export default function Dashboard({ onReview, onOpen, onChoose, onNew }) {
   const [rows, setRows] = useState(null);
   const [dbInfo, setDbInfo] = useState(null);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
 
-  const load = async () => {
-    setBusy(true);
+  // `quiet` polls in the background without touching `busy` — otherwise every tick
+  // would flip the buttons to their disabled "…" state and the board would look like
+  // it's constantly reloading.
+  const load = async (quiet = false) => {
+    if (!quiet) setBusy(true);
     try {
       const d = await api.dashboard();
       setRows(d.rows);
       setDbInfo(d.db ?? (await api.dbMode()));
       setError(null);
     } catch (e) {
-      setError(String(e));
+      // A failed background poll is not worth blanking a board that's already
+      // rendering. Only a foreground load surfaces the error screen.
+      if (!quiet) setError(String(e));
     } finally {
-      setBusy(false);
+      if (!quiet) setBusy(false);
     }
   };
-  useEffect(() => { load(); }, []);
+
+  // Everything that moves a referral is asynchronous and happens off-screen — the
+  // worker drains actions every 15s, and Voice/Messaging post back whenever their call
+  // or text lands. Without a poll the SW sees a frozen board and assumes nothing
+  // happened. Integration.jsx already does this at 4s; the dashboard is a heavier query,
+  // so 5s, and only while the tab is actually visible.
+  const timer = useRef(null);
+  useEffect(() => {
+    load();
+    const tick = () => { if (!document.hidden) load(true); };
+    timer.current = setInterval(tick, 5000);
+    document.addEventListener("visibilitychange", tick);
+    return () => {
+      clearInterval(timer.current);
+      document.removeEventListener("visibilitychange", tick);
+    };
+  }, []);
 
   const switchDb = async () => {
     const next = dbInfo?.mode === "supabase" ? "mock" : "supabase";
@@ -119,7 +142,12 @@ export default function Dashboard({ onReview, onOpen, onNew }) {
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <DataSource info={dbInfo} onSwitch={switchDb} busy={busy} />
+          {/* POST /api/db swaps the adapter PROCESS-WIDE, so one person clicking
+              "Mock" changes the data source for everyone on the deployment at once and
+              the next visitor sees fixture data with nothing explaining why. A
+              debugging control wired to global mutable state has no business on a
+              public URL — DEV_TOOLS only. */}
+          {DEV_TOOLS && <DataSource info={dbInfo} onSwitch={switchDb} busy={busy} />}
           <Btn tone="ghost" disabled={busy} onClick={load}>{busy ? "…" : "↻ Refresh"}</Btn>
           <Btn onClick={onNew}>+ New referral</Btn>
         </div>
@@ -152,12 +180,30 @@ export default function Dashboard({ onReview, onOpen, onNew }) {
                     <tr key={r.referral_id} style={s.tr}>
                       <td style={s.tdName} onClick={() => onOpen(r.referral_id)}>{r.patient_name}</td>
                       <td style={s.td} onClick={() => onOpen(r.referral_id)}>
-                        {r.service_name || "—"}
-                        <div style={{ fontSize: 11, color: C.sub, marginTop: 2 }}>
-                          via {CHANNEL_LABEL[r.outreach_channel] || r.outreach_channel}
-                        </div>
+                        {/* No service yet is a distinct state from a service with no
+                            channel — conflating them made a referral waiting on the SW
+                            read as a misconfigured one. */}
+                        {r.awaiting_sw_selection ? (
+                          <>
+                            <span style={{ color: C.sub }}>not chosen yet</span>
+                            <div style={{ fontSize: 11, color: C.warn, marginTop: 2 }}>
+                              ranked shortlist ready
+                            </div>
+                          </>
+                        ) : (
+                          <>
+                            {r.service_name || "—"}
+                            <div style={{ fontSize: 11, color: C.sub, marginTop: 2 }}>
+                              via {CHANNEL_LABEL[r.outreach_channel] || r.outreach_channel}
+                            </div>
+                          </>
+                        )}
                       </td>
-                      <td style={s.td}><Badge state={r.current_state} /></td>
+                      <td style={s.td}>
+                        {r.awaiting_sw_selection
+                          ? <Badge state="awaiting_sw_selection" />
+                          : <Badge state={r.current_state} />}
+                      </td>
                       <td style={s.td}><ChannelsTried channels={r.channels_tried} count={r.attempt_count} /></td>
                       <td style={s.td}><PatientResponse response={r.patient_response} /></td>
                       <td style={s.td}>
@@ -167,12 +213,20 @@ export default function Dashboard({ onReview, onOpen, onNew }) {
                       </td>
                       <td style={{ ...s.td, color: C.sub, fontSize: 12 }}>{fmtTime(r.updated_at)}</td>
                       <td style={s.td}>
-                        {dbInfo?.mode === "supabase"
-                          // Live, advance_referral() owns the workflow (§7a) — our run /
-                          // simulated-inbound buttons are not the driver there, and
-                          // offering them would imply a control we don't have.
+                        {/* The SW selection gate is a REAL action in both modes — the
+                            referral is parked waiting for exactly this person, so it
+                            takes precedence over the "driven by the DB" note below. */}
+                        {r.awaiting_sw_selection
+                          ? <Btn small tone="ok" onClick={() => onChoose(r.referral_id)}>
+                              Choose service →
+                            </Btn>
+                          : dbInfo?.mode === "supabase"
+                          // Otherwise, live, advance_referral() owns the workflow (§7a) —
+                          // our run / simulated-inbound buttons are not the driver there,
+                          // and offering them would imply a control we don't have.
                           ? <span style={{ fontSize: 11, color: C.sub }}>driven by the DB scheduler</span>
-                          : <RowActions row={r} onReview={onReview} onChange={load} small />}
+                          : <RowActions row={r} onReview={onReview} onChange={load} small
+                                        live={dbInfo?.mode === "supabase"} />}
                       </td>
                     </tr>
                   );

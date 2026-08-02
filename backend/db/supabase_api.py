@@ -48,6 +48,8 @@ class SupabaseAPIReferralDB(ReferralDB):
         self._key = service_key
         self._client = None
         self._schemas = _load_schemas(SCHEMA_DIR)  # file-authoritative (§5c)
+        self._form_ids: dict[str, str] = {}        # service_id -> form_templates.name
+        self._service_info_cache: dict[str, dict] = {}   # service_id -> name + channel
 
     async def _c(self):
         if self._client is None:
@@ -72,7 +74,81 @@ class SupabaseAPIReferralDB(ReferralDB):
             REFERRAL_COLS["id"], referral_id).limit(1).execute()
         if not res.data:
             raise KeyError(referral_id)
-        return _to_ours(res.data[0], REFERRAL_COLS)
+        return await self._decorate(_to_ours(res.data[0], REFERRAL_COLS))
+
+    async def _decorate(self, referral: dict) -> dict:
+        """Fill in the three fields `referrals` has no column for.
+
+        `service_name`, `outreach_channel` and `form_id` are all real parts of our
+        contract that the live schema keeps elsewhere — on `services`,
+        `service_application_channels` and `form_templates` respectively (see the None
+        entries in REFERRAL_COLS). Resolving them here rather than at each call site is
+        what lets the dashboard, the review route and `fill_form` stay identical across
+        the mock and the live DB. Left undone, the board renders every live referral with
+        a blank service and channel, which reads as missing data rather than a missing
+        join.
+        """
+        service_id = referral.get("service_id")
+        referral["form_id"] = await self._resolve_form_id(service_id)
+        info = await self._service_info(service_id)
+        referral["service_name"] = info.get("name")
+        referral["outreach_channel"] = info.get("preferred_channel")
+        return referral
+
+    async def _service_info(self, service_id: str | None) -> dict:
+        """Name + preferred channel for a service. `preferred_channel` is the
+        lowest-`priority` row in `service_application_channels` — the same ordering
+        `advance_referral()` step 10 uses to choose a channel, so the UI shows what the
+        orchestrator will actually try next rather than a separate guess."""
+        if not service_id:
+            return {}
+        if service_id in self._service_info_cache:
+            return self._service_info_cache[service_id]
+
+        c = await self._c()
+        svc = await c.table(TABLES["social_services"]).select("name").eq(
+            "id", service_id).limit(1).execute()
+        chans = await c.table("service_application_channels").select(
+            "channel,priority").eq("service_id", service_id).order("priority").execute()
+        info = {
+            "name": svc.data[0]["name"] if svc.data else None,
+            # None when the service has NO channel row at all — which is a real and
+            # important state: advance_referral treats it as instantly exhausted.
+            "preferred_channel": chans.data[0]["channel"] if chans.data else None,
+        }
+        self._service_info_cache[service_id] = info
+        return info
+
+    async def _resolve_form_id(self, service_id: str | None) -> str | None:
+        """Which form schema this referral's service uses.
+
+        `referrals` has NO `form_id` column — the live schema keeps that association on
+        `form_templates.service_id` instead, which is the better design (a form belongs
+        to a service, not to each referral). Everything downstream still reads
+        `referral["form_id"]`, so the join happens here rather than rippling through
+        fill_form, the review route and the UI.
+
+        Returns None when the service has no template. That's a real state, not an
+        error: `form_templates` is seeded per service (A6,
+        `backend.scripts.seed_form_templates`), and until a service has one, its
+        referrals simply have no form to fill. The review route turns that into a 404
+        with an actionable message rather than a KeyError on `None`.
+        """
+        if not service_id:
+            return None
+        if service_id in self._form_ids:
+            return self._form_ids[service_id]
+
+        c = await self._c()
+        res = await c.table("form_templates").select("name").eq(
+            "service_id", service_id).eq("active", True).order(
+            "version", desc=True).limit(1).execute()
+        form_id = res.data[0]["name"] if res.data else None
+        # Only cache hits: a miss is very likely "not seeded yet", and caching that
+        # would mean a seed run doesn't take effect until the process restarts.
+        if form_id is not None:
+            self._form_ids[service_id] = form_id
+        return form_id
 
     async def get_form_schema(self, form_id: str) -> FormSchema:
         return self._schemas[form_id]  # from JSON, not the DB (§5c)
@@ -80,27 +156,35 @@ class SupabaseAPIReferralDB(ReferralDB):
     # --- Writes ---------------------------------------------------------------
 
     async def record_attempt(self, outcome: ToolOutcome) -> None:
-        """Idempotent upsert on ``attempt_id`` (§10). Needs the UNIQUE constraint on
-        that column (docs/db-contract.md); PostgREST's on_conflict relies on it."""
-        c = ATTEMPT_COLS
-        row = {
-            c["attempt_id"]: outcome.attempt_id,
-            c["referral_id"]: outcome.referral_id,
-            c["channel"]: outcome.channel,
-            c["status"]: outcome.status,
-            c["from_state"]: outcome.from_state,
-            c["data"]: outcome.data,     # dict -> jsonb (PostgREST serializes)
-            c["error"]: outcome.error,
-        }
-        client = await self._c()
-        await client.table(TABLES["outreach_attempts"]).upsert(
-            row, on_conflict=c["attempt_id"]).execute()
+        """No-op against the live DB, on purpose — the same call as `set_state` (§7a).
+
+        Every tool ends by calling this (`fill_form.submit`, `notify_patient`,
+        `send_email`, `make_phone_call`), which is right offline: it writes the
+        `outreach_attempts` row in OUR ToolOutcome vocabulary. Live, that row is written
+        instead by `record_shared_attempt` in THEIR vocabulary — translated channel,
+        `attempt_number`, `outcome` enum — from `actions.py`, `backend_component.py`,
+        `inbound.py` and `main.py`'s submit route. Doing both writes the same event twice.
+
+        That is not merely redundant, it is corrupting. `advance_referral()` picks the
+        next channel with `not exists(select 1 from attempts where ... a.channel =
+        ch.channel)` and enforces the three-attempt cap by counting these rows, so an
+        extra row silently burns a channel. Our `channel='form'` isn't even in
+        `attempts_channel_check` (online_form/phone/email/sms/whatsapp), and
+        `attempt_number` is NOT NULL with no default.
+
+        This used to be a broken write rather than a no-op: `attempt_id` and `from_state`
+        both map to None, so the row dict collapsed onto one literal `None` key and
+        `on_conflict=None` went to PostgREST as the string "null" — PGRST204 on every
+        call. Nothing caught it because the worker path never comes through here; only
+        `POST /api/submit` (the review UI) does, and it had never been run live.
+        """
+        return None
 
     async def set_state(self, referral_id: str, state: str) -> None:
-        c = await self._c()
-        await c.table(TABLES["referrals"]).update(
-            {REFERRAL_COLS["current_state"]: state}).eq(
-            REFERRAL_COLS["id"], referral_id).execute()
+        """No-op against the live DB, on purpose (§7a) — see SupabaseReferralDB.set_state.
+        There is no `current_state` column and there must never be one; `advance_referral()`
+        owns transitions live."""
+        return None
 
     # --- Intake front door ----------------------------------------------------
 
@@ -124,10 +208,11 @@ class SupabaseAPIReferralDB(ReferralDB):
         return str(res.data[0][PATIENT_COLS["id"]])
 
     async def create_referral(self, patient_id: str, form_id: str, **extra) -> str:
+        # `form_id` / `current_state` have no live column (see REFERRAL_COLS): the form
+        # comes from form_templates.service_id, and a new referral starts at their own
+        # default `status='not_started'`.
         row = {
             REFERRAL_COLS["patient_id"]: patient_id,
-            REFERRAL_COLS["form_id"]: form_id,
-            REFERRAL_COLS["current_state"]: "created",  # §7
             **_to_theirs(extra, REFERRAL_COLS),
         }
         c = await self._c()
@@ -152,7 +237,7 @@ class SupabaseAPIReferralDB(ReferralDB):
     async def list_referrals(self) -> list[dict]:
         c = await self._c()
         res = await c.table(TABLES["referrals"]).select("*").execute()
-        return [_to_ours(r, REFERRAL_COLS) for r in res.data or []]
+        return [await self._decorate(_to_ours(r, REFERRAL_COLS)) for r in res.data or []]
 
     async def list_attempts(self, referral_id: str) -> list[dict]:
         c = await self._c()
@@ -176,11 +261,39 @@ class SupabaseAPIReferralDB(ReferralDB):
         return dict(res.data[0]) if res.data else {}
 
     async def save_service_request(self, referral_id: str, fields: dict) -> None:
+        """Update the newest row for this referral, or INSERT one if none exists yet.
+
+        Used two ways: intake creates the row up front with whatever it collected
+        (pickup_address, requested_date/time), and `fill_form.submit()` writes reviewed
+        values back afterwards. Before this was a bare UPDATE, so a referral with no row
+        yet (B13 — nothing created one) silently dropped every write-back: 0 rows
+        matched, no error, and the "first fill is manual, every later one autofills"
+        promise (CLAUDE.md §6a) was false on live data. `request_status`/`patient_id`
+        are NOT NULL with no default, so the insert branch fills them defensively even
+        when the caller (fill_form) doesn't pass them.
+        """
         if not fields:
             return
         c = await self._c()
-        await c.table(TABLES["service_requests"]).update(fields).eq(
-            "referral_id", referral_id).execute()
+        existing = await c.table(TABLES["service_requests"]).select("id").eq(
+            "referral_id", referral_id).limit(1).execute()
+        if existing.data:
+            await c.table(TABLES["service_requests"]).update(fields).eq(
+                "referral_id", referral_id).execute()
+            return
+        row = {"referral_id": referral_id, "request_status": "draft", **fields}
+        if "patient_id" not in row:
+            referral = await c.table(TABLES["referrals"]).select(
+                REFERRAL_COLS["patient_id"]).eq(REFERRAL_COLS["id"], referral_id).limit(1).execute()
+            if referral.data:
+                row["patient_id"] = referral.data[0][REFERRAL_COLS["patient_id"]]
+        await c.table(TABLES["service_requests"]).insert(row).execute()
+
+    async def create_service_request(self, referral_id: str, patient_id: str, fields: dict) -> str:
+        c = await self._c()
+        base = {"referral_id": referral_id, "patient_id": patient_id, **fields}
+        res = await c.table(TABLES["service_requests"]).insert(base).execute()
+        return str(res.data[0]["id"])
 
     async def set_referral_service(self, referral_id: str, service_id: str, **fields) -> None:
         c = await self._c()
@@ -215,12 +328,95 @@ class SupabaseAPIReferralDB(ReferralDB):
         c = await self._c()
         await c.table("attempts").insert(row).execute()
 
+    async def next_attempt_number(self, referral_id: str, service_id: str | None) -> int:
+        c = await self._c()
+        q = c.table("attempts").select("attempt_number").eq("referral_id", referral_id)
+        # PostgREST needs `is_` for NULL — `.eq(col, None)` builds `?col=eq.None`.
+        q = q.is_("service_id", "null") if service_id is None else q.eq("service_id", service_id)
+        res = await q.order("attempt_number", desc=True).limit(1).execute()
+        return (res.data[0]["attempt_number"] + 1) if res.data else 1
+
+    async def reclaim_stale_actions(self, component: str, older_than_seconds: int) -> int:
+        """`in_progress` rows older than the cutoff go back to `ready`, so a worker that
+        crashed mid-action doesn't deadlock its referral forever (A5). `blocked` is left
+        alone — that's the human-review gate, not a crash."""
+        from datetime import datetime, timedelta, timezone
+
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(seconds=older_than_seconds)).isoformat()
+        c = await self._c()
+        res = await c.table("referral_actions").update(
+            {"action_status": "ready", "updated_at": "now()"},
+        ).eq("assigned_component", component).eq(
+            "action_status", "in_progress").lt("updated_at", cutoff).execute()
+        return len(res.data or [])
+
+    async def record_integration_event(self, event: dict) -> None:
+        c = await self._c()
+        await c.table("integration_events").upsert(
+            event, on_conflict="provider,external_id,event_type").execute()
+
+    # --- Read-only diagnostics ------------------------------------------------
+
+    async def list_actions(self, referral_id: str | None = None,
+                           limit: int = 50) -> list[dict]:
+        c = await self._c()
+        q = c.table("referral_actions").select("*")
+        if referral_id is not None:
+            q = q.eq("referral_id", referral_id)
+        res = await q.order("created_at", desc=True).limit(limit).execute()
+        return [dict(r) for r in res.data or []]
+
+    async def list_integration_events(self, limit: int = 20) -> list[dict]:
+        c = await self._c()
+        res = await c.table("integration_events").select("*").order(
+            "received_at", desc=True).limit(limit).execute()
+        return [dict(r) for r in res.data or []]
+
+    async def list_candidates(self, referral_id: str) -> list[dict]:
+        c = await self._c()
+        res = await c.table("referral_service_candidates").select("*").eq(
+            "referral_id", referral_id).order("rank").execute()
+        return [dict(r) for r in res.data or []]
+
+    async def select_candidate(self, referral_id: str, service_id: str) -> None:
+        """Release, then flag — the same two steps advance_referral itself uses. Order
+        matters: flagging first and releasing second would clear the row just set."""
+        c = await self._c()
+        await c.table("referral_service_candidates").update(
+            {"selected": False, "candidate_status": "available"},
+        ).eq("referral_id", referral_id).eq("candidate_status", "selected").execute()
+        await c.table("referral_service_candidates").update(
+            {"selected": True, "candidate_status": "selected", "updated_at": "now()"},
+        ).eq("referral_id", referral_id).eq("service_id", service_id).execute()
+
+    async def set_patient_utilization(self, referral_id: str, used: bool) -> None:
+        """Milestone 2 — the same column Messaging's poller writes when the patient
+        answers the check-in. `advance_referral` turns it into `completion_outcome` on
+        its next pass; writing that here too would be a second owner of the decision."""
+        c = await self._c()
+        await c.table(TABLES["referrals"]).update(
+            {"patient_confirmed_utilization": used, "patient_confirmed_at": "now()"},
+        ).eq("id", referral_id).execute()
+
     async def advance_referral(self, referral_id: str) -> dict:
         """Call the DB's own scheduler. It — not us — decides the next step (§7: one
         owner of transitions; here that owner is the database)."""
         c = await self._c()
         res = await c.rpc("advance_referral", {"p_referral_id": referral_id}).execute()
         return res.data if isinstance(res.data, dict) else {"result": res.data}
+
+    async def queue_action(self, referral_id: str, service_id: str | None,
+                           action_type: str, component: str, key: str, reason: str,
+                           payload: dict | None = None) -> str:
+        """Same RPC as SupabaseReferralDB, over PostgREST — see interface.py."""
+        c = await self._c()
+        res = await c.rpc("queue_referral_action", {
+            "p_referral_id": referral_id, "p_service_id": service_id,
+            "p_action_type": action_type, "p_component": component,
+            "p_key": key, "p_reason": reason, "p_payload": payload or {},
+        }).execute()
+        return str(res.data)
 
     def list_forms(self) -> list[dict]:
         """UI sugar (not on the Protocol; from the JSON schemas, like the mock)."""

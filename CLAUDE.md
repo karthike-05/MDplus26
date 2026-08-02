@@ -2,7 +2,7 @@
 
 Guidance for Claude Code and for the team. **Read this before writing code.** It defines **how the pieces fit together** so four people can build in parallel without colliding.
 
-- The form-fill design detail lives in [`docs/form-filling-architecture-and-build-plan.md`](docs/form-filling-architecture-and-build-plan.md).
+- The form-fill design detail lives in [§6](#6-form-fill-architecture--the-injector-seam) below, and in the code it describes ([`backend/tools/fill_form/`](backend/tools/fill_form/)).
 - A runnable slice lives in the repo ([`run_demo.py`](run_demo.py), [`tests/`](tests/)).
 - This file is about **seams, contracts, and conventions.**
 
@@ -11,7 +11,7 @@ Guidance for Claude Code and for the team. **Read this before writing code.** It
 ## Table of contents
 
 1. [What we're building](#1-what-were-building)
-2. [Golden rules](#2-golden-rules-do-not-violate)
+2. [Golden rules](#2-golden-rules-do-not-violate) — incl. [🔴 the three real-world flags](#2a--the-three-flags-that-stand-between-this-app-and-the-real-world)
 3. [Tech stack](#3-tech-stack)
 4. [Repo structure](#4-repo-structure)
 5. [The shared contracts](#5-the-shared-contracts-freeze-first)
@@ -48,6 +48,21 @@ Incumbents (findhelp, Unite Us) *generate* referrals; our differentiator is **co
 
 ## 2. Golden rules (do not violate)
 
+### 2a. 🔴 The three flags that stand between this app and the real world
+
+**Read this before flipping anything on, and before handing anyone the URL.** These
+default OFF, and each one is off because turning it on reaches somebody outside the
+building. Every one of them was added after finding the app could already do the thing.
+
+| Flag | Default | What turning it ON actually does |
+| --- | --- | --- |
+| **`ALLOW_LIVE_CALLS`** | `0` | Lets the `retell` poller place a **real outbound phone call to a real organisation**. 23 services in the live catalog carry a real phone number and **11 have `phone` at priority 1** — `913-588-6970` is an actual county health department. Anyone who picks one of those on the Choose-service screen dials it. Off, the action is left `ready` and never claimed — deliberately *not* marked failed, because a failed action poisons its dedup key permanently (§7c) and the queue could never be drained later. |
+| **`ALLOW_LIVE_INTAKE`** | `0` | Makes "+ New referral" send a **real WhatsApp** to whatever number was typed, on the team's Twilio. Currently **on** by choice. `Initiate.jsx` names the number in a confirm dialog first — a generic "are you sure?" wouldn't catch the mistyped digit that guard exists for. |
+| **`VITE_DEV_TOOLS`** | `0` | Shows the **Integration tab** and the **Mock/Supabase data-source toggle**. That toggle calls `POST /api/db`, which swaps the adapter **process-wide** — one person clicking "Mock" changes the data source for *everyone* on the deployment at once, and the next visitor sees fixture data with nothing explaining why. It is a debugging control wired to global mutable state. **Build-time**, because Vite inlines `VITE_*` at build: `VITE_DEV_TOOLS=1 npm run build`. Locally, `?dev=1` works without a rebuild. |
+
+> The shared `APP_PASSWORD` is the *only* thing gating any of this. There is no
+> per-user auth, so "who can press it" and "who has the link" are the same set.
+
 - **Synthetic data only.** No real PHI anywhere. This is what lets us skip HIPAA/RBAC/audit infra — narrate those as production design, don't build them.
 - **Modules talk through the DB + the scheduler, never by importing each other.** `fill_form` does not call `notify_patient`. It writes an outcome; the scheduler decides what's next.
 - **Depend on interfaces, not implementations.** A workstream that needs another team's data depends on a small typed interface it owns (e.g. `ReferralDB`), mocks it from fixtures, and hands the interface to the owner. Nobody blocks on unfinished work.
@@ -55,7 +70,14 @@ Incumbents (findhelp, Unite Us) *generate* referrals; our differentiator is **co
 - **No live LLM in the submission path.** Claude is used only inside bounded steps (value mapping, call-script generation) and must return validated JSON that deterministic code acts on.
 - **Never auto-fill or auto-submit `human_only` fields** (signatures, consent, attestations). Enforced by `FormSchema.fillable_fields()`, not by model judgment.
 - **Deterministic fill + validation before any injection.** Malformed values are flagged for human review, never injected.
-- **Web and PDF are both first-class form targets.** They differ only in the field locator and the injector — see [§6](#6-form-fill-architecture--the-injector-seam). Flat (non-fillable) PDFs are IN scope for a known template; only autonomous extraction of an *unseen* scanned form is deferred.
+- **PDF is the form target we ship. Web is DEFERRED — do not claim it works.** The
+  `Injector` seam ([§6](#6-form-fill-architecture--the-injector-seam)) is genuinely
+  target-agnostic and `WebInjector` is written, but it has never run against anything:
+  `frontend/mock_form/` is empty and no `*_web.json` schema exists, so there is no
+  fixture and the L3 test layer is inert. Cut from scope 2026-08-01 on time grounds.
+  Describe web as *what the seam is designed for*, never as a capability we have.
+  Flat (non-fillable) PDFs ARE in scope for a known template; only autonomous
+  extraction of an *unseen* scanned form is deferred.
 - **No CAPTCHA solving. No live third-party portal in the hero demo.** The hero form is self-hosted / a local fixture under our control.
 - **Freeze the shared contracts ([§5](#5-the-shared-contracts-freeze-first)) before building logic.** Everyone codes against them.
 
@@ -68,7 +90,7 @@ Incumbents (findhelp, Unite Us) *generate* referrals; our differentiator is **co
 | **Backend** | Python 3.11+, FastAPI | Async throughout. |
 | **DB** | Supabase (Postgres) | Backend accesses Postgres **directly** (asyncpg / async SQLAlchemy) for logic/transactions. Frontend uses `supabase-js` for reads + realtime. |
 | **Agent/LLM** | Anthropic Claude API | Structured tool-use / JSON output. No agent framework (no LangChain) — discrete tools + our own state machine. |
-| **Web automation** | Playwright **for Python** | In-process with the backend. Stagehand (Node-only) deferred to the Aug 17 extraction stretch — no Node in the backend before then. |
+| **Web automation** | Playwright **for Python** | ⚠ Dependency present, `WebInjector` written, **never exercised** — web forms are out of scope (§2). Stagehand (Node-only) deferred with it. |
 | **PDF automation** | PyMuPDF (`fitz`), `pypdf` | `fitz` for deterministic text overlay onto flat PDFs; `pypdf` for AcroForm fillable PDFs. |
 | **Messaging** | Twilio | WhatsApp sandbox — chosen over SMS to avoid 10DLC delays. |
 | **Voice** | Retell | Outbound calls to social services. Budget in Retell/Twilio minutes, not Claude tokens. |
@@ -84,19 +106,35 @@ Incumbents (findhelp, Unite Us) *generate* referrals; our differentiator is **co
 ├─ CLAUDE.md                       # this file
 ├─ README.md                       # how to run the slice
 ├─ docs/
-│   └─ form-filling-architecture-and-build-plan.md
+│   ├─ local-setup.md              # clone -> running + a UI walkthrough (start here)
+│   ├─ changes-2026-08-01.md       # latest changes; the live form walk + 6 root-caused bugs
+│   ├─ changes-2026-07-28.md       # incl. the Ranking handoff
+│   ├─ integration-status.md       # the four-service bus, in detail
+│   ├─ whats-left.md               # the task list, grouped by owner
+│   ├─ demo-walkthrough.md         # running a demo for an audience
+│   ├─ handoff-ranking-candidates.md
+│   ├─ form-failure-paths.md       # the form component's unhardened edges (post-Aug-2)
+│   └─ db-contract.md              # live columns + CHECK constraints
 ├─ contracts/                      # SHARED SOURCE OF TRUTH — freeze early
 │   ├─ models.py                   # FormSchema / FormField / ToolOutcome (Pydantic)
-│   └─ schemas/                    # one verified schema per form (web XOR pdf)
+│   └─ schemas/                    # one verified schema per form (pdf only today)
 │       ├─ transport_intake_pdf.json
 │       └─ food_assistance_pdf.json
 │                                  # NOTE: no *_web.json yet — the online-application
 │                                  # component is unbuilt (docs/whats-left.md B1)
 ├─ backend/
-│   ├─ main.py                     # FastAPI app + routes (to build)
+│   ├─ main.py                     # FastAPI app + routes; serves frontend/dist last
 │   ├─ orchestrator/
 │   │   ├─ state_machine.py        # referral lifecycle states + transitions
-│   │   └─ scheduler.py            # reads DB state, dispatches exactly one tool
+│   │   ├─ scheduler.py            # reads DB state, dispatches exactly one tool
+│   │   ├─ actions.py              # the `karthik_form` worker on the shared bus (§7a)
+│   │   ├─ backend_component.py    # the `backend` worker — bookkeeping + email (§7a)
+│   │   └─ worker.py               # the runner: drains both, recovers crashed actions
+│   ├─ scripts/
+│   │   ├─ demo_driver.py          # read-only verdict on every LIVE referral (+ demo setup)
+│   │   ├─ seed_demo_services.py   # [Demo] services + an armed demo referral (§2a-safe)
+│   │   ├─ geocode_locations.py    # locations.lat/long from addresses (US Census)
+│   │   └─ seed_form_templates.py  # contracts/schemas/*.json -> form_templates
 │   ├─ tools/
 │   │   └─ fill_form/
 │   │       ├─ fill_form.py        # prepare() for review UI; submit() injects + records
@@ -113,7 +151,11 @@ Incumbents (findhelp, Unite Us) *generate* referrals; our differentiator is **co
 │   └─ scripts/make_sample_pdf.py  # generates the flat-PDF fixture
 ├─ frontend/
 │   ├─ src/ReviewUI.jsx            # per-patient review screen
-│   └─ mock_form/index.html        # local web-form test double
+│   ├─ src/ChooseService.jsx       # the SW selection gate (§7b)
+│   ├─ src/Escalations.jsx         # referrals the agent couldn't finish (B2)
+│   ├─ src/devtools.js             # the VITE_DEV_TOOLS / ?dev=1 switch (§2a)
+│   ├─ src/Integration.jsx         # the shared bus — DEV_TOOLS only (§2a)
+│   └─ mock_form/                  # EMPTY — the web test double was never built
 ├─ sample_forms/                   # PDF fixtures + rendered previews
 ├─ tests/test_fill_form.py         # layered suite (runs with no DB/browser)
 ├─ run_demo.py                     # headless end-to-end
@@ -190,12 +232,24 @@ Every tool returns this and writes an `outreach_attempts` row. The scheduler onl
 
 ### 5c. Form schema JSON (serves web AND pdf)
 
-One shape for both targets. Every field carries `fill_policy` (`auto` / `review` / `human_only`), `source`, `maxlength`, `format`, `required`. The only per-target difference:
+One shape for both targets. Every field carries `fill_policy` (`auto` / `review` /
+`human_only`), `source`, `maxlength`, `format`, `required`. The only per-target difference:
 
 - **web** fields carry a `selector`.
 - **pdf** fields carry `page` + `rect`.
 
-Full definition in [`docs/form-filling-architecture-and-build-plan.md` §4](docs/form-filling-architecture-and-build-plan.md).
+> **`format` is not cosmetic — it's the type contract with the shared DB.** The vocabulary
+> is `date` / `phone` / `email` / `time` (`fill_form/validation.py`). It does two jobs:
+> `validate_field` rejects a malformed value *before* injection, and
+> `service_request_writeback` normalises through the same key on the way out. That second
+> job is why a missing `format` is a real bug and not a nicety — `appointment_time` had
+> none, so a reviewer's `2:45 PM` passed validation (7 chars, under an 8-char
+> `maxlength`) and only failed at the `time` column, *after* the PDF was injected. A
+> field whose `source` points at a typed column MUST declare its `format`.
+
+Full definition: [`contracts/models.py`](contracts/models.py) (`FormSchema` / `FormField`),
+with [`contracts/schemas/transport_intake_pdf.json`](contracts/schemas/transport_intake_pdf.json)
+as the worked example.
 
 > **Source of truth:** the JSON file in `contracts/schemas/` is **authoritative**. The
 > `form_schemas` DB table is a **cache** populated from it — never hand-edit the table.
@@ -219,12 +273,38 @@ prepare(schema, patient)  -> map_values -> validate -> {values, needs_attention,
                                                         # this is the review-UI payload
 
 submit(referral_id, schema, reviewed_values, db)
+    -> re-validate  ->  needs_human, nothing injected      # malformed values never ship
     -> get_injector(target_type).inject(...)   # PdfInjector | WebInjector
+    -> write reviewed values back to service_requests      # guarded; see below
     -> ToolOutcome (+ db.record_attempt)
 ```
 
+**`needs_human` is not a failed outreach — it's an unfinished review, and the difference
+is load-bearing.** Re-validation rejecting a value means nothing was injected and nothing
+reached the service. So `POST /api/submit` deliberately does *none* of the three things it
+does on success:
+
+| | on `success` | on `needs_human` |
+| --- | --- | --- |
+| shared `attempts` row | written | **not** written — `advance_referral` counts these against a three-attempt cap and treats a channel with a row as *spent* |
+| the open form action | closed `completed` | **left `blocked`** — which is exactly what blocked means (awaiting human review) |
+| `advance_referral()` | called | **not** called — nothing changed |
+
+Doing any of them made one bad date abandon the service the referral was about to apply
+to, with the retry path already dead: the closed action poisons its dedup key (§7c) so
+nothing can re-queue it. See `docs/form-failure-paths.md` F1.
+
+**The write-back is guarded and must stay guarded.** It runs *after* injection, so if it
+raises and escapes, the PDF is out but no `ToolOutcome` is recorded, the action never
+closes, the open-action guard freezes the referral, and the reviewer is told their submit
+failed. It reports into `outcome.data["writeback_failed"]` instead. This is the same shape
+as the `save_call_outcome` bug (`changes-2026-07-31` §2) — **bookkeeping must never roll
+back a side effect that already left the building.**
+
 - **PdfInjector** — overlays text at each field's `rect` (PyMuPDF). Flat digital PDFs and scanned PDFs fill identically once a rect is verified.
-- **WebInjector** — fills by `selector` (Playwright), leaving `human_only` blank, capturing the confirmation.
+- **WebInjector** — ⚠ **written but never run.** Fills by `selector` (Playwright),
+  leaving `human_only` blank, capturing the confirmation. No fixture exists, so this is
+  unproven code, not a supported target — see the golden rule in §2.
 - Adding an API-based submission later = one more `Injector`. Mapping, validation, and the review UI never change.
 
 **The review screen** (`frontend/src/ReviewUI.jsx`) is a split view: extracted **fields on the left**, the **PDF form on the right**. Selecting a field boxes its `rect` on the page (and vice-versa) so the reviewer can confirm the agent mapped the right region before submit. It reads the `ReviewPayload` (values) + the `FormSchema` fields (rect geometry, `fill_policy`). For it to work the backend must expose, per form:
@@ -313,14 +393,163 @@ components is **`karthik_form`** — us. Messaging already works this way
 `MockReferralDB` **mirrors** `advance_referral` in Python so the same worker code runs
 both ways — that mirror is what keeps them from drifting (`tests/test_actions.py`).
 
+**We service TWO components, and a runner drives them.** `karthik_form` was always ours;
+**`backend`** was confirmed ours on 2026-07-27 and had no poller anywhere, which mattered
+more than it sounds: `advance_referral`'s first guard is "any open action → `waiting`",
+so one unserviced `select_resource` row **deadlocks** its referral permanently.
+[`worker.py`](backend/orchestrator/worker.py) runs both in the FastAPI lifespan —
+drain-per-tick (a backlog clears in one pass, not one-per-interval), and a sweep that
+returns actions stuck `in_progress` to `ready` so a crashed worker doesn't wedge a
+referral. It never raises into the event loop: a servicing failure is recorded on the
+action, a DB failure is logged and retried.
+
+Two things it deliberately does **not** do, both `.env` flags defaulting off:
+`rank_resources` is left for Ranking (claiming it would advance a referral with an empty
+shortlist — `BACKEND_CLAIM_RANKING`), and the central `advance_referral` sweep over all
+open referrals is opt-in (`ORCHESTRATOR_TICK`) because the team hasn't chosen between
+that and "every component advances itself".
+
+> **Live mode has no `current_state` and no `form_id`.** `set_state()` is a documented
+> **no-op** on both real adapters — writing our vocabulary into their `status` would
+> corrupt the column every other service branches on — and the form is resolved through
+> `form_templates.service_id`. The routes that push our offline scheduler (`/run`,
+> `/inbound`) return **409** live rather than silently doing nothing.
+
 > **Never add `referrals.current_state` to the shared DB, and never write our
 > vocabulary into their `referrals.status`.** Our state machine and theirs are parallel
 > implementations of the same decisions; a second state field would be a second owner
 > of truth. Their `referral_actions(referral_id, deduplication_key)` unique index
 > already gives us the idempotency `attempt_id` was for.
 
+### 7b. The social worker picks the service — `003_sw_selection_gate.sql`
+
+**Applied to the live DB (2026-07-27).** `advance_referral` used to take the top-ranked
+candidate itself and dispatch outreach. That is a different product from the one we're
+building: the SW seeing the options and choosing is what feeds `sw_feedback`, and
+`sw_feedback` is the *only* signal ranking's subjective layer ever learns from.
+Auto-selecting doesn't just remove a safeguard — it starves the feedback loop.
+
+So: candidates exist and none is `selected` → queue `select_resource` to
+**`social_worker`** and return `awaiting_sw_selection`. Nothing polls that component
+because a human is the poller. `POST /api/referrals/{id}/choose-service` completes it,
+and it must do **four** things or the gate breaks silently: flag the candidate, point the
+referral, **close the action** (else the open-action guard freezes the referral on the
+choice just made), and record the label.
+
+A candidate already flagged `selected` is *adopted*, not re-ranked. Without that branch
+the function falls through to the old auto-picker, which only considers `available`
+rows — so the SW's own pick is the one row it would skip.
+
+> Ranking's handoff assumed the opposite (auto-select + override) because **our** doc
+> still recommended it after we'd decided otherwise. Their code needs no change; only
+> their "zero open actions afterwards" check moves to expecting one.
+
+### 7c. ⚠ A finished action permanently poisons its dedup key
+
+The single sharpest trap on this bus, and it is silent. `queue_referral_action` does:
+
+```sql
+on conflict (referral_id, deduplication_key) do update set updated_at = now()
+```
+
+It **does not reset `action_status`**. So once an action is `completed`, `failed` or
+`cancelled`, `advance_referral` can never re-queue anything under that key again: it
+"queues" the action, gets the dead row's id back, reports success, and **no open action
+exists**. The referral then looks fine and does nothing. Nothing errors.
+
+Consequences to keep in mind:
+
+- **To genuinely re-arm a referral you must DELETE the finished rows, not cancel them.**
+  `backend/scripts/demo_driver.py --reset-selection` does this.
+- A retried step is only re-runnable if its key varies. `attempt:<referral>:<service>:
+  <channel>` does; `sw_select:<referral>` and `rank:<referral>` do not.
+- This is also why recording an attempt under the wrong `channel` stalls a referral
+  (§ CHANNEL_FOR_TARGET): the re-dispatch computes the same key and hits the dead row.
+
 Full walkthrough, the vocabulary translation, and the current blockers:
 [`docs/integration-status.md`](docs/integration-status.md).
+
+### 7d. ⚠ An `os.getenv` at module scope is evaluated before `.env` exists
+
+`backend/main.py` imports its dependencies (line ~37) and *then* calls `load_dotenv()`
+(line ~47). So any module-level `CONST = os.getenv(...)` in something it imports reads an
+environment that has no `.env` in it yet — the value in `.env` is **silently ignored**,
+and the flag reports its default forever.
+
+This cost a live debugging round on 2026-07-28: `ORCHESTRATOR_TICK=1` in `.env` did
+nothing and `/health` kept reporting `false`. `backend_component.claim_ranking()` was
+already a function, which is exactly why `BACKEND_CLAIM_RANKING` worked and the other
+didn't.
+
+**Read env flags in a function, never at import.** And note that patching the module
+attribute in a test proves nothing about how the value is sourced — that's what let this
+ship green. Drive the env var: `tests/test_worker.py::
+test_env_flags_are_read_at_call_time_not_import`.
+
+### 7e. Intake: the address is an input, not a stored field
+
+`patients` has **no street-address column** — only `postal_code`, `county`, `latitude`,
+`longitude` (§6a). `PATIENT_COLS` maps `"address": None`, and `_to_theirs` drops
+`None`-mapped keys, so an address typed into the intake form went nowhere and those four
+columns were never populated by anything.
+
+That is not cosmetic: Ranking's hard filter reads them, and `POST /rank-referral` returned
+a bare **500** for every referral created through our UI while succeeding for the seeded
+patients that had coordinates.
+
+So `address` is **required** on `NewPatient` and
+[`backend/intake/geocode.py`](backend/intake/geocode.py) resolves it into those four
+columns (US Census — free, keyless, authoritative for county). Geocoding degrades to
+`None` on any failure — it must never be why a social worker can't create a patient — but
+reports `geocoded: false` rather than failing silently, because unresolved coordinates
+kill the referral later inside a service we don't own.
+
+### 7g. ⚠ Nothing creates a `service_requests` row — 5 of 11 form fields go blank
+
+`transport_intake` sources **four** fields from `service_request.*` (`appointment_date`,
+`appointment_time`, `pickup_address`, `destination`) and one from `patient.address`, which
+has no column (§7e, B5). So on a referral created through our own intake UI, **5 of the
+11 agent-fillable fields render blank** — not an error, just empty boxes on the PDF.
+
+As of 2026-07-28 the live DB has exactly **one** `service_requests` row, hand-seeded for
+Jordan Ellis (`c1a1e002…`). Nothing in this codebase inserts one: intake collects a
+patient and a service, never the trip details. **Jordan is therefore the only referral
+whose form meaningfully autofills**, which is why he's the demo referral.
+
+Two consequences to hold onto:
+
+- A "create a fresh referral and walk it end to end" demo will reach the review screen
+  with most trip fields empty. The reviewer can type them, and `submit()` writes them
+  back to `service_requests` (§6a) — so the *first* fill is manual and every later one
+  autofills.
+- The real fix is collecting trip details at intake (a step 4 on the New referral form)
+  and inserting the `service_requests` row. Not built.
+
+### 7f. `attempts.outcome='enrolled'` is the only thing that closes milestone 1
+
+`advance_referral` promotes a referral to `status='enrolled'` **only** if an `attempts`
+row carries `outcome='enrolled'` (`001_orchestration_bus.sql:81`). Nothing wrote it until
+2026-07-28, so a live referral could reach `submitted` and never advance — the loop could
+not close on live data at all.
+
+Our successful submit records `outcome='submitted'`, and that is **correct**: submitting a
+form is not the org accepting. Never "fix" this by having submit write `enrolled` —
+collapsing the two milestones destroys the distinction the product exists to make (§7),
+and `tests/test_org_response.py` asserts it can't happen.
+
+The org's answer arrives at **`POST /api/org/response`** (in the inbound adapter, beside
+the Voice and Messaging seams). Today a human clicks *Org accepted ✓* on the dashboard,
+and that is currently the **only** caller: nothing parses org email yet, on either side.
+The live `attempts.outcome` CHECK vocabulary is pinned in `tests/test_org_response.py` —
+a value outside it fails the insert on the real DB and nowhere else.
+
+> ⚠ **`ORG_BACKEND_URL` is NOT the org-email seam** — an earlier version of this file
+> said it was, and the mistake propagated. It is Messaging's pointer at *us*, and
+> `patient_comms/org_events.py` uses it for exactly one thing:
+> `POST {ORG_BACKEND_URL}/api/patient-comms/event`, the **patient-reply** seam (consent
+> confirmed/declined, utilization verified). Setting it does nothing for org email.
+> Verified unset as of 2026-08-01: `integration_events` holds only `karthik_form` rows,
+> so Messaging has never posted to us.
 
 ---
 
@@ -347,14 +576,12 @@ You can finish a workstream before its dependencies exist.
 **Two fixtures, one pipeline.** Develop web and PDF simultaneously off the same `prepare()` / `submit()` flow:
 
 - **PDF:** `sample_forms/transport_intake_blank.pdf` (generated by `make_sample_pdf.py`) + `transport_intake_pdf.json`.
-- **Web:** ⚠ **not built yet.** `frontend/mock_form/` is empty and there is no
-  `transport_intake_web.json`, so `WebInjector` currently has no fixture and the L3 layer
-  below has nothing to run against. The plan is unchanged — a local page plus a web
-  schema, swapped for a real form later by editing `source_ref` + selectors with no code
-  change — but building it is open work (docs/whats-left.md B1):
-  ```bash
-  python -m http.server 8000 --directory frontend/mock_form   # once it has an index.html
-  ```
+- **Web:** ⚠ **cut from scope 2026-08-01.** `frontend/mock_form/` is empty and there is
+  no `transport_intake_web.json`, so `WebInjector` has no fixture and the L3 layer below
+  has nothing to run against. The design still holds — a local page plus a web schema,
+  swapped for a real form later by editing `source_ref` + selectors with no code change —
+  but it is not being built for this deadline, and nothing should describe web forms as
+  working.
 
 **Test in layers** (`tests/test_fill_form.py`):
 
@@ -362,7 +589,7 @@ You can finish a workstream before its dependencies exist.
 | --- | --- | --- |
 | **L1 unit** | mapping + validation, no I/O | Runs in ms. The correctness core (G2) — keep it fast and exhaustive. |
 | **L2 injector** | `submit()` writes a real PDF | Assert by extracting the text layer (`fitz … get_text()`), not by pixel-diff. |
-| **L3 web** | Playwright smoke against the mock page | Skips if no browser. |
+| **L3 web** | ⚠ **inert** — no mock page, no web schema. Skips always, and would skip even with a browser. |
 
 **The visual loop for PDF coordinate authoring:** fill → render page to PNG (`page.get_pixmap`) → eyeball → nudge `rect`. Fast way to design a template. But pair it with a text-extraction assertion — the eye misses things a substring check catches (e.g. `insert_textbox` silently drops text in short boxes; use a baseline `insert_text` for single-line fields).
 
@@ -388,11 +615,17 @@ pytest -q               # layered suite
 ## 11. Dev workflow & commands
 
 ```bash
-uvicorn backend.main:app --reload           # backend
+uvicorn backend.main:app --reload           # backend (+ frontend/dist if built)
+                                            # UI at :8000 — add ?dev=1 for dev tools (§2a)
 python -m backend.scripts.make_sample_pdf   # regenerate the PDF fixture
-python run_demo.py                          # headless end-to-end
-pytest -q                                   # tests
-python -m http.server 8000 --directory frontend/mock_form   # mock web form (EMPTY — see §9)
+python run_demo.py                          # headless end-to-end (always the mock)
+pytest tests -q                             # our suite — `pytest -q` also collects
+                                            # backend/patient_comms, which needs sqlalchemy
+python -m backend.scripts.demo_driver       # read-only: what the LIVE loop will do next
+python -m backend.scripts.seed_form_templates --list   # form_templates + candidate services
+python -m backend.scripts.seed_demo_services            # DRY RUN: [Demo] services (--yes to write,
+                                                        # --with-referral, --reset-referral, --delete)
+python -m backend.scripts.geocode_locations             # DRY RUN: fill locations.lat/long (--yes)
 cd frontend && npm run dev                  # frontend
 supabase db push                            # apply contracts/db_schema.sql (when using the CLI)
 ```
@@ -405,6 +638,19 @@ supabase db push                            # apply contracts/db_schema.sql (whe
 | DDL only | `SUPABASE_ACCESS_TOKEN` (`sbp_…` Management API PAT — account-scoped, revocable) |
 | Frontend | `VITE_API_BASE` (inlined at **build** time), `SUPABASE_ANON_KEY` |
 | Theirs, not ours | `TWILIO_*` / `RETELL_*` live in Messaging's and Voice's own deploys — this backend never dials out |
+
+**Behaviour flags** (not secrets — safe defaults, read at *call* time per §7d):
+
+| Flag | Default | Turn on when |
+| --- | --- | --- |
+| `ORCHESTRATOR_TICK` | `0` | Voice/Messaging aren't calling `advance_referral()` after their steps, so chains stop dead. Currently **true**, so it's on |
+| `BACKEND_CLAIM_RANKING` | `0` | Nothing else triggers ranking runs. **Costs one Claude call per run** |
+| `ALLOW_LIVE_INTAKE` | `0` | You're demoing intake. On, "+ New referral" sends a **real WhatsApp** to whatever number was typed, on the team's Twilio. Currently **on**; the UI now confirms the number first |
+| `ALLOW_LIVE_CALLS` | `0` | 🔴 See §2a below. On, a chosen phone-channel service is **really dialled**. Leave off unless you are watching it |
+| `VITE_DEV_TOOLS` | `0` | 🔴 See §2a. **Build-time** (`VITE_*` is inlined by Vite), so `VITE_DEV_TOOLS=1 npm run build`. `?dev=1` works locally without a rebuild |
+| `GEOCODING_ENABLED` | `1` | Off only for offline work; `conftest` forces it off so the suite stays hermetic |
+| `WORKER_ENABLED` | `1` | `0` disables the background poller entirely |
+| `APP_PASSWORD` | *unset* | Any public deploy. HTTP Basic, any username, one shared secret. Unset = no gate, which is what keeps a fresh clone working unconfigured. Webhook seams + `/health` stay open — see [`backend/app_auth.py`](backend/app_auth.py) |
 
 > Names match the sibling services deliberately, so one value pastes across all four
 > deploys: it's `SUPABASE_SERVICE_ROLE_KEY` (not `..._SERVICE_KEY`) and `DATABASE_URL`
@@ -439,20 +685,48 @@ Deferred on purpose — build only after the Aug-2 warm path is solid.
   `form_schemas`. This is the Aug-17 extraction stretch (§6 cold path, §3 Stagehand).
   Everything downstream (map → validate → review → inject) is already target-agnostic,
   so extraction only has to *produce a `FormSchema`* — no warm-path code changes.
+- **The online-application component — finish `WebInjector`.** *Cut 2026-08-01 on time,
+  not on design; this is the #2 item after the cold path.* Most real services take an
+  online application, not a PDF, so this is the half that decides whether the product
+  generalises beyond one hero form.
+
+  **What exists:** [`web_injector.py`](backend/tools/fill_form/injectors/web_injector.py)
+  — Playwright, fills by `selector`, leaves `human_only` blank, captures the
+  confirmation. It has **never been executed**: `frontend/mock_form/` is empty and no
+  `*_web.json` schema exists, so there has never been a fixture (§2, §9 L3).
+
+  **What it needs, in order — none of it touches the warm path:**
+  1. `frontend/mock_form/index.html` — a plain form with stable `id`s, one field per
+     `transport_intake` field, plus a signature box left blank to prove `human_only` is
+     never auto-filled. Served by `python -m http.server 8000 --directory frontend/mock_form`.
+  2. `contracts/schemas/transport_intake_web.json` — the same `FormSchema` shape as the
+     PDF one with `target_type: "web"`; `selector` replaces `page`/`rect`, everything
+     else (`source`, `fill_policy`, `maxlength`, `format`) is copied verbatim. That
+     symmetry is the point: same mapper, same validation, same review payload.
+  3. Un-skip the L3 layer in `tests/test_fill_form.py` and assert against the filled DOM.
+  4. Give one live service an `online_form` channel whose `application_url` points at a
+     real form, and swap `source_ref` + selectors. **No code change** — that swap is the
+     whole reason the Injector seam exists.
+
+  **Deliberately still out:** CAPTCHA solving, and any live third-party portal in a
+  recorded demo (§2). Multi-page and JS-gated forms are the first real difficulty; the
+  current injector assumes one page and no conditional fields.
 - **Real Supabase behind `ReferralDB`.** ✅ Built — `supabase_api.py` (REST +
   `service_role`, the stable path) and `supabase.py` (asyncpg). Column maps are aligned
   to the live schema. Flip by setting `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`;
   unset, `make_db()` returns the mock. Still gated on one blocker outside our control —
   nothing writes `referral_service_candidates`, so the live flow parks at
   `status='ranking'` (see [`docs/integration-status.md`](docs/integration-status.md)).
-- **The online-application form component.** The PDF half is built; filling a service's
-  real web form is not (§6a). `WebInjector` exists and works against
-  `frontend/mock_form/`. No CAPTCHA, no live third-party portal.
 - **Seed `form_templates`** from `contracts/schemas/*.json`. The live DB provisioned a
   better-designed home for our schemas than the original `form_schemas` idea —
   versioned, with verification provenance — and it's empty.
 - **Persist inbound events to `integration_events`.** Our adapters currently apply and
   forget; that table is the durable webhook log.
-- **Inbound webhooks for real** (org email parse, Twilio "Y") replacing the simulated
-  `apply_inbound` in `run_demo.py` (§7). The Twilio leg already works in Messaging's
-  deploy; what's missing is `ORG_BACKEND_URL` pointing at us.
+- **Inbound webhooks for real**, replacing the simulated `apply_inbound` in
+  `run_demo.py` (§7). These are two separate legs and they are NOT at the same stage:
+  - **Patient replies (Twilio "Y")** — genuinely one config change. Messaging's
+    `org_events.py` already emits to `{ORG_BACKEND_URL}/api/patient-comms/event`, and
+    our receiving end is built; `ORG_BACKEND_URL` is simply unset in their deploy.
+  - **Org email parse** — *not* built, on either side. Our `POST /api/org/response`
+    receives it (§7f), but nothing produces it and there is no env var for it. Until
+    then the dashboard's *Org accepted ✓* button is the only caller.

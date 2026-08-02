@@ -28,6 +28,10 @@ export const STATE_META = {
   check_in_scheduled: { label: "Check-in sent", color: C.teal },
   completed: { label: "Completed", color: C.ok },
   needs_human: { label: "Needs worker", color: C.warn },
+  // Not a state_machine state — a live-only condition derived from an open
+  // select_resource action (003_sw_selection_gate.sql). Distinct badge because
+  // "Placing" (its underlying status) implies outreach is already happening.
+  awaiting_sw_selection: { label: "Pick a service", color: C.warn },
   escalated: { label: "Escalated", color: C.danger },
 };
 
@@ -36,6 +40,10 @@ export const STATE_META = {
 export const CHANNEL_LABEL = {
   form: "📄 Form", online_form: "📄 Form", phone: "📞 Phone", email: "✉️ Email",
   text: "💬 Text", sms: "💬 Text", whatsapp: "💬 WhatsApp", escalation: "⚠ Escalation",
+  // A live service with no `service_application_channels` row is treated as instantly
+  // exhausted by advance_referral, so the referral dead-ends. Name it rather than
+  // letting it render as a confident channel it doesn't have.
+  none: "⚠ no channel configured",
 };
 
 // The PATIENT's own answers, kept visually separate from the service's (§7). Two
@@ -145,7 +153,7 @@ export function actionFor(row) {
 // The one control that pushes a referral forward — reused by the dashboard rows and
 // the referral detail. Runs the auto-tool (`run`), opens the review screen (`review`),
 // or fires a simulated inbound signal, then calls onChange() to refresh.
-export function RowActions({ row, onReview, onChange, small }) {
+export function RowActions({ row, onReview, onChange, small, live }) {
   const [busy, setBusy] = useState(false);
   const a = actionFor(row);
   const go = async (fn) => {
@@ -154,7 +162,11 @@ export function RowActions({ row, onReview, onChange, small }) {
       await fn();
       await onChange?.();
     } catch (e) {
-      alert(String(e));
+      const msg = String(e);
+      alert(msg.includes("409")
+        ? "Live, the DB's advance_referral() owns this transition — these buttons drive "
+          + "our offline scheduler. Switch the data source to Mock to drive the loop by hand."
+        : msg);
     } finally {
       setBusy(false);
     }
@@ -162,6 +174,68 @@ export function RowActions({ row, onReview, onChange, small }) {
   if (a.done) return <span style={{ color: C.ok, fontWeight: 600, fontSize: 13 }}>✅ Loop closed</span>;
   if (a.flag) return <span style={{ color: C.warn, fontWeight: 600, fontSize: 13 }}>⚠ Needs social worker</span>;
   if (a.review) return <Btn small={small} onClick={() => onReview?.(row.referral_id)}>{a.review}</Btn>;
+
+  // `submitted` is the one waiting state that IS actionable live: the org's answer is a
+  // real inbound seam (POST /api/org/response), not our offline scheduler. It writes the
+  // `attempts.outcome='enrolled'` row that advance_referral reads — the row nothing else
+  // writes, and without which a live referral can never leave `submitted`.
+  //
+  // Until Messaging points ORG_BACKEND_URL at us, a human clicks this instead of an
+  // email arriving. Same endpoint either way, so wiring the email leg needs no new code.
+  if (live && row.current_state === "submitted")
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <span style={{ fontSize: 11, color: C.sub }}>Awaiting service response</span>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          <Btn small={small} disabled={busy}
+               onClick={() => go(() => api.orgResponse(row.referral_id, "accepted"))}>
+            {busy ? "…" : "Org accepted ✓"}
+          </Btn>
+          <Btn small tone="ghost" disabled={busy}
+               onClick={() => go(() => api.orgResponse(row.referral_id, "rejected"))}>
+            Org declined ✕
+          </Btn>
+        </div>
+      </div>
+    );
+
+  // MILESTONE 2, live. `confirmed` means the org accepted; whether the PATIENT used the
+  // resource is the separate, later fact (§7) and the one the pitch turns on. Live, the
+  // only writer of that column is Messaging's poller when the patient answers the
+  // check-in — so with that service degraded, or nobody's number in the Twilio sandbox,
+  // a real referral reached `confirmed` and stopped there and the loop could never be
+  // seen closing on real data. Same human stand-in as "Org accepted ✓" above.
+  if (live && (row.current_state === "confirmed"
+               || row.current_state === "check_in_scheduled"))
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <span style={{ fontSize: 11, color: C.sub }}>Did the patient use it?</span>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          <Btn small={small} disabled={busy}
+               onClick={() => go(() => api.patientUtilization(row.referral_id, true))}>
+            {busy ? "…" : "Patient used it ✓"}
+          </Btn>
+          <Btn small tone="ghost" disabled={busy}
+               onClick={() => go(() => api.patientUtilization(row.referral_id, false))}>
+            Didn’t use it ✕
+          </Btn>
+        </div>
+      </div>
+    );
+
+  // Every other live state: `advance_referral()` owns transitions (CLAUDE.md §7a) and
+  // /run + /inbound answer 409 by design. Review still works — it's our component either
+  // way — but a button whose only possible outcome is an error reads as a broken app, so
+  // name the owner of the step instead of offering it.
+  if (live)
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+        <span style={{ fontSize: 12, color: C.ink }}>{a.wait || a.run}</span>
+        <span style={{ fontSize: 11, color: C.sub }}>
+          the DB scheduler drives this live
+        </span>
+      </div>
+    );
   if (a.run)
     return (
       <Btn small={small} disabled={busy} onClick={() => go(() => api.run(row.referral_id))}>

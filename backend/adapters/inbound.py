@@ -23,8 +23,10 @@ change. Phone outcomes use ``phone``.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from backend.db.interface import ReferralDB
 from backend.orchestrator import scheduler
@@ -91,6 +93,151 @@ class PatientCommsEvent(BaseModel):
     reply_text: str | None = None
 
 
+# --- The service organisation's answer (MILESTONE 1) -------------------------
+# Our decision vocab -> the live `attempts.outcome` CHECK vocabulary. `enrolled` is the
+# one that matters: `advance_referral` (001_orchestration_bus.sql:81) moves a referral to
+# status='enrolled' if and only if an attempts row carries it —
+#
+#     if exists(select 1 from attempts where referral_id=r.id and outcome='enrolled')
+#
+# and NOTHING wrote it. Our own successful submit records `submitted`, correctly:
+# submitting a form is not the org accepting, and collapsing those two would destroy the
+# distinction that is the whole product (§7). So a live referral could reach `submitted`
+# and never reach `enrolled` -> never `completed`. The loop could not close on live data.
+ORG_DECISION_OUTCOME: dict[str, str] = {
+    "accepted": "enrolled",          # -> status='enrolled', then migration 002's check-in
+    "rejected": "rejected",          # org said no -> advance_referral moves down the list
+    "no_response": "no_response",    # exhausted -> try_next_resource
+    "ineligible": "ineligible",      # patient not eligible for THIS service
+}
+
+# The same decisions in OUR offline vocabulary, for the mock scheduler (§7a). `submitted`
+# is the from_state, so success -> confirmed and failed -> escalated.
+ORG_DECISION_STATUS: dict[str, str] = {
+    "accepted": "success",
+    "rejected": "failed",
+    "no_response": "failed",
+    "ineligible": "needs_human",
+}
+
+
+# The live `attempts.channel` CHECK, read off the deployed schema 2026-07-28. Validated
+# here rather than at the insert: PostgREST reports a CHECK violation as an opaque 500
+# from deep inside `record_shared_attempt`, and only ever against the real DB — the mock
+# accepts anything, so no test would catch it.
+ATTEMPT_CHANNELS = ("online_form", "phone", "email", "sms", "whatsapp")
+
+
+class OrgResponse(BaseModel):
+    """The service organisation's answer to a submitted application.
+
+    Posted by whatever parses the org's reply — today the SW dashboard's "Org accepted"
+    control, and the org-email webhook once ``ORG_BACKEND_URL`` is pointed at us. Both
+    hit this same endpoint, so wiring the email leg later needs no new code path.
+    """
+
+    referral_id: str
+    decision: str                        # ORG_DECISION_OUTCOME keys
+    attempt_no: int | None = None        # defaults to the next free number
+    channel: str = "email"               # how they answered; ATTEMPT_CHANNELS
+    confirmation_id: str | None = None
+    note: str | None = None
+    external_id: str | None = None       # their message id, for webhook dedupe
+
+    @field_validator("channel")
+    @classmethod
+    def _known_channel(cls, v: str) -> str:
+        if v not in ATTEMPT_CHANNELS:
+            raise ValueError(f"channel must be one of {list(ATTEMPT_CHANNELS)}, got {v!r}")
+        return v
+
+
+class PatientUtilization(BaseModel):
+    """Whether the patient actually used the resource — MILESTONE 2 (§7).
+
+    Posted today by the dashboard's "Patient used it ✓" control; later by Messaging when
+    the patient answers the check-in text. Deliberately NOT folded into `OrgResponse`:
+    the two milestones are different facts about different people, and every incumbent
+    in this space collapses them.
+    """
+
+    referral_id: str
+    used: bool
+    note: str | None = None
+
+
+# --- The durable webhook log (A12) -------------------------------------------
+# `integration_events.provider` is CHECK-constrained to twilio / retell / karthik_form,
+# so an inbound event is logged under the SENDING service's provider name, not ours.
+PROVIDER_FOR_SEAM = {"voice": "retell", "patient_comms": "twilio"}
+
+# Queued directly onto the live bus (via ReferralDB.queue_action) once Voice confirms an
+# actual booking — not by advance_referral() itself, which never emits this action type.
+# `backend/patient_comms`'s poller (repo.py NOTIFY_ACTION) already listens for exactly
+# this (action_type, component) pair; this is the first thing that ever queues it.
+NOTIFY_PATIENT_ACTION_TYPE = "notify_patient"
+NOTIFY_PATIENT_COMPONENT = "twilio"
+
+
+# `advance_referral`'s open-action guard treats all three as "someone is still working".
+OPEN_ACTION_STATUSES = ("ready", "in_progress", "blocked")
+
+
+async def _close_open_actions(db: ReferralDB, referral_id: str,
+                              action_types: tuple[str, ...], status: str) -> list[str]:
+    """Close every open action of `action_types` on this referral. Best-effort.
+
+    Used where a human records a signal a teammate's service would normally record: the
+    action that service was holding open has to be closed too, or `advance_referral`'s
+    first guard ("any open action -> waiting") freezes the referral on the very event
+    that should have moved it.
+    """
+    closed: list[str] = []
+    try:
+        actions = await db.list_actions(referral_id)
+    except Exception:                                    # noqa: BLE001 — best effort
+        return closed
+    for a in actions:
+        if (a.get("action_type") in action_types
+                and a.get("action_status") in OPEN_ACTION_STATUSES):
+            try:
+                await db.set_action_status(a["id"], status,
+                                           result={"closed_by": "dashboard_human_signal"})
+                closed.append(a["id"])
+            except Exception:                            # noqa: BLE001
+                pass
+    return closed
+
+
+async def _log_event(db: ReferralDB, *, provider: str, event_type: str, payload: dict,
+                     referral_id: str, external_id: str | None,
+                     status: str = "processed", error: str | None = None) -> None:
+    """Persist one inbound webhook. Best-effort by design: the event has already been
+    APPLIED by the time we get here, so failing the request because the audit write
+    failed would turn a bookkeeping problem into a lost referral transition. A failure
+    is printed and swallowed.
+
+    `external_id` is the sender's own id (Retell's call_id, Messaging's outreach_id),
+    which is what makes the live UNIQUE (provider, external_id, event_type) able to
+    collapse a retried webhook into one row. Without one the row still lands — Postgres
+    treats NULLs as distinct — it just won't dedupe.
+    """
+    try:
+        await db.record_integration_event({
+            "provider": provider,
+            "event_type": event_type,
+            "payload": payload,
+            "referral_id": referral_id,
+            "external_id": external_id,
+            "processing_status": status,
+            "error_message": error,
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as exc:                      # noqa: BLE001 — see docstring
+        print(f"[inbound] integration_events write failed (non-fatal): "
+              f"{type(exc).__name__}: {exc}")
+
+
 def build_router(db: ReferralDB, tools: Tools) -> APIRouter:
     """Return the inbound-adapter router bound to this app's ``db`` + tool map.
 
@@ -120,35 +267,250 @@ def build_router(db: ReferralDB, tools: Tools) -> APIRouter:
             "steps": [o.model_dump() for o in steps],
         }
 
-    @router.post("/api/voice/call-outcome")
-    async def voice_call_outcome(body: VoiceCallOutcome) -> dict:
-        status = VOICE_STATUS_MAP.get(body.status)
-        if status is None:
-            raise HTTPException(
-                422, f"unknown voice status '{body.status}'; "
-                     f"expected one of {sorted(VOICE_STATUS_MAP)}",
-            )
-        data = body.model_dump(exclude_none=True, exclude={"referral_id", "attempt_no"})
-        data["voice_status"] = body.status   # keep the raw status for the UI / audit
-        return await _apply_and_cascade(
-            body.referral_id, status=status, channel="phone",
-            attempt_no=body.attempt_no, data=data,
-        )
+    async def _handle(body, *, provider: str, event_type: str, mapped,
+                      known: list[str], channel_for: str, data_key: str) -> dict:
+        """Shared shape for both seams: log the raw event, then apply it.
 
-    @router.post("/api/patient-comms/event")
-    async def patient_comms_event(body: PatientCommsEvent) -> dict:
-        mapped = PATIENT_COMMS_EVENT_MAP.get(body.event)
+        Every arrival is logged, including the two rejections — an unrecognised
+        vocabulary word and an unknown referral are exactly the failures you want a
+        durable trace of, since both are silent from the sender's side (A12).
+        """
+        payload = body.model_dump()
+        external_id = getattr(body, "call_id", None) or getattr(body, "outreach_id", None)
+
         if mapped is None:
-            raise HTTPException(
-                422, f"unknown patient-comms event '{body.event}'; "
-                     f"expected one of {sorted(PATIENT_COMMS_EVENT_MAP)}",
-            )
-        status, channel = mapped
+            await _log_event(db, provider=provider, event_type=event_type, payload=payload,
+                             referral_id=body.referral_id, external_id=external_id,
+                             status="failed", error=f"unknown value; expected one of {known}")
+            raise HTTPException(422, f"unknown {provider} value; expected one of {known}")
+
+        try:
+            await db.get_referral(body.referral_id)
+        except KeyError:
+            # referral_id is a FK, so an unknown one cannot be stored — log it detached
+            # rather than losing the trace entirely.
+            await _log_event(db, provider=provider, event_type=event_type, payload=payload,
+                             referral_id=None, external_id=external_id,
+                             status="failed", error=f"unknown referral '{body.referral_id}'")
+            raise HTTPException(404, f"unknown referral '{body.referral_id}'")
+
+        status, channel = mapped if isinstance(mapped, tuple) else (mapped, channel_for)
         data = body.model_dump(exclude_none=True, exclude={"referral_id", "attempt_no"})
-        data["patient_comms_event"] = body.event
-        return await _apply_and_cascade(
+        data[data_key] = event_type          # keep the raw value for the UI / audit
+        result = await _apply_and_cascade(
             body.referral_id, status=status, channel=channel,
             attempt_no=body.attempt_no, data=data,
         )
+        await _log_event(db, provider=provider, event_type=event_type, payload=payload,
+                         referral_id=body.referral_id, external_id=external_id)
+        return result
+
+    @router.post("/api/voice/call-outcome")
+    async def voice_call_outcome(body: VoiceCallOutcome) -> dict:
+        """Record Retell's call result and hand control back to whichever scheduler
+        owns transitions (§7a).
+
+        Unlike the org/patient-comms seams, `call_agent` already writes the shared
+        `attempts` row itself — its own Supabase client, `db.py`'s `save_call_outcome`
+        — *before* this forward ever arrives. So live, this seam doesn't write attempts
+        again; it re-runs `advance_referral()` so the DB actually sees that row, and —
+        only when the call really confirmed a booking — queues the patient's
+        booking-confirmed WhatsApp (`notify_patient`/`twilio`), which nothing else in
+        the live pipeline queues today (`advance_referral()` only ever emits
+        `confirm_consent` and `confirm_service_utilization` to that component;
+        `backend/patient_comms`'s poller already listens for `notify_patient` — it's
+        just never been queued from anywhere).
+        """
+        mapped = VOICE_STATUS_MAP.get(body.status)
+        payload = body.model_dump()
+        provider = PROVIDER_FOR_SEAM["voice"]
+
+        if mapped is None:
+            await _log_event(db, provider=provider, event_type=body.status,
+                             payload=payload, referral_id=body.referral_id,
+                             external_id=body.call_id, status="failed",
+                             error=f"unknown voice status; expected one of {sorted(VOICE_STATUS_MAP)}")
+            raise HTTPException(
+                422, f"unknown voice status '{body.status}'; expected one of "
+                     f"{sorted(VOICE_STATUS_MAP)}")
+
+        try:
+            referral = await db.get_referral(body.referral_id)
+        except KeyError:
+            await _log_event(db, provider=provider, event_type=body.status,
+                             payload=payload, referral_id=None, external_id=body.call_id,
+                             status="failed", error=f"unknown referral '{body.referral_id}'")
+            raise HTTPException(404, f"unknown referral '{body.referral_id}'")
+
+        if getattr(db, "kind", type(db).__name__) != "MockReferralDB":
+            advanced = await db.advance_referral(body.referral_id)
+            notify_action_id = None
+            if mapped == "success":   # Retell's "confirmed" -- a real booking now exists
+                notify_action_id = await db.queue_action(
+                    body.referral_id, referral.get("service_id"),
+                    NOTIFY_PATIENT_ACTION_TYPE, NOTIFY_PATIENT_COMPONENT,
+                    f"notify:{body.referral_id}:{body.call_id or 'nocall'}",
+                    "Voice confirmed a booking; notify the patient",
+                )
+            result = {"advanced": advanced, "notify_action_id": notify_action_id}
+        else:
+            data = body.model_dump(exclude_none=True, exclude={"referral_id", "attempt_no"})
+            data["voice_status"] = body.status
+            result = await _apply_and_cascade(
+                body.referral_id, status=mapped, channel="phone",
+                attempt_no=body.attempt_no, data=data,
+            )
+
+        await _log_event(db, provider=provider, event_type=body.status,
+                         payload=payload, referral_id=body.referral_id,
+                         external_id=body.call_id)
+        return result
+
+    @router.post("/api/patient-comms/event")
+    async def patient_comms_event(body: PatientCommsEvent) -> dict:
+        return await _handle(
+            body, provider=PROVIDER_FOR_SEAM["patient_comms"], event_type=body.event,
+            mapped=PATIENT_COMMS_EVENT_MAP.get(body.event),
+            known=sorted(PATIENT_COMMS_EVENT_MAP), channel_for="whatsapp",
+            data_key="patient_comms_event",
+        )
+
+    @router.post("/api/org/response")
+    async def org_response(body: OrgResponse) -> dict:
+        """Record the service organisation's answer — MILESTONE 1 (§7).
+
+        This is the one seam that had no implementation, and its absence meant the loop
+        could not close on live data at all (see ORG_DECISION_OUTCOME above).
+
+        Unlike the Voice and Messaging seams, this one writes a **shared `attempts` row**
+        rather than only driving our offline scheduler, because live it's that row —
+        specifically `outcome='enrolled'` — that `advance_referral` reads. Offline it
+        falls through to `apply_inbound` as before, so `run_demo.py` is unchanged.
+        """
+        outcome_value = ORG_DECISION_OUTCOME.get(body.decision)
+        payload = body.model_dump()
+        if outcome_value is None:
+            await _log_event(db, provider="karthik_form", event_type=body.decision,
+                             payload=payload, referral_id=body.referral_id,
+                             external_id=body.external_id, status="failed",
+                             error=f"unknown decision; expected one of "
+                                   f"{sorted(ORG_DECISION_OUTCOME)}")
+            raise HTTPException(
+                422, f"unknown decision '{body.decision}'; expected one of "
+                     f"{sorted(ORG_DECISION_OUTCOME)}")
+        try:
+            referral = await db.get_referral(body.referral_id)
+        except KeyError:
+            await _log_event(db, provider="karthik_form", event_type=body.decision,
+                             payload=payload, referral_id=None,
+                             external_id=body.external_id, status="failed",
+                             error=f"unknown referral '{body.referral_id}'")
+            raise HTTPException(404, f"unknown referral '{body.referral_id}'")
+
+        service_id = referral.get("service_id")
+        attempt_no = body.attempt_no or await db.next_attempt_number(
+            body.referral_id, service_id)
+        await db.record_shared_attempt({
+            "referral_id": body.referral_id,
+            "service_id": service_id,
+            "attempt_number": attempt_no,
+            "channel": body.channel,
+            # `manual` while a human clicks it; the email webhook will keep it, since the
+            # org is not one of the CHECK-allowed providers either way.
+            "provider": "manual",
+            "direction": "inbound",
+            "status": "completed",
+            "outcome": outcome_value,
+            "structured_result": {"decision": body.decision,
+                                  "confirmation_id": body.confirmation_id},
+            "notes": body.note,
+        })
+
+        # Hand straight back to whichever scheduler owns transitions here (§7a). Live
+        # that's advance_referral, which now sees the attempts row we just wrote.
+        # `kind` is DBSwitch's property; a bare adapter (as the tests pass) has none, so
+        # fall back to its class name rather than mis-routing to the offline branch.
+        result: dict
+        if getattr(db, "kind", type(db).__name__) != "MockReferralDB":
+            result = {"advanced": await db.advance_referral(body.referral_id),
+                      "outcome": outcome_value, "attempt_number": attempt_no}
+        else:
+            result = await _apply_and_cascade(
+                body.referral_id, status=ORG_DECISION_STATUS[body.decision],
+                channel=body.channel, attempt_no=attempt_no,
+                data={"org_decision": body.decision,
+                      "confirmation_id": body.confirmation_id},
+            )
+            result["outcome"] = outcome_value
+
+        await _log_event(db, provider="karthik_form", event_type=body.decision,
+                         payload=payload, referral_id=body.referral_id,
+                         external_id=body.external_id)
+        return result
+
+    @router.post("/api/patient/utilization")
+    async def patient_utilization(body: PatientUtilization) -> dict:
+        """Record whether the patient actually USED the resource — MILESTONE 2 (§7).
+
+        The counterpart to `/api/org/response`, and the more important of the two: "the
+        org said yes" is what every incumbent already reports, and "the patient got
+        helped" is the one this product exists to prove.
+
+        Live, the only writer of `referrals.patient_confirmed_utilization` is Messaging's
+        own poller when the patient answers the check-in text. So with that service
+        degraded — or simply with nobody's phone joined to the Twilio sandbox — a live
+        referral reached `enrolled` and stopped, and the loop could not be shown closing
+        on real data at all. Same escape hatch as milestone 1: a human records the signal
+        the webhook will record later, through the same column, so wiring the real leg
+        needs no new code path here.
+
+        We set the column and hand straight back to whichever scheduler owns transitions
+        — `advance_referral` derives `completion_outcome` from it. Deriving that here too
+        would make us a second owner of the same decision.
+        """
+        payload = body.model_dump()
+        try:
+            await db.get_referral(body.referral_id)
+        except KeyError:
+            await _log_event(db, provider="karthik_form", event_type="utilization",
+                             payload=payload, referral_id=None, external_id=None,
+                             status="failed",
+                             error=f"unknown referral '{body.referral_id}'")
+            raise HTTPException(404, f"unknown referral '{body.referral_id}'")
+
+        await db.set_patient_utilization(body.referral_id, body.used)
+        # Close the check-in action this answer resolves, or nothing moves. Milestone 2
+        # is queued as `confirm_service_utilization` -> twilio, and `advance_referral`'s
+        # FIRST guard is "any open action -> waiting" — so setting the column alone left
+        # it returning {"state":"waiting","reason":"An action is already open"} forever
+        # (verified live 2026-08-01). Messaging normally closes it when the patient
+        # replies; a human recording that same answer has to do the same job.
+        # Best-effort: the answer is already stored, and failing here would report the
+        # click as failed when it wasn't.
+        await _close_open_actions(
+            db, body.referral_id,
+            ("confirm_service_utilization", "notify_patient"),
+            "completed" if body.used else "failed",
+        )
+
+        if getattr(db, "kind", type(db).__name__) != "MockReferralDB":
+            result = {"advanced": await db.advance_referral(body.referral_id),
+                      "used": body.used}
+        else:
+            result = await _apply_and_cascade(
+                body.referral_id,
+                status="success" if body.used else "failed",
+                channel="whatsapp",
+                attempt_no=None,
+                data={"patient_utilization": body.used},
+            )
+            result["used"] = body.used
+
+        await _log_event(db, provider="karthik_form",
+                         event_type="utilization_confirmed" if body.used
+                                    else "utilization_declined",
+                         payload=payload, referral_id=body.referral_id,
+                         external_id=None)
+        return result
 
     return router

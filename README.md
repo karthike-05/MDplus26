@@ -1,4 +1,6 @@
-# Catalyst-26 — Referral-to-Completion Agent
+# Relay — Referral-to-Completion Agent
+
+*(repo name `Catalyst-26`; the product is **Relay**)*
 
 An agent that closes the **referral-to-completion** loop for social services: a clinic
 initiates a referral (with patient consent), a backend agent attempts outreach
@@ -7,6 +9,11 @@ worker, and a utilization check-in fires after enrollment.
 
 > **Read [`CLAUDE.md`](CLAUDE.md) before writing code** — it defines the seams,
 > contracts, and conventions that let the team build in parallel.
+>
+> **Picking this up for the first time?** Start with
+> [`docs/local-setup.md`](docs/local-setup.md) — clone-to-running in ~5 minutes plus a
+> click-by-click UI walkthrough, with no database, credentials, or teammate's service
+> needed.
 
 ## Quick start
 
@@ -14,12 +21,26 @@ worker, and a utilization check-in fires after enrollment.
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-python run_demo.py      # headless end-to-end (PDF)
-pytest -q               # layered suite — 81 tests, no DB / browser / network needed
+python run_demo.py      # headless end-to-end (PDF) — always the fixture mock
+pytest tests -q         # layered suite — 190 tests, no DB / browser / network needed
 
-uvicorn backend.main:app --reload            # backend on :8000
-cd frontend && npm install && npm run dev    # UI on :5173
+# The whole app on one port: the backend serves the built frontend (see the StaticFiles
+# mount at the bottom of backend/main.py), so this is the deployable shape too.
+cd frontend && npm install && npm run build && cd ..
+uvicorn backend.main:app --reload            # app on http://localhost:8000
+                                             # add ?dev=1 for the Integration tab
+                                             # + data-source pill (CLAUDE.md §2a)
+
+# ...or, while editing the UI, run Vite separately:
+cd frontend && npm run dev                   # UI on :5173, API still on :8000
 ```
+
+> `pytest tests -q`, not bare `pytest -q` — the latter also collects
+> `backend/patient_comms/`, which is Messaging's subtree and needs `sqlalchemy`.
+
+**Running a walkthrough?** [`docs/demo-walkthrough.md`](docs/demo-walkthrough.md) —
+it separates the product demo (works today, depends on nobody) from the live
+four-service demo, and lists what each teammate has to check first.
 
 Everything runs offline out of the box: with no `.env`, `make_db()` returns the fixture
 mock and `make_phone_call` records a visibly stubbed dispatch rather than dialing. Copy
@@ -65,10 +86,18 @@ are interchangeable because of two shared contracts — not shared code:
 - **Every tool returns the same `ToolOutcome`** (`contracts/models.py`) and writes one
   row to the shared `attempts` log. Signature for all of them:
   `tool(referral_id, db, *, attempt_id, from_state) -> ToolOutcome`.
-- **One scheduler** (`backend/orchestrator/scheduler.py`) reads `referrals.current_state`,
-  picks the method (`outreach_channel` → `OUTREACH_TOOLS`), runs it, and advances state
-  from the outcome. Long/async work (a phone call, an email acceptance) returns later as
-  an **inbound** `ToolOutcome` via `scheduler.apply_inbound` — same table, same shape.
+- **One scheduler.** *Offline* that's `backend/orchestrator/scheduler.py`, reading
+  `referrals.current_state` and picking the method (`outreach_channel` →
+  `OUTREACH_TOOLS`). *Live* it's the database's own `advance_referral()`, which queues
+  work into `referral_actions` addressed to a component — there is no `current_state`
+  column there, deliberately, and `set_state()` is a no-op on the real adapters. Two
+  orchestrators, one set of tools; see [`CLAUDE.md` §7a](CLAUDE.md). Long/async work (a
+  phone call, an email acceptance) returns later as an **inbound** `ToolOutcome` — same
+  table, same shape.
+- **A worker joins the shared bus** (`backend/orchestrator/worker.py`), polling
+  `referral_actions` for the two components we own — `karthik_form` and `backend` —
+  draining each tick and reclaiming actions stranded by a crash. It starts with the app;
+  `GET /api/worker` and the **Integration** screen show what it's doing.
 
 Messaging (Railway) and Voice (their own infra) never import this repo. They connect
 through **two inbound adapter endpoints** on our backend — `POST /api/voice/call-outcome`
@@ -107,8 +136,13 @@ before flipping, both in [`docs/integration-status.md`](docs/integration-status.
   (`backend/orchestrator/actions.py`). So there are **two orchestrators** — ours offline,
   theirs live. `MockReferralDB` mirrors `advance_referral` in Python so the same worker
   code runs both ways.
-- **The live flow is currently blocked** upstream of us: nothing writes
-  `referral_service_candidates`, so referrals park at `status='ranking'`.
+- **The social worker picks the service, not the scheduler** (`003_sw_selection_gate.sql`,
+  CLAUDE.md §7b). A ranked referral parks at `awaiting_sw_selection` until someone
+  chooses on the dashboard; that choice is what triggers outreach and what trains the
+  ranker.
+- **Live is not self-starting yet:** Ranking writes `referral_service_candidates`
+  correctly as of 2026-07-28, but nothing *triggers* a ranking run — they built no
+  poller by design (`docs/whats-left.md` A1b).
 
 ### If you're picking this up fresh
 

@@ -47,8 +47,24 @@ class ReferralDB(Protocol):
     # this is where form-fill sources its request-specific values from and writes the
     # reviewed values back to — rather than duplicating them onto the referral.
     # Returns {} when there is no row yet. CONTRACT TOUCH — announced.
+    #
+    # save_service_request UPSERTS: update the newest row for this referral if one
+    # exists, else INSERT it (defaulting request_status='draft' and looking up
+    # patient_id when the caller didn't supply either — both NOT NULL with no default).
+    # A bare UPDATE silently no-ops on a referral with no row yet, which is exactly the
+    # B13 gap this closes: intake now creates the row up front, and a reviewer's first
+    # write-back on a referral that still has no row persists instead of vanishing.
     async def get_service_request(self, referral_id: str) -> dict: ...
     async def save_service_request(self, referral_id: str, fields: dict) -> None: ...
+
+    # Nothing else creates this row (no DB trigger, verified via supabase MCP) — a
+    # referral needing service_requests data must call this once, right after
+    # create_referral. save_service_request above now upserts too, so this isn't the
+    # only path to a first row anymore, but it stays the intake-time insert since it
+    # also takes patient_id explicitly instead of deriving it from the referral.
+    # CONTRACT TOUCH — announced.
+    async def create_service_request(self, referral_id: str, patient_id: str,
+                                      fields: dict) -> str: ...
 
     # --- The shared action queue (backend/orchestrator/actions.py) -----------
     # The live DB owns a scheduler, `advance_referral()`, which queues work into
@@ -62,3 +78,73 @@ class ReferralDB(Protocol):
                                result: dict | None = None, error: str | None = None) -> None: ...
     async def record_shared_attempt(self, row: dict) -> None: ...
     async def advance_referral(self, referral_id: str) -> dict: ...
+
+    # Queues a NEW row directly into the bus — the same primitive `advance_referral()`
+    # calls internally (SQL `queue_referral_action()`), reused here rather than
+    # reimplemented so the ON CONFLICT dedup key + agent_decisions audit row stay
+    # identical to every other action on the bus. The only Python caller today is the
+    # Voice call-outcome seam (backend/adapters/inbound.py), queuing `notify_patient`
+    # once a call actually confirms a booking — every other action type is queued BY
+    # advance_referral() itself, never from Python. Already satisfied by
+    # MockReferralDB's existing internal `queue_action`, used by its own
+    # advance_referral mirror. CONTRACT TOUCH — announced.
+    async def queue_action(self, referral_id: str, service_id: str | None,
+                           action_type: str, component: str, key: str, reason: str,
+                           payload: dict | None = None) -> str: ...
+
+    # `attempts.attempt_number` is NOT NULL with NO default, and the table carries a
+    # UNIQUE (referral_id, service_id, attempt_number). So a shared attempt cannot be
+    # written without one — an omission fails the insert outright rather than
+    # defaulting. This returns the next free number for that (referral, service) pair.
+    # CONTRACT TOUCH — announced.
+    async def next_attempt_number(self, referral_id: str, service_id: str | None) -> int: ...
+
+    # Crash recovery for the worker (docs/whats-left.md A5). An action marked
+    # `in_progress` by a worker that then died stays that way forever, and
+    # `advance_referral`'s first guard ("any open action -> waiting") turns that into a
+    # permanent deadlock for its referral. This resets long-stalled `in_progress` rows
+    # back to `ready` so another pass can claim them. Returns how many it reclaimed.
+    #
+    # ONLY `in_progress` — never `blocked`. `prepare_online_form` leaves its action
+    # `blocked` on purpose while it waits for a human reviewer (§2: form outreach is
+    # human-gated), and reclaiming those would re-run the prepare in a loop behind the
+    # reviewer's back.
+    async def reclaim_stale_actions(self, component: str, older_than_seconds: int) -> int: ...
+
+    # The durable inbound-webhook log (`integration_events`, docs/whats-left.md A12).
+    # Our adapters used to apply-and-forget, which made a dropped or duplicated webhook
+    # untraceable. Keys on the live UNIQUE (provider, external_id, event_type) when the
+    # caller has an external id; without one Postgres treats NULLs as distinct, so the
+    # row is appended rather than deduped. CONTRACT TOUCH — announced.
+    async def record_integration_event(self, event: dict) -> None: ...
+
+    # --- Read-only diagnostics (the /api/system panel) -----------------------
+    # Four services share one queue, and the failure modes are all *silent*: an action
+    # nobody polls, a candidate list nobody wrote, a webhook that never arrived. None of
+    # those raise anywhere. These three reads are what make that visible on one screen
+    # instead of only in psql. CONTRACT TOUCH — announced.
+    async def list_actions(self, referral_id: str | None = None,
+                           limit: int = 50) -> list[dict]: ...
+    async def list_integration_events(self, limit: int = 20) -> list[dict]: ...
+    async def list_candidates(self, referral_id: str) -> list[dict]: ...
+
+    # The social worker's pick (003_sw_selection_gate.sql). Flags one candidate
+    # `selected` and releases the rest back to `available`, which is the signal
+    # `advance_referral` adopts instead of ranking for itself. Writing
+    # `referrals.service_id` alone is not enough: the shortlist would still claim a
+    # different row was chosen, and any later `try_next_resource` would reason from it.
+    # CONTRACT TOUCH — announced.
+    async def select_candidate(self, referral_id: str, service_id: str) -> None: ...
+
+    # MILESTONE 2 — did the patient actually USE the resource (§7)? Live, the only
+    # writer of `referrals.patient_confirmed_utilization` is Messaging's own poller
+    # (backend/patient_comms/repo.py), when the patient answers the check-in text. So
+    # when that service is down — or nobody's phone is in the Twilio sandbox — a live
+    # referral can reach `enrolled` and never close, and the differentiator the whole
+    # product is built around is undemonstrable on real data.
+    #
+    # This is the same escape hatch `POST /api/org/response` already is for milestone 1
+    # (§7f): a human records the signal that a webhook will record later, through the
+    # same column, so wiring the real leg needs no new code path.
+    # CONTRACT TOUCH — announced.
+    async def set_patient_utilization(self, referral_id: str, used: bool) -> None: ...

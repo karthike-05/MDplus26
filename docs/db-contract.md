@@ -8,10 +8,23 @@ just update the maps at the top of that file. The few things below that genuinel
 *exist* are marked **REQUIRED**; everything else the adapter maps to whatever the shared
 schema already has.
 
-> **Status (2026-07-26):** the maps are now aligned to the live schema, so `patients` and
-> `services` report clean. Three columns genuinely don't exist yet:
-> `referrals.current_state` and `attempts.attempt_id` / `from_state`. Verify anytime with
-> `python -m backend.scripts.db_introspect`.
+> **Status (2026-07-27): this document describes the ORIGINAL contract, and the live
+> schema won the argument on three points.** Kept for the rationale; where it disagrees
+> with the live DB, the live DB wins and `backend/db/supabase.py`'s `*_COLS` maps are
+> authoritative. Verify anytime with `python -m backend.scripts.db_introspect`.
+>
+> 1. **`referrals.current_state` does not exist and must never be added** (§7a). The live
+>    DB ships its own scheduler, `advance_referral()`, plus a `referral_actions` queue; a
+>    second state column would be a second owner of truth. `set_state()` is a documented
+>    no-op on both real adapters, and the dashboard translates *their* `status` for
+>    display only.
+> 2. **`referrals.form_id` does not exist.** The form is resolved through
+>    `form_templates.service_id` — a better design, since a form belongs to a service
+>    rather than to each referral.
+> 3. **`attempts.attempt_id` / `from_state` do not exist**, and aren't needed:
+>    `referral_actions(referral_id, deduplication_key)` is already the idempotency key.
+>    But `attempts.attempt_number` **is** NOT NULL with no default and carries a UNIQUE
+>    `(referral_id, service_id, attempt_number)` — see `next_attempt_number()`.
 
 > The DB is the integration bus (CLAUDE.md §2, §5a). Nobody imports anybody's code;
 > everyone reads/writes rows. That's what ties form/SMS/phone back together.

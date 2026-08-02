@@ -144,6 +144,93 @@ def upsert_ranking_results(rows: list[dict]) -> list[dict]:
     )
 
 
+# --- referral_service_candidates + the shared action queue -------------------
+# `referral_service_candidates` is the *only* table `advance_referral()` reads to pick
+# a service -- `ranking_results` is invisible to it (handoff-ranking-candidates.md §1).
+# Writing candidates alone still leaves the referral deadlocked on its open
+# `rank_resources` action (§3), so both steps happen together in rank_referral().
+
+
+def upsert_referral_service_candidates(rows: list[dict]) -> list[dict]:
+    """Upsert survivors into referral_service_candidates.
+
+    Deliberately does NOT touch `rank` (or `candidate_status`/`selected`) on an
+    existing row: there's a UNIQUE(referral_id, rank) constraint, and a blind
+    full-column upsert risks colliding mid-statement on a re-rank that permutes the
+    order. Existing (referral_id, service_id) rows only get score/reasons refreshed.
+    A genuine re-rank needs a delete+re-insert, and only once no candidate has left
+    'available' -- not handled here (handoff-ranking-candidates.md §2, out of scope
+    for this pass).
+    """
+    if not rows:
+        return []
+    referral_id = rows[0]["referral_id"]
+    existing_ids = {
+        row["service_id"]
+        for row in (
+            _supabase.table("referral_service_candidates")
+            .select("service_id")
+            .eq("referral_id", referral_id)
+            .execute()
+            .data
+        )
+    }
+
+    to_insert = [row for row in rows if row["service_id"] not in existing_ids]
+    to_update = [row for row in rows if row["service_id"] in existing_ids]
+
+    results = []
+    if to_insert:
+        results += (
+            _supabase.table("referral_service_candidates").insert(to_insert).execute().data
+        )
+    for row in to_update:
+        results += (
+            _supabase.table("referral_service_candidates")
+            .update({"score": row["score"], "reasons": row["reasons"], "updated_at": "now()"})
+            .eq("referral_id", row["referral_id"])
+            .eq("service_id", row["service_id"])
+            .execute()
+            .data
+        )
+    return results
+
+
+def get_open_rank_resources_action(referral_id: str) -> dict | None:
+    """The `rank_resources` action addressed to us. There's no dedicated 'ranking'
+    value in referral_actions' assigned_component CHECK constraint (verified live:
+    backend/twilio/retell/karthik_form/social_worker only), so this queries by
+    action_type + referral_id rather than by component. None if nothing is open."""
+    rows = (
+        _supabase.table("referral_actions")
+        .select("id")
+        .eq("referral_id", referral_id)
+        .eq("action_type", "rank_resources")
+        .in_("action_status", ["ready", "in_progress", "blocked"])
+        .execute()
+        .data
+    )
+    return rows[0] if rows else None
+
+
+def close_rank_resources_action(action_id: str, candidate_count: int) -> None:
+    _supabase.table("referral_actions").update(
+        {
+            "action_status": "completed",
+            "result": {"candidates": candidate_count},
+            "completed_at": "now()",
+            "updated_at": "now()",
+        }
+    ).eq("id", action_id).execute()
+
+
+def advance_referral(referral_id: str) -> dict:
+    """Hand control back to the DB's own scheduler -- it, not us, decides the next
+    step (handoff-ranking-candidates.md §3)."""
+    res = _supabase.rpc("advance_referral", {"p_referral_id": referral_id}).execute()
+    return res.data if isinstance(res.data, dict) else {"result": res.data}
+
+
 def get_ranking_results(referral_id: str) -> list[dict]:
     """GET /ranking-results/{referral_id}. SW-facing ranked list for a
     referral: survivors only, ordered by rank, with service_name and

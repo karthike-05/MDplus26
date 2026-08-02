@@ -14,20 +14,29 @@ Uses MockReferralDB now; swapping in SupabaseReferralDB changes nothing here.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
+import re
+from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from contracts.models import DashboardRow
+from backend import app_auth
 from backend.adapters.inbound import build_router as build_inbound_router
 from backend.db.interface import ReferralDB
 from backend.db.mock import MockReferralDB
+from backend.intake.geocode import geocode
+from backend.orchestrator import actions as act
 from backend.orchestrator import scheduler
 from backend.orchestrator import state_machine as sm
+from backend.orchestrator import worker
 from backend.tools.fill_form.fill_form import prepare, submit
 from backend.tools.fill_form.pdf_render import get_page_size, render_page_png
 from backend.tools.make_phone_call import make_phone_call
@@ -113,7 +122,31 @@ class DBSwitch:
         self._impl = impl
 
 
-app = FastAPI(title="Catalyst-26")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Own the `karthik_form` worker for the life of the process (A5).
+
+    The worker holds `db` — the DBSwitch, not the implementation — so flipping the data
+    source from the UI redirects the running worker too, rather than leaving it polling
+    the store you just switched away from.
+    """
+    task = None
+    worker.status.enabled = worker.enabled()
+    if worker.status.enabled:
+        task = asyncio.create_task(worker.run_forever(db))
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+            # Await the cancellation so the loop's `finally` runs before the process
+            # exits — otherwise a shutdown mid-tick can leave an action `in_progress`
+            # with nothing to reclaim it until the next deploy.
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+app = FastAPI(title="Catalyst-26", lifespan=lifespan)
 
 # The Vite dev server is the default so local dev needs no config. A deployed frontend
 # lives on another origin, so ALLOWED_ORIGINS (comma-separated) must list it or every
@@ -131,6 +164,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# The shared-password gate (backend/app_auth.py). No-op unless APP_PASSWORD is set, so
+# local dev and the test suite are untouched. Registered AFTER CORSMiddleware so it runs
+# INSIDE it — `add_middleware` prepends, so the last one added is the outermost, and a
+# 401 must still carry CORS headers or the browser reports a CORS failure instead of an
+# auth prompt.
+app.middleware("http")(app_auth.middleware)
+
 db = DBSwitch(make_db())
 
 # Inbound seams to the Voice + Messaging services (docs/integration-plan.md). The
@@ -140,6 +180,47 @@ app.include_router(build_inbound_router(db, TOOLS))
 
 
 # --- Request models ----------------------------------------------------------
+
+def _normalize_date(v: str, *, field: str = "date of birth") -> str:
+    """Any DATE column rejects what Postgres can't parse as an opaque 500
+    (`invalid input syntax for type date: "j"` — hit live on 2026-07-28 by typing a
+    letter into the DOB field). Validate at the edge instead, where FastAPI turns it
+    into a 422 the UI can actually render. Shared by `patients.date_of_birth` and
+    `service_requests.requested_date` — same column type, same failure mode.
+
+    Accepts ISO `YYYY-MM-DD` and US `MM/DD/YYYY` — the fixtures use the latter
+    (`tests/test_intake.py`) and a social worker is likelier to type it. Ambiguous
+    day/month ordering is resolved US-style; this is a US healthcare demo.
+    """
+    raw = (v or "").strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(raw, fmt).date().isoformat()
+        except ValueError:
+            continue
+    raise ValueError(f"{field} must be YYYY-MM-DD or MM/DD/YYYY, got {raw!r}")
+
+
+def _normalize_phone(v: str) -> str:
+    """Store E.164. Messaging's Twilio provider prefixes `whatsapp:` and sends as-is —
+    its docstring states the app stores "plain E.164 (+1...) numbers" — so a number
+    saved as `408-898-8088` becomes `whatsapp:408-898-8088` and Twilio rejects it in
+    *their* logs, which reads here as a loop that silently stalled. US-only, matching
+    the demo's scope; an explicit `+<country>` is passed through untouched.
+    """
+    raw = (v or "").strip()
+    if raw.startswith("+"):
+        if re.fullmatch(r"\+\d{8,15}", raw):
+            return raw
+        raise ValueError(f"not a valid E.164 number: {raw!r}")
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    raise ValueError(
+        f"phone must be 10 digits, or E.164 with a leading +, got {raw!r}")
+
 
 class NewPatient(BaseModel):
     name: str
@@ -151,10 +232,41 @@ class NewPatient(BaseModel):
     # consent message, and every channel needs the phone.
     phone: str
     referring_clinic: str
-    address: str | None = None
+    # REQUIRED even though `patients` has no address column: it's the input we geocode
+    # into postal_code / county / latitude / longitude, which is what Ranking's hard
+    # filter reads. Optional, it was left blank, those four stayed NULL, and
+    # /rank-referral 500'd on every referral born in our UI.
+    address: str
     medicaid_id: str | None = None
     mobility_needs: str | None = None
     household_size: str | None = None
+    # The rest of `patients`' writable, non-derived columns (verified via the live
+    # schema) — added so intake can populate them instead of leaving them NULL forever.
+    need_description: str | None = None
+    education_level: str | None = None
+    employment_status: str | None = None
+    marital_status: str | None = None
+    income_status: str | None = None
+    preferred_language: str | None = None
+    insurance_type: str | None = None
+    is_veteran: bool | None = None
+    preferred_contact_method: str | None = None
+    # Normally derived from `address`; accepted explicitly so a caller can supply them
+    # when the geocoder can't resolve an address (rural, PO box, brand-new street).
+    postal_code: str | None = None
+    county: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+
+    @field_validator("dob")
+    @classmethod
+    def _check_dob(cls, v: str) -> str:
+        return _normalize_date(v)
+
+    @field_validator("phone")
+    @classmethod
+    def _check_phone(cls, v: str) -> str:
+        return _normalize_phone(v)
 
 
 class NewReferral(BaseModel):
@@ -166,6 +278,27 @@ class NewReferral(BaseModel):
     referring_clinic: str | None = None
     appointment_date: str | None = None
     appointment_time: str | None = None
+    # `category` picks which trip-detail block the intake UI shows ("transportation" is
+    # the only one wired up so far). When it's "transportation", everything below is
+    # peeled off into its own `service_requests` row (§6a) rather than onto `referrals` —
+    # see SERVICE_REQUEST_FIELDS in create_referral().
+    category: str | None = None
+    pickup_address: str | None = None
+    destination_address: str | None = None
+    pickup_notes: str | None = None
+    destination_notes: str | None = None
+    requested_end_time: str | None = None
+    companion_required: bool | None = None
+    interpreter_required: bool | None = None
+    contact_email: str | None = None
+    emergency_contact: str | None = None
+    special_instructions: str | None = None
+    request_notes: str | None = None
+
+    @field_validator("appointment_date")
+    @classmethod
+    def _check_appointment_date(cls, v: str | None) -> str | None:
+        return _normalize_date(v, field="appointment date") if v else v
 
 
 class ReviewedValues(BaseModel):
@@ -241,22 +374,36 @@ def _patient_response(referral: dict, patient: dict) -> dict:
     }
 
 
-async def _dashboard_row(referral: dict) -> dict:
+async def _dashboard_row(referral: dict, open_sw_selection: set[str] | None = None) -> dict:
     patient = await db.get_patient(referral["patient_id"])
     attempts = await db.list_attempts(referral["id"])
     state = _display_state(referral)
+    # An open `select_resource` addressed to `social_worker` is the SW gate
+    # (003_sw_selection_gate.sql) waiting on a person. It's derived from the ACTION, not
+    # from `status`: the status CHECK has no value for "awaiting a human", and inventing
+    # one would force a schema change on every other service.
+    awaiting_selection = referral["id"] in (open_sw_selection or set())
     row = DashboardRow(
         referral_id=referral["id"],
         patient_name=patient.get("name", ""),
-        service_name=referral.get("service_name", ""),
+        # `or ""` not `.get(k, "")`: live the key EXISTS and is None whenever the
+        # referral has no service yet (a shortlist that hasn't been chosen from), and
+        # DashboardRow.service_name is a plain str.
+        service_name=referral.get("service_name") or "",
         current_state=state,
         confirmation_source=_confirmation_source(state),
-        needs_attention=state in (sm.NEEDS_HUMAN, sm.ESCALATED),
+        needs_attention=state in (sm.NEEDS_HUMAN, sm.ESCALATED) or awaiting_selection,
         updated_at=attempts[-1]["at"] if attempts else None,
     ).model_dump()
     # Extra fields the UI needs to route actions (superset of the frozen contract).
     row.update({
-        "outreach_channel": referral.get("outreach_channel", "form"),
+        # `none` rather than defaulting to "form": live, a service with no
+        # `service_application_channels` row is instantly "exhausted" by
+        # advance_referral step 9 and the referral dead-ends. Showing a confident
+        # "via Form" there would hide the single most likely reason a live referral
+        # stops moving.
+        "outreach_channel": referral.get("outreach_channel")
+                            or ("form" if referral.get("current_state") else "none"),
         "form_id": referral.get("form_id"),
         "patient_id": referral["patient_id"],
         "service_id": referral.get("service_id"),
@@ -266,13 +413,62 @@ async def _dashboard_row(referral: dict) -> dict:
         # attempt failed and a form attempt followed (all three services land here).
         "channels_tried": sorted({a["channel"] for a in attempts if a.get("channel")}),
         "attempt_count": len(attempts),
+        "awaiting_sw_selection": awaiting_selection,
     })
     return row
 
 
+def _owns_transitions() -> bool:
+    """True when OUR scheduler drives the loop, false when the DB's does (§7a).
+
+    Offline, `scheduler.py` + `referrals.current_state` are the spine. Live there is no
+    `current_state` column at all and `advance_referral()` owns every transition, so the
+    routes that push the loop have to behave differently — silently calling `set_state`
+    against the live DB is a no-op, which looks exactly like a working button that does
+    nothing.
+    """
+    return db.kind == "MockReferralDB"
+
+
 async def _advance_result(referral_id: str, steps) -> dict:
     referral = await db.get_referral(referral_id)
-    return {"state": referral["current_state"], "steps": [o.model_dump() for o in steps]}
+    return {"state": _display_state(referral), "steps": [o.model_dump() for o in steps]}
+
+
+LIVE_INTAKE_BLOCKED = (
+    "ALLOW_LIVE_INTAKE=0: the referral was created, but not advanced. Advancing it live "
+    "queues confirm_consent -> twilio, and Messaging's deployed poller sends a REAL "
+    "WhatsApp to whatever number was typed, billed to the team's Twilio. Set "
+    "ALLOW_LIVE_INTAKE=1 to enable."
+)
+
+
+def allow_live_intake() -> bool:
+    """Whether creating a referral may kick `advance_referral()` on the LIVE DB.
+
+    Defaults OFF, and that default is the whole point. The app has no auth, so anyone
+    with the URL can open "+ New referral", type any phone number, and cause a real
+    WhatsApp to be sent on the team's account. That was an acceptable risk for an
+    ephemeral tunnel shared with three teammates for an evening; it is not one for a
+    permanent public deploy, which is what this guard was written for.
+
+    Creating the patient and referral rows still works with this off — only the outbound
+    kick is withheld, and the response says so rather than looking like a success.
+
+    Read at call time, not import: `backend.main` imports before `load_dotenv()`, and a
+    module-level constant here would silently ignore `.env` (see worker.py's note).
+    """
+    return os.getenv("ALLOW_LIVE_INTAKE", "0").strip().lower() in ("1", "true", "yes")
+
+
+def _require_our_scheduler() -> None:
+    if not _owns_transitions():
+        raise HTTPException(
+            409,
+            "This endpoint drives OUR offline scheduler, but the live DB's "
+            "advance_referral() owns transitions here (CLAUDE.md §7a). Use the worker "
+            "(GET /api/worker) — or switch the data source to `mock` — instead.",
+        )
 
 
 def _slugify_category(category: str) -> str:
@@ -287,11 +483,17 @@ def _service_backfill(svc: dict) -> dict:
     """Fields to backfill onto a referral once its service is known — shared by
     referral creation and post-creation service selection (e.g. after a social
     worker acts on backend/service_ranking's output, see integration_plan_service_ranking.md)."""
+    # `.get`, not `[...]`. Live, SERVICE_COLS maps `preferred_channel` and `form_id` to
+    # None (no such column — the channel lives in service_application_channels), so
+    # `_to_ours` omits the keys entirely and subscripting raised KeyError. That took out
+    # the whole choose-service endpoint against the real DB while passing every offline
+    # test, because the fixture services do carry those keys.
     fields = {
-        "service_name": svc["name"],
-        "outreach_channel": svc["preferred_channel"],
-        "need_category": _slugify_category(svc.get("category", "")),
+        "service_name": svc.get("name"),
+        "outreach_channel": svc.get("preferred_channel"),
+        "need_category": _slugify_category(svc.get("category") or ""),
     }
+    fields = {k: v for k, v in fields.items() if v is not None}
     if svc.get("form_id"):
         fields["form_id"] = svc["form_id"]
     return fields
@@ -303,9 +505,23 @@ def _service_backfill(svc: dict) -> dict:
 async def get_review(referral_id: str) -> dict:
     try:
         referral = await db.get_referral(referral_id)
-        schema = await db.get_form_schema(referral["form_id"])
     except KeyError:
         raise HTTPException(404, f"unknown referral '{referral_id}'")
+    form_id = referral.get("form_id")
+    if not form_id:
+        # Live, the form comes from `form_templates.service_id`, which starts empty
+        # (A6). Say so — the alternative is a bare KeyError that reads like a bug in the
+        # review screen rather than a table that hasn't been seeded.
+        raise HTTPException(
+            404,
+            f"referral '{referral_id}' has no form: no active `form_templates` row for "
+            f"service '{referral.get('service_id')}'. Seed one with "
+            f"`python -m backend.scripts.seed_form_templates --list`.",
+        )
+    try:
+        schema = await db.get_form_schema(form_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown form '{form_id}' for referral '{referral_id}'")
     payload = await prepare(referral_id, db)
     pdf = ROOT / schema.source_ref
     return {
@@ -325,6 +541,35 @@ async def get_form_page(form_id: str, page: int) -> Response:
     return Response(content=png, media_type="image/png")
 
 
+async def _close_open_form_action(referral_id: str, status: str) -> dict | None:
+    """Close whichever form action the reviewer just answered, mirroring what
+    `actions.py` does when the worker submits on its own.
+
+    Both action types count: `prepare_online_form` is what the worker leaves `blocked`
+    awaiting review, and `submit_online_form` is what a reviewer-approved dispatch queues.
+    Either one still open would freeze the referral. Best-effort and never fatal — the
+    submission itself already happened and is recorded; failing the request here would
+    tell the SW their submit failed when it didn't.
+    """
+    try:
+        actions = await db.list_actions(referral_id)
+    except Exception:                                     # noqa: BLE001 - diagnostics only
+        return None
+    for a in actions:
+        if (a.get("action_type") in (act.PREPARE, act.SUBMIT)
+                and a.get("action_status") in OPEN_STATUSES):
+            try:
+                await db.set_action_status(
+                    a["id"],
+                    "completed" if status == "success" else "failed",
+                    result={"closed_by": "review_ui_submit", "outcome_status": status},
+                )
+                return a
+            except Exception:                             # noqa: BLE001
+                return None
+    return None
+
+
 @app.post("/api/submit/{referral_id}")
 async def post_submit(referral_id: str, body: ReviewedValues) -> dict:
     """Run the real fill_form.submit on the reviewer's confirmed values, then advance
@@ -334,15 +579,62 @@ async def post_submit(referral_id: str, body: ReviewedValues) -> dict:
         referral = await db.get_referral(referral_id)
     except KeyError:
         raise HTTPException(404, f"unknown referral '{referral_id}'")
-    from_state = referral["current_state"]
+    from_state = _display_state(referral)
     outcome = await submit(
         referral_id, body.values, db,
         attempt_id=scheduler.attempt_id_for(referral_id, from_state),
         from_state=from_state,
     )
-    await db.set_state(referral_id, sm.next_state(from_state, outcome.status))
+
+    if _owns_transitions():
+        await db.set_state(referral_id, sm.next_state(from_state, outcome.status))
+        advanced = None
+    elif outcome.status == "needs_human":
+        # A VALIDATION BOUNCE IS NOT AN OUTREACH ATTEMPT. `submit()` returns needs_human
+        # when re-validation rejects a value, which means nothing was injected and
+        # nothing reached the service — the reviewer simply isn't finished.
+        #
+        # So this branch does none of the three things below, and each omission matters:
+        #   - no shared `attempts` row: advance_referral counts those for the
+        #     three-attempt cap and reads "is there an attempt on this channel" as
+        #     channel-exhausted, so recording one would spend a real outreach attempt on
+        #     a form that was never sent;
+        #   - the action stays `blocked`, which is exactly what blocked means (awaiting
+        #     human review). Closing it as `failed` — what this used to do — poisoned
+        #     `attempt:<referral>:<service>:online_form` permanently (§7c), so the
+        #     corrected resubmit could never be re-queued;
+        #   - no advance_referral: nothing changed, and calling it after the two above
+        #     is what made one bad date abandon the service entirely.
+        #
+        # docs/form-failure-paths.md F1. The reviewer fixes the value and POSTs again.
+        advanced = {"state": "awaiting_review",
+                    "reason": "validation failed — nothing was sent, the action is "
+                              "still open for the reviewer"}
+    else:
+        # Live, a submit is an `attempts` row plus a handoff back to the DB scheduler —
+        # the same two steps the worker takes (orchestrator/actions.py). Doing only our
+        # own `record_attempt` here would leave the shared log, and therefore the
+        # ranker's responsiveness score and advance_referral's channel bookkeeping,
+        # blind to a submission that really happened.
+        schema = await db.get_form_schema(referral["form_id"])
+        attempt_no = await db.next_attempt_number(referral_id, referral.get("service_id"))
+        await db.record_shared_attempt(
+            act.attempt_row(referral, outcome, schema.target_type, attempt_no,
+                            referral.get("outreach_channel")))
+        # CLOSE THE ACTION FIRST, THEN ADVANCE — in that order, or the referral wedges.
+        # The worker services `prepare_online_form` by marking it `blocked` and waiting
+        # for a human (actions.py), and this route IS that human. Recording the attempt
+        # without closing the action leaves it open forever, and `advance_referral`'s
+        # first guard is "any open action -> waiting", so the referral silently stops
+        # dead on the submit that just succeeded — the §7b failure shape exactly.
+        # Verified live 2026-08-01: without this, advance_referral returned
+        # {"state": "waiting", "reason": "An action is already open"} after a 200 submit.
+        await _close_open_form_action(referral_id, outcome.status)
+        advanced = await db.advance_referral(referral_id)
+
     new = await db.get_referral(referral_id)
-    return {"outcome": outcome.model_dump(), "state": new["current_state"]}
+    return {"outcome": outcome.model_dump(), "state": _display_state(new),
+            "advanced": advanced}
 
 
 # --- Dashboard + detail ------------------------------------------------------
@@ -350,7 +642,15 @@ async def post_submit(referral_id: str, body: ReviewedValues) -> dict:
 @app.get("/api/dashboard")
 async def dashboard() -> dict:
     referrals = await db.list_referrals()
-    return {"rows": [await _dashboard_row(r) for r in referrals], "db": _db_status()}
+    # One queue read for the whole board rather than one per row.
+    open_sw_selection = {
+        str(a["referral_id"]) for a in await db.list_actions(limit=200)
+        if a.get("action_type") == "select_resource"
+        and a.get("assigned_component") == "social_worker"
+        and a.get("action_status") in OPEN_STATUSES
+    }
+    return {"rows": [await _dashboard_row(r, open_sw_selection) for r in referrals],
+            "db": _db_status()}
 
 
 # --- Data source (mock <-> Supabase, flippable from the UI) ------------------
@@ -373,6 +673,172 @@ def _db_status() -> dict:
 @app.get("/api/db")
 async def get_db_mode() -> dict:
     return _db_status()
+
+
+@app.get("/api/worker")
+async def get_worker_status() -> dict:
+    """What the action-queue worker has actually done (A5). Live, the most common
+    failure is silence — nothing polls and nothing errors — so this is deliberately
+    rendered on the dashboard rather than left to logs."""
+    return worker.status.as_dict()
+
+
+# Who is meant to be listening on the shared bus, and who owns them. Rendered as the
+# integration panel — the point of the screen is that an component with no poller is
+# invisible in every other view, because an unserviced action raises nothing.
+COMPONENTS = [
+    {"name": "karthik_form", "owner": "Form-fill (us)", "polled_by_us": True},
+    {"name": "backend", "owner": "Form-fill (us) — confirmed 2026-07-27", "polled_by_us": True},
+    {"name": "twilio", "owner": "Messaging", "polled_by_us": False},
+    {"name": "retell", "owner": "Voice — polled by us since 2026-07-31", "polled_by_us": True},
+    {"name": "social_worker", "owner": "the dashboard (B2: no screen yet)",
+     "polled_by_us": False},
+]
+
+OPEN_STATUSES = ("ready", "in_progress", "blocked")
+
+
+def _blockers(actions_by_component: dict, candidates_total: int, live: bool) -> list[dict]:
+    """Turn "nothing is happening" into a named cause.
+
+    Every live failure mode here is silent — an unserviced action, an empty shortlist, a
+    webhook URL nobody set. Left to logs they all present identically as a board that
+    stops updating, which is exactly the state you cannot debug in front of an audience.
+    """
+    out = []
+    if not live:
+        return out
+
+    if candidates_total == 0:
+        out.append({
+            "id": "A1", "severity": "blocker", "owner": "Ranking / Data",
+            "title": "Nothing writes referral_service_candidates",
+            "detail": "advance_referral() reads this table to pick a service. It is empty, "
+                      "so every referral parks at status='ranking'. See "
+                      "docs/handoff-ranking-candidates.md.",
+        })
+
+    for component in COMPONENTS:
+        if component["polled_by_us"]:
+            continue
+        open_rows = [a for a in actions_by_component.get(component["name"], [])
+                     if a["action_status"] in OPEN_STATUSES]
+        if not open_rows:
+            continue
+
+        # An open `social_worker` action is the DESIGN, not a fault: the SW selection
+        # gate parks the referral on purpose and the dashboard is the claimant. Flagging
+        # it red would train people to ignore this panel, which is the one thing it must
+        # not do — every other entry here is a genuine silent failure.
+        if component["name"] == "social_worker":
+            out.append({
+                "id": "gate", "severity": "info", "owner": "the dashboard",
+                "title": f"{len(open_rows)} referral(s) waiting on a social worker",
+                "detail": "Working as intended — the SW selection gate parks a referral "
+                          "until someone picks a service on the dashboard. Not a stall.",
+            })
+            continue
+
+        out.append({
+            "id": "A3/A4", "severity": "warning", "owner": component["owner"],
+            "title": f"{len(open_rows)} open action(s) for `{component['name']}`",
+            "detail": "Queued and unclaimed. advance_referral's first guard is "
+                      "\"any open action -> waiting\", so each one freezes its referral "
+                      f"until {component['owner']} claims it.",
+        })
+
+    if not os.getenv("SERVICE_RANKING_BASE_URL"):
+        out.append({
+            "id": "env", "severity": "info", "owner": "us",
+            "title": "SERVICE_RANKING_BASE_URL is unset",
+            "detail": "The ranking proxy routes are inert without it.",
+        })
+    return out
+
+
+@app.get("/api/system")
+async def system_status() -> dict:
+    """Everything needed to see the four-service loop on one screen.
+
+    Deliberately one round trip: during a walkthrough you want the queue, the worker and
+    the blockers to be a consistent snapshot of the same instant, not three fetches that
+    disagree.
+    """
+    live = not _owns_transitions()
+    try:
+        all_actions = await db.list_actions(limit=100)
+    except Exception as exc:                      # noqa: BLE001 — panel must still render
+        return {"error": f"{type(exc).__name__}: {exc}", "db": _db_status(),
+                "worker": worker.status.as_dict()}
+
+    by_component: dict[str, list[dict]] = {}
+    for action in all_actions:
+        by_component.setdefault(action.get("assigned_component", "?"), []).append(action)
+
+    referrals = await db.list_referrals()
+    candidates_total = 0
+    for referral in referrals:
+        candidates_total += len(await db.list_candidates(referral["id"]))
+
+    return {
+        "db": _db_status(),
+        "worker": worker.status.as_dict(),
+        "components": [
+            {
+                **component,
+                "open": sum(1 for a in by_component.get(component["name"], [])
+                            if a["action_status"] in OPEN_STATUSES),
+                "total": len(by_component.get(component["name"], [])),
+            }
+            for component in COMPONENTS
+        ],
+        "queue": [
+            {
+                "id": str(a.get("id")),
+                "referral_id": str(a.get("referral_id")),
+                "action_type": a.get("action_type"),
+                "action_status": a.get("action_status"),
+                "component": a.get("assigned_component"),
+                "error": a.get("error_message"),
+                "created_at": str(a.get("created_at")) if a.get("created_at") else None,
+            }
+            for a in all_actions[:25]
+        ],
+        "events": [
+            {
+                "provider": e.get("provider"),
+                "event_type": e.get("event_type"),
+                "referral_id": str(e.get("referral_id")) if e.get("referral_id") else None,
+                "processing_status": e.get("processing_status"),
+                "error": e.get("error_message"),
+                "received_at": str(e.get("received_at")) if e.get("received_at") else None,
+            }
+            for e in await db.list_integration_events(limit=15)
+        ],
+        "candidates_total": candidates_total,
+        "blockers": _blockers(by_component, candidates_total, live),
+    }
+
+
+@app.get("/health")
+async def health() -> dict:
+    """Deploy health check. Reports the worker too: a process that answers HTTP while
+    its worker died is "up" by every naive check and completely broken in practice."""
+    from backend.orchestrator import voice_component
+    from backend.tools.send_email import provider_configured
+
+    return {"ok": True, "db": _db_status(), "worker": worker.status.as_dict(),
+            # Every flag here is surfaced for the same reason: OFF and BROKEN look
+            # identical from outside. "New referrals send no consent text" is
+            # indistinguishable from Messaging's poller being down; "the phone step
+            # never fires" from Voice being down; "the email step escalates" from a
+            # provider outage. §7d is the other half of this — a flag read at import
+            # silently ignores `.env`, and `/health` reporting the wrong value for
+            # ORCHESTRATOR_TICK is what cost a live debugging round on 2026-07-28. If a
+            # flag is worth having, it's worth being able to confirm from outside the box.
+            "allow_live_intake": allow_live_intake(),
+            "allow_live_calls": voice_component.allow_live_calls(),
+            "email_provider_configured": provider_configured()}
 
 
 class DBMode(BaseModel):
@@ -424,6 +890,7 @@ async def get_referral_detail(referral_id: str) -> dict:
 async def run_referral(referral_id: str) -> dict:
     """Dispatch auto-tools until the referral is terminal, waiting for inbound, or at
     the form-review gate. This is how the dashboard's action buttons push the loop."""
+    _require_our_scheduler()
     try:
         await db.get_referral(referral_id)
     except KeyError:
@@ -435,6 +902,7 @@ async def run_referral(referral_id: str) -> dict:
 @app.post("/api/referrals/{referral_id}/inbound")
 async def post_inbound(referral_id: str, body: Inbound) -> dict:
     """Record a (simulated) inbound signal, then cascade any push states it unblocks."""
+    _require_our_scheduler()
     if body.signal not in INBOUND:
         raise HTTPException(400, f"unknown signal '{body.signal}'")
     try:
@@ -459,14 +927,64 @@ async def find_patient(name: str, dob: str) -> dict:
 
 @app.post("/api/patients")
 async def create_patient(body: NewPatient) -> dict:
-    pid = await db.create_patient(body.model_dump(exclude_none=True))
-    return {"patient_id": pid, "patient": await db.get_patient(pid)}
+    fields = body.model_dump(exclude_none=True)
+
+    # Resolve the typed address into the columns `patients` actually has. Only fills
+    # what the caller didn't supply, so an explicit postal_code/lat/long always wins over
+    # a geocoder guess.
+    located = None
+    if not all(fields.get(k) for k in ("latitude", "longitude")):
+        located = await geocode(fields["address"])
+        for key, value in (located or {}).items():
+            if value is not None:
+                fields.setdefault(key, value)
+
+    pid = await db.create_patient(fields)
+    # Reported, not swallowed: with these NULL, Ranking's /rank-referral returns a bare
+    # 500 and the referral dead-ends in a service we don't own. `geocoded: false` is what
+    # makes that traceable to this address rather than to their bug.
+    return {"patient_id": pid, "patient": await db.get_patient(pid),
+            "geocoded": located is not None,
+            "location": {k: fields.get(k) for k in
+                         ("postal_code", "county", "latitude", "longitude")}}
+
+
+# `service_requests` columns the intake form supplies with the same name it uses
+# itself — everything else on NewReferral either belongs to `referrals` or needs a
+# name translation (appointment_date/time below).
+_SERVICE_REQUEST_DIRECT_FIELDS = (
+    "pickup_address", "destination_address", "pickup_notes", "destination_notes",
+    "requested_end_time", "companion_required", "interpreter_required",
+    "contact_email", "emergency_contact", "special_instructions", "request_notes",
+)
 
 
 @app.post("/api/referrals")
 async def create_referral(body: NewReferral) -> dict:
     fields = body.model_dump(exclude_none=True)
     patient_id = fields.pop("patient_id")
+    try:
+        patient = await db.get_patient(patient_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown patient '{patient_id}'")
+    category = fields.pop("category", None)
+    # `referrals.need_category` is NOT NULL live, and service_ranking's very first
+    # read (get_active_services_by_category) filters candidates by it. The intake
+    # UI no longer collects a service up front (§ ChooseService hand-off), so the
+    # Category picker (CATEGORY_OPTIONS in Initiate.jsx) is now this column's only
+    # source — set here, ahead of the service_id backfill below so an explicit
+    # service_id (if one is ever passed some other way) can't silently override it.
+    if category:
+        fields["need_category"] = _slugify_category(category)
+    # `service_requests` is a separate table (§6a) — split its fields off before
+    # `referrals` is created, so neither adapter has to guess which keys belong where.
+    sr_input = {k: fields.pop(k) for k in _SERVICE_REQUEST_DIRECT_FIELDS if k in fields}
+    if "appointment_date" in fields:
+        sr_input["requested_date"] = fields.pop("appointment_date")
+    if "appointment_time" in fields:
+        sr_input["requested_start_time"] = fields.pop("appointment_time")
+
+
     # Backfill service_name / channel / form from the catalog when a service is given;
     # explicit values in the request win (the SW may override the channel, §4 answer).
     if body.service_id:
@@ -478,7 +996,125 @@ async def create_referral(body: NewReferral) -> dict:
             fields.setdefault(key, value)
     form_id = fields.pop("form_id", None)
     referral_id = await db.create_referral(patient_id, form_id, **fields)
-    return {"referral_id": referral_id}
+
+    # `service_requests` is what fill_form/Voice actually read (§6a), and nothing else
+    # creates this row — a transportation referral born here needs one or the phone/
+    # form tools have nothing to fill in later (verified via supabase MCP: no DB trigger
+    # creates it either). Values not asked on the intake form come from the patient
+    # record instead of duplicating a second box for them (mobility/insurance/phone).
+    # Written for EVERY category that collected something, not just transportation.
+    # `patients` has no street-address column (§7e), so `pickup_address` on this row is
+    # the only place a street address lives — and `food_assistance.home_address` sources
+    # from it exactly as the transport form's does. Gating this on transportation meant a
+    # food referral got no row at all and that field rendered blank on the pantry form.
+    if sr_input:
+        sr_fields = {
+            **sr_input,
+            "mobility_requirements": patient.get("mobility_needs"),
+            "contact_phone": patient.get("phone"),
+            "insurance_provider": patient.get("insurance_type"),
+            "insurance_member_id": patient.get("medicaid_id"),
+        }
+        sr_fields = {k: v for k, v in sr_fields.items() if v is not None}
+        await db.create_service_request(referral_id, patient_id, sr_fields)
+
+    # Live, a referral that nobody advances is inert: `advance_referral()` is a function,
+    # not a daemon, so a brand-new row sits at `status='not_started'` and the consent
+    # text is never queued to twilio. Kicking it here is what makes "create a referral ->
+    # the patient gets a WhatsApp asking to opt in" actually happen. Offline, our own
+    # scheduler owns that and the UI's Run button drives it.
+    advanced = None
+    if not _owns_transitions():
+        if allow_live_intake():
+            advanced = await db.advance_referral(referral_id)
+        else:
+            advanced = {"state": "not_advanced", "reason": LIVE_INTAKE_BLOCKED}
+    return {"referral_id": referral_id, "advanced": advanced}
+
+
+# --- Escalations (B2) --------------------------------------------------------
+
+ESCALATION_ACTION = "escalate_to_social_worker"
+
+
+@app.get("/api/escalations")
+async def list_escalations() -> dict:
+    """Every referral that needs a human, with why.
+
+    THE PRODUCT HOLE THIS CLOSES (whats-left B2). `advance_referral` queues
+    `escalate_to_social_worker` to the `social_worker` component on four different
+    paths — consent declined, no eligible resource left, every channel exhausted, and
+    the patient reporting they never used the service. Nothing polls that component
+    *by design*, because a person is supposed to be the poller. But there was no screen,
+    so the person never saw it: a declined referral simply vanished from the board's
+    active groups and sat in a queue nobody could open. The failure mode of a referral
+    tool that loses failures is the exact one this product exists to fix.
+
+    Read-only and derived — an escalation is not new state, it's the open action plus
+    the referral's own `escalation_reason`. Nothing here writes; `resolve` is a separate
+    POST so the two can't be confused.
+    """
+    actions = await db.list_actions(limit=200)
+    open_escalations = [
+        a for a in actions
+        if a.get("action_type") == ESCALATION_ACTION
+        and a.get("action_status") in OPEN_STATUSES
+    ]
+
+    rows = []
+    for a in open_escalations:
+        try:
+            referral = await db.get_referral(a["referral_id"])
+            patient = await db.get_patient(referral["patient_id"])
+        except KeyError:
+            continue
+        rows.append({
+            "action_id": a["id"],
+            "referral_id": a["referral_id"],
+            "patient_name": patient.get("name"),
+            "patient_phone": patient.get("phone"),
+            "need_category": referral.get("need_category"),
+            "service_name": referral.get("service_name"),
+            # The DB's own words for why, which are more specific than the action's.
+            "reason": (referral.get("escalation_reason")
+                       or a.get("input_payload", {}).get("reason")
+                       or a.get("error_message")
+                       or "Needs a social worker"),
+            "status": referral.get("status"),
+            "display_state": _display_state(referral),
+            "queued_at": str(a.get("created_at")) if a.get("created_at") else None,
+        })
+    rows.sort(key=lambda r: r["queued_at"] or "", reverse=True)
+    return {"escalations": rows, "count": len(rows)}
+
+
+class ResolveEscalation(BaseModel):
+    action_id: str
+    note: str | None = None
+
+
+@app.post("/api/escalations/{referral_id}/resolve")
+async def resolve_escalation(referral_id: str, body: ResolveEscalation) -> dict:
+    """Mark an escalation handled offline (the SW called the patient, found another
+    service by hand, etc.) and hand back to the scheduler.
+
+    Closes the action rather than cancelling it — `advance_referral`'s first guard is
+    "any open action -> waiting", so an escalation left open freezes the referral even
+    after a human has dealt with it. Note that the dedup key
+    `escalate:<reason>:<referral>` is dead afterwards either way (§7c); that's correct
+    here, since the same escalation shouldn't re-fire.
+    """
+    try:
+        await db.get_referral(referral_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown referral '{referral_id}'")
+    await db.set_action_status(
+        body.action_id, "completed",
+        result={"resolved_by": "social_worker", "note": body.note})
+    advanced = None
+    if not _owns_transitions():
+        advanced = await db.advance_referral(referral_id)
+    return {"resolved": body.action_id, "advanced": advanced}
 
 
 @app.get("/api/forms")
@@ -522,23 +1158,104 @@ async def _rank_referral(referral_id: str, db: ReferralDB) -> dict:
         await db.get_referral(referral_id)
     except KeyError:
         raise HTTPException(404, f"unknown referral '{referral_id}'")
-    base_url = os.environ["SERVICE_RANKING_BASE_URL"]  # required; no silent fallback
+    # Required; no silent fallback (Layer 3 is a live Claude call, unlike _get_ranking's
+    # read path, which can fall back to referral_service_candidates). Surfaced as a
+    # clean 503 instead of a bare KeyError -> opaque 500, since the ChooseService
+    # screen's "Run service ranking" button needs something to actually show the SW.
+    base_url = os.environ.get("SERVICE_RANKING_BASE_URL")
+    if not base_url:
+        raise HTTPException(503, "SERVICE_RANKING_BASE_URL is not configured — the "
+                                  "ranking service isn't reachable from this environment.")
     async with httpx.AsyncClient(timeout=30.0) as client:  # Layer 3 is a live Claude call
-        response = await client.post(f"{base_url}/rank-referral/{referral_id}")
-        response.raise_for_status()
+        try:
+            response = await client.post(f"{base_url}/rank-referral/{referral_id}")
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            # A 4xx here is the ranking service's OWN clean rejection (e.g.
+            # RankingUnavailable — zero or >15 candidates survived its hard filter,
+            # backend/service_ranking/ranking.py), not an infra failure. Forward its
+            # status + detail as-is so the SW sees the actual reason rather than a
+            # flattened 502; only a genuinely erroring/unreachable service (5xx, or a
+            # body we can't parse) falls through to the generic 502 below.
+            if e.response.status_code < 500:
+                try:
+                    detail = e.response.json().get("detail") or e.response.text
+                except ValueError:
+                    detail = e.response.text
+                raise HTTPException(e.response.status_code, detail)
+            raise HTTPException(502, f"ranking service call failed: {e}")
+        except httpx.HTTPError as e:
+            raise HTTPException(502, f"ranking service call failed: {e}")
         return response.json()
 
 
 async def _get_ranking(referral_id: str, db: ReferralDB) -> dict:
+    """The ranked shortlist for the SW selection screen.
+
+    Prefers the ranking service, which returns richer display data (service and
+    organisation names, the raw component scores). Falls back to
+    `referral_service_candidates` — the same run, written by the same code, already in
+    our DB — when that service is unset, asleep or erroring.
+
+    The fallback matters because this screen is a **human gate**: the referral is parked
+    until someone picks, so a dependency being down doesn't merely degrade the view, it
+    blocks the pipeline. The shortlist is already local; there's no reason to be unable
+    to render it.
+    """
     try:
         await db.get_referral(referral_id)
     except KeyError:
         raise HTTPException(404, f"unknown referral '{referral_id}'")
-    base_url = os.environ["SERVICE_RANKING_BASE_URL"]  # required; no silent fallback
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(f"{base_url}/ranking-results/{referral_id}")
-        response.raise_for_status()
-        return response.json()
+
+    base_url = os.environ.get("SERVICE_RANKING_BASE_URL")
+    if base_url:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(f"{base_url}/ranking-results/{referral_id}")
+                response.raise_for_status()
+                payload = response.json()
+            if payload.get("results"):
+                return payload
+        except httpx.HTTPError as e:
+            print(f"[ranking] proxy failed, falling back to candidates: {e}")
+
+    return {"results": await _ranking_from_candidates(referral_id, db),
+            "source": "referral_service_candidates"}
+
+
+async def _ranking_from_candidates(referral_id: str, db: ReferralDB) -> list[dict]:
+    """Shape `referral_service_candidates` like the ranking service's response.
+
+    `reasons` is Ranking's own display payload — an array of `{type, text}` covering the
+    combined/objective/subjective scores and the Layer 3 rationale — so the numbers the
+    screen shows are theirs, not ours recomputed.
+    """
+    out = []
+    for c in await db.list_candidates(referral_id):
+        reasons = {r.get("type"): r.get("text")
+                   for r in (c.get("reasons") or []) if isinstance(r, dict)}
+        try:
+            service = await db.get_service(c["service_id"])
+        except KeyError:
+            service = {}
+
+        def _num(key):
+            try:
+                return float(reasons[key])
+            except (KeyError, TypeError, ValueError):
+                return None
+
+        out.append({
+            "rank": c.get("rank"),
+            "service_id": c.get("service_id"),
+            "service_name": service.get("name"),
+            "organization_name": None,
+            "objective_score": _num("objective_score"),
+            "subjective_score": _num("subjective_score"),
+            "combined_score": _num("combined_score") or float(c.get("score") or 0),
+            "subjective_rationale": reasons.get("subjective_rationale"),
+        })
+    return out
 
 
 async def _choose_service(referral_id: str, body: ChooseService, db: ReferralDB) -> dict:
@@ -551,7 +1268,27 @@ async def _choose_service(referral_id: str, body: ChooseService, db: ReferralDB)
     except KeyError:
         raise HTTPException(404, f"unknown service '{body.service_id}'")
 
+    # 1. Flag the chosen candidate. This is the signal advance_referral's SW gate
+    #    (003_sw_selection_gate.sql) adopts. Doing only step 2 would leave the shortlist
+    #    claiming a different service was selected, and the gate would re-ask.
+    await db.select_candidate(referral_id, body.service_id)
+
+    # 2. Point the referral at it.
     await db.set_referral_service(referral_id, body.service_id, **_service_backfill(svc))
+
+    # 3. Close the open `select_resource` action addressed to `social_worker`. Nothing
+    #    polls that component — a human is the poller — so if this is skipped the
+    #    open-action guard freezes the referral on the very choice that was just made.
+    closed = []
+    for action in await db.list_actions(referral_id):
+        if (action.get("action_type") == "select_resource"
+                and action.get("assigned_component") == "social_worker"
+                and action.get("action_status") in ("ready", "in_progress", "blocked")):
+            await db.set_action_status(
+                str(action["id"]), "completed",
+                result={"chosen_service_id": body.service_id, "label": body.label},
+            )
+            closed.append(str(action["id"]))
 
     # Best-effort: log the SW's choice to ranking's own sw_feedback bookkeeping.
     # The db write above is authoritative for our loop regardless of this succeeding.
@@ -570,7 +1307,16 @@ async def _choose_service(referral_id: str, body: ChooseService, db: ReferralDB)
         except httpx.HTTPError as e:
             print(f"[choose_service] sw-feedback forward failed (non-fatal): {e}")
 
-    return {"referral": await db.get_referral(referral_id)}
+    # 4. Trigger the next step. The whole point of the gate is that the SW's choice —
+    #    not a rank ordering — is what moves the referral, so the selection has to hand
+    #    control straight back to the scheduler. Offline our own scheduler owns that, so
+    #    this only applies live.
+    advanced = None
+    if not _owns_transitions():
+        advanced = await db.advance_referral(referral_id)
+
+    return {"referral": await db.get_referral(referral_id),
+            "closed_actions": closed, "advanced": advanced}
 
 
 @app.post("/api/referrals/{referral_id}/rank")
@@ -586,3 +1332,51 @@ async def get_ranking_endpoint(referral_id: str) -> dict:
 @app.post("/api/referrals/{referral_id}/choose-service")
 async def choose_service_endpoint(referral_id: str, body: ChooseService) -> dict:
     return await _choose_service(referral_id, body, db)
+
+
+# --- Serve the built frontend (one deployable, not two) -----------------------
+# MOUNTED LAST, deliberately: a StaticFiles mount at "/" swallows every path, so any
+# route declared after it is unreachable. Keep this the final statement in the file.
+#
+# WHY SERVE IT FROM HERE AT ALL. `VITE_API_BASE` is inlined at BUILD time, so a
+# separately-hosted frontend has to be rebuilt whenever the backend URL changes — which,
+# behind a `cloudflared` tunnel, is every restart. Served same-origin the variable can
+# stay empty, relative `/api/...` calls just work, and CORS stops mattering. It also
+# makes the whole product one Railway service instead of two.
+#
+# Absent (nobody ran `npm run build`), this is skipped and the API still serves normally
+# — `npm run dev` on :5173 remains the dev loop.
+
+FRONTEND_DIST = ROOT / "frontend" / "dist"
+
+if FRONTEND_DIST.is_dir():
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
+
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
+
+    _DIST_ROOT = FRONTEND_DIST.resolve()
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa(full_path: str):
+        """SPA fallback. The app routes client-side, so a deep link like /?referral=…
+        must return index.html rather than a 404. Unknown /api paths are excluded so a
+        typo'd endpoint still 404s as JSON instead of silently returning the HTML shell —
+        which is a genuinely confusing way to debug a broken fetch.
+
+        SECURITY — the containment check below is load-bearing, do not remove it.
+        `full_path` is attacker-controlled. Without `.resolve()` + `is_relative_to`,
+        `GET /%2e%2e%2f%2e%2e%2f.env` reads the repo's .env and hands back
+        SUPABASE_SERVICE_ROLE_KEY and ANTHROPIC_API_KEY to anyone who can reach this
+        process — which, behind a tunnel, is the whole internet. Starlette does NOT
+        normalise `..` out of a `:path` parameter, and percent-encoded traversal survives
+        into the string, so this has to be checked here. `.resolve()` also collapses
+        symlinks, so a link inside dist can't point out of it either.
+        """
+        if full_path.startswith("api/"):
+            raise HTTPException(404, f"no such endpoint '/{full_path}'")
+        if full_path:
+            candidate = (FRONTEND_DIST / full_path).resolve()
+            if candidate.is_file() and candidate.is_relative_to(_DIST_ROOT):
+                return FileResponse(candidate)
+        return FileResponse(FRONTEND_DIST / "index.html")

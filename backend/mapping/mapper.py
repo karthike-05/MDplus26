@@ -43,6 +43,20 @@ def _normalize_phone(value: str) -> str:
     return value.strip()  # leave as-is; validation will flag it
 
 
+def _normalize_time(value: str) -> str:
+    """-> `HH:MM:SS`. `requested_start_time` is a Postgres `time` column, so a reviewer's
+    "2:45 PM" is a type error that fails the whole write-back statement (F2). Parse the
+    forms a human or the DB actually produces; leave anything else alone for validation
+    to flag rather than guessing."""
+    text = value.strip().upper().replace(".", "")
+    for fmt in ("%H:%M:%S", "%H:%M", "%I:%M %p", "%I:%M%p", "%I %p"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%H:%M:%S")
+        except ValueError:
+            continue
+    return value.strip()  # leave as-is; validation will flag it
+
+
 def normalize(value, fmt: str | None):
     if value is None:
         return None
@@ -51,6 +65,8 @@ def normalize(value, fmt: str | None):
         return _normalize_date(value)
     if fmt == "phone":
         return _normalize_phone(value)
+    if fmt == "time":
+        return _normalize_time(value)
     return value.strip()
 
 

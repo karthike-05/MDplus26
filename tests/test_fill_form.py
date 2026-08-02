@@ -205,3 +205,60 @@ def test_failed_submit_does_not_touch_the_shared_row(tmp_path):
     )
     assert outcome.status == "failed"
     assert asyncio.run(db.get_service_request("ref_1002"))["pickup_address"] == before
+
+
+# --- F2: the service_requests write-back must never undo a real submission ---
+
+class _WritebackBoom(MockReferralDB):
+    """A DB whose write-back fails the way a live `time` column does."""
+
+    async def save_service_request(self, referral_id, fields):
+        raise RuntimeError('invalid input syntax for type time: "2:45 PM"')
+
+
+def test_a_failing_writeback_does_not_lose_the_submission(tmp_path):
+    """The PDF is already written by the time the write-back runs. If this raises and
+    escapes, the ToolOutcome is never recorded, the caller never closes the action,
+    advance_referral's open-action guard freezes the referral, and the reviewer is told
+    their submit failed — for a submission that really happened. Same shape as the
+    save_call_outcome bug (changes-2026-07-31 §2)."""
+    db = _WritebackBoom()
+    payload = asyncio.run(prepare("ref_1002", db))
+    out = tmp_path / "filled.pdf"
+
+    outcome = asyncio.run(submit("ref_1002", dict(payload.values), db,
+                                 attempt_id="att_wb", out_path=out))
+
+    assert outcome.status == "success", "the injection happened; report it"
+    assert out.exists()
+    assert "writeback_failed" in outcome.data
+    assert "type time" in outcome.data["writeback_failed"]
+    assert db.attempts["att_wb"] is outcome        # still recorded (§8)
+
+
+def test_writeback_normalises_through_each_field_format():
+    """The PDF should carry what the reviewer typed ("2:45 PM" is what a human reads on
+    a form); `service_requests.requested_start_time` is a Postgres `time` column and
+    must get 14:45:00. The schema's own `format` is the single place that's declared."""
+    db = MockReferralDB()
+    schema = asyncio.run(db.get_form_schema("transport_intake"))
+
+    writeback = service_request_writeback(
+        schema, {"appointment_time": "2:45 PM", "pickup_address": "  12 Main St  "})
+
+    assert writeback["requested_start_time"] == "14:45:00"
+    assert writeback["pickup_address"] == "12 Main St"
+
+
+def test_a_bad_time_is_caught_before_injection_not_at_the_writeback():
+    """Prevention, not just containment. `appointment_time` had no `format`, so
+    "quarter" passed validation (under an 8-char maxlength) and only failed at the DB —
+    after the PDF was injected."""
+    db = MockReferralDB()
+    schema = asyncio.run(db.get_form_schema("transport_intake"))
+    field = next(f for f in schema.fields if f.name == "appointment_time")
+
+    assert validate_field(field, "2:45 PM") == []
+    assert validate_field(field, "09:30:00") == []
+    assert validate_field(field, "25:99") != []
+    assert validate_field(field, "quarter") != []

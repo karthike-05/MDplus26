@@ -16,6 +16,7 @@ from backend.orchestrator import scheduler
 from backend.orchestrator import state_machine as sm
 from backend.tools.notify_patient import notify_patient
 from backend.tools.make_phone_call import make_phone_call
+from backend.tools import send_email as send_email_mod
 from backend.tools.send_email import send_email
 
 VALID_STATUS = {"success", "needs_human", "failed"}
@@ -128,3 +129,44 @@ def test_scheduler_dispatches_phone_method(monkeypatch):
         out = asyncio.run(scheduler.tick(rid, db, tools))
     assert out is not None and out.channel == "phone"
     assert asyncio.run(db.get_referral(rid))["current_state"] == sm.SUBMITTED
+
+
+# --- send_email must not claim a send it didn't make -------------------------
+
+def test_send_email_without_a_provider_reports_needs_human(monkeypatch):
+    """It used to return `success` with data={"sent": True}, so a referral routed to an
+    email channel advanced to "awaiting service response" and the dashboard rendered
+    *email sent ✓* for a message never composed. 12 live services carry an email channel
+    and advance_referral picks it by priority, so this was reachable with nobody
+    choosing it. Claiming an outreach that didn't happen is the exact failure this
+    product exists to eliminate."""
+    for name in send_email_mod.PROVIDER_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+    outcome, db = _run(send_email)
+
+    assert outcome.status == "needs_human"
+    assert outcome.data["sent"] is False and outcome.data["stub"] is True
+    assert outcome.error and "nothing was sent" in outcome.error
+    assert db.attempts["att_x"] is outcome          # still recorded exactly once (§8)
+
+
+def test_send_email_reports_sent_once_a_provider_is_configured(monkeypatch):
+    """Guards the seam the TODO plugs into: setting any provider var flips it out of
+    stub mode, so finishing B3 needs no change to the callers."""
+    monkeypatch.setenv("RESEND_API_KEY", "re_test")
+
+    outcome, _ = _run(send_email)
+
+    assert outcome.status == "success"
+    assert outcome.data == {"sent": True, "stub": False}
+
+
+def test_provider_flag_is_read_at_call_time_not_import(monkeypatch):
+    """§7d — backend.main imports before load_dotenv(), so a module-level constant would
+    report its default forever. Drive the env var, don't patch the attribute."""
+    for name in send_email_mod.PROVIDER_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    assert send_email_mod.provider_configured() is False
+    monkeypatch.setenv("SMTP_URL", "smtp://localhost")
+    assert send_email_mod.provider_configured() is True

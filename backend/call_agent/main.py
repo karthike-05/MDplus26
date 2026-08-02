@@ -25,6 +25,8 @@ RETELL_CREATE_CALL_URL = "https://api.retellai.com/v2/create-phone-call"
 # integration_plan_call_agent.md. Forwarding is skipped, not a startup error, when
 # it's absent, so this service keeps running standalone either way.
 ORCHESTRATOR_BASE_URL = os.environ.get("ORCHESTRATOR_BASE_URL")
+if ORCHESTRATOR_BASE_URL:
+    ORCHESTRATOR_BASE_URL = ORCHESTRATOR_BASE_URL.rstrip("/")
 
 
 # def _next_available_call_time(service_id: str) -> Optional[datetime]:
@@ -66,8 +68,10 @@ async def _call_retell(booking_id: str, referral_id: str, request_data: dict) ->
         "patient_insurance_id": request_data["insurance_member_id"],
         "mobility_needs": request_data["mobility_needs"],
         "referring_clinic_name": request_data["referring_clinic_name"],
-        "appointment_time": request_data["appointment_date"],
+        "appointment_date": request_data["appointment_date"],
         "appointment_location": request_data["appointment_location"],
+        "requested_start_time": request_data["requested_start_time"],
+        "requested_end_time": request_data["requested_end_time"],
     }
     # Retell rejects the whole request if any dynamic variable is non-string;
     # fields like confirmation_number/scheduled_start_at are legitimately NULL
@@ -164,6 +168,21 @@ def _attempt_number_from(result: dict) -> int:
     return (attempt or {}).get("attempt_number", 1)
 
 
+def _close_action_and_advance(referral_id: str, status: str, call_id: Optional[str]) -> None:
+    """Best-effort: closes the open contact_service_by_phone/retell action (if any)
+    and hands control back to advance_referral, now that save_call_outcome has
+    recorded the attempt. Without this the referral freezes permanently on
+    advance_referral's open-action guard, even though the call already happened
+    (docs/whats-left.md A4) -- the attempts row alone isn't enough."""
+    try:
+        open_action = db.get_open_contact_service_action(referral_id)
+        if open_action is not None:
+            db.close_contact_service_action(open_action["id"], {"status": status, "call_id": call_id})
+        db.advance_referral(referral_id)
+    except Exception as e:
+        print(f"[log_outcome] closing contact_service_by_phone / advance_referral failed (non-fatal): {e}")
+
+
 async def _forward_to_orchestrator(body: "LogOutcomeRequest", call_id: Optional[str], result: dict) -> None:
     """Best-effort: tell the orchestrator's inbound adapter (backend/adapters/inbound.py
     POST /api/voice/call-outcome) about this outcome so its scheduler can advance the
@@ -216,6 +235,7 @@ async def log_outcome(request: Request):
         )
 
     result = db.save_call_outcome(body.model_dump(exclude_none=True), call_id)
+    _close_action_and_advance(body.case_id, body.status, call_id)
     await _forward_to_orchestrator(body, call_id, result)
     return {
         "success": True,
@@ -243,8 +263,10 @@ async def place_referral_call_endpoint(request: PlaceReferralCallRequest):
     trigger_call.py exercises directly for manual testing.
 
     booking_id is optional — if omitted, the latest booking for referral_id is
-    looked up (db.get_latest_booking_id, mirrors trigger_call.py's manual lookup),
-    so callers only need referral_id (database_usage.md: "Receives: referral_id").
+    resolved, CREATING one from service_requests + service_application_channels if
+    this referral has none yet (db.get_or_create_booking_id — nothing upstream of us
+    creates this row today), so callers only need referral_id
+    (database_usage.md: "Receives: referral_id").
     """
-    booking_id = request.booking_id or db.get_latest_booking_id(request.referral_id)
+    booking_id = request.booking_id or db.get_or_create_booking_id(request.referral_id)
     return await place_referral_call(booking_id, request.referral_id)

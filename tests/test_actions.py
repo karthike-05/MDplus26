@@ -26,7 +26,7 @@ def _consenting_db():
 def test_our_status_maps_to_their_status_and_outcome_pair():
     """Their schema splits what we carry in one field, and the ranker reads `outcome`,
     so every one of our statuses must produce BOTH halves."""
-    assert actions.STATUS_TO_THEIRS["success"] == ("completed", "submitted")
+    assert actions.STATUS_TO_THEIRS["success"] == ("sent", "submitted")
     assert actions.STATUS_TO_THEIRS["needs_human"] == ("completed", "needs_human_followup")
     assert actions.STATUS_TO_THEIRS["failed"] == ("failed", "technical_failure")
 
@@ -44,7 +44,7 @@ def test_attempt_row_is_shaped_for_the_shared_table():
                           attempt_id="a1", data={"filled_fields": ["client_name"]})
     row = actions.attempt_row({"service_id": "svc_capmetro"}, outcome, "pdf")
     assert row["provider"] == "karthik_form"          # attempts.provider enum
-    assert (row["status"], row["outcome"]) == ("completed", "submitted")
+    assert (row["status"], row["outcome"]) == ("sent", "submitted")
     assert row["channel"] == "email"
     assert isinstance(row["structured_result"], dict)  # jsonb NOT NULL
     assert row["notes"] is None
@@ -137,7 +137,12 @@ def test_submit_writes_a_shared_attempt_and_hands_control_back(tmp_path):
     assert report["status"] == "success"
     row = db.shared_attempts[0]
     assert row["provider"] == "karthik_form" and row["outcome"] == "submitted"
-    assert row["channel"] == "email"                    # transport_intake is a pdf target
+    # `online_form`, NOT `email`, even though transport_intake is a pdf: the attempt is
+    # recorded under the channel the scheduler DISPATCHED (the service is configured for
+    # online_form), because that is the value advance_referral's exhaustion test compares
+    # against. Recording the document format instead stalls the referral — see
+    # CHANNEL_FOR_TARGET and tests/test_worker.py.
+    assert row["channel"] == "online_form"
     # the action is closed, and control returned to the DB scheduler
     assert [a["action_status"] for a in db._actions if a["id"] == aid] == ["completed"]
     assert "state" in report["advanced"]

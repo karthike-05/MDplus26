@@ -15,12 +15,41 @@ const fmt = (iso) => {
 };
 const DOT = { success: C.ok, needs_human: C.warn, failed: C.danger };
 
+// Three services write `attempts.status` and none of them agreed on a vocabulary:
+// Messaging writes 'sent' outbound and 'delivered' on the patient's inbound reply, Voice
+// writes 'completed', we write our own ToolOutcome statuses. Rendering the raw value put
+// "Sent" on the first WhatsApp and "Delivered" on the next, which reads as two different
+// delivery states for the same channel rather than what it is — one message out, one
+// message back. Direction decides the wording; the raw status only refines it.
+const STATUS_LABEL = {
+  sent: "Sent", queued: "Queued", delivered: "Sent", read: "Read",
+  failed: "Failed", undelivered: "Not delivered",
+  completed: "Completed", success: "Success", needs_human: "Needs review",
+};
+
+function attemptLabel(a) {
+  if (a.direction === "inbound") {
+    // Nothing the patient sends us is "delivered" from the SW's point of view — it's a
+    // reply that arrived. Failures stay failures.
+    return a.status === "failed" ? "Reply failed" : "Reply received";
+  }
+  return STATUS_LABEL[a.status] || a.status;
+}
+
+const DOT_FOR = (a) =>
+  a.direction === "inbound" && a.status !== "failed" ? C.accent
+    : DOT[a.status] ?? (["sent", "delivered", "queued", "read", "completed"].includes(a.status) ? C.ok : C.sub);
+
 export default function ReferralDetail({ referralId, onBack, onReview }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
+  // Which scheduler owns transitions, so RowActions can offer the buttons or name the
+  // owner instead of firing a guaranteed 409 (CLAUDE.md §7a).
+  const [live, setLive] = useState(false);
 
   const load = () => api.referral(referralId).then(setData).catch((e) => setError(String(e)));
   useEffect(() => { setData(null); load(); }, [referralId]);
+  useEffect(() => { api.dbMode().then((d) => setLive(d?.mode === "supabase")).catch(() => {}); }, []);
 
   if (error) return <div style={s.center}>Couldn’t load: {error}</div>;
   if (!data) return <div style={s.center}>Loading…</div>;
@@ -63,7 +92,7 @@ export default function ReferralDetail({ referralId, onBack, onReview }) {
           <div style={{ marginTop: 6 }}><PatientResponse response={patient_response} /></div>
 
           <div style={{ ...s.sectionLabel, marginTop: 16 }}>Next step</div>
-          <div style={{ marginTop: 6 }}><RowActions row={row} onReview={onReview} onChange={load} /></div>
+          <div style={{ marginTop: 6 }}><RowActions row={row} onReview={onReview} onChange={load} live={live} /></div>
         </div>
 
         {/* right: timeline */}
@@ -73,11 +102,14 @@ export default function ReferralDetail({ referralId, onBack, onReview }) {
           <div style={{ marginTop: 8 }}>
             {attempts.map((a, i) => (
               <div key={i} style={s.event}>
-                <div style={{ ...s.dot, background: DOT[a.status] || C.sub }} />
+                <div style={{ ...s.dot, background: DOT_FOR(a) }} />
                 <div style={{ flex: 1 }}>
                   <div style={s.eventTop}>
-                    <span style={s.eventChannel}>{CHANNEL_LABEL[a.channel] || a.channel}</span>
-                    <span style={{ color: DOT[a.status] || C.sub, fontWeight: 600, fontSize: 12 }}>{a.status}</span>
+                    <span style={s.eventChannel}>
+                      {CHANNEL_LABEL[a.channel] || a.channel}
+                      {a.purpose && <span style={{ color: C.sub, fontWeight: 400 }}> · {String(a.purpose).replace(/_/g, " ")}</span>}
+                    </span>
+                    <span style={{ color: DOT_FOR(a), fontWeight: 600, fontSize: 12 }}>{attemptLabel(a)}</span>
                   </div>
                   <div style={s.eventSub}>
                     {a.from_state && <>from <b>{a.from_state}</b> · </>}{fmt(a.at)}
@@ -126,6 +158,11 @@ function summarize(data) {
   if (data.event) return `patient event: ${String(data.event).replace(/_/g, " ")}`;
   if (data.reply_text) return `patient replied “${data.reply_text}”`;
 
+  // Never render a bare "email sent" — `send_email` is a stub until a provider is
+  // configured (whats-left B3), and the old line reported a phantom send for a message
+  // that was never composed. The tool now says needs_human in that case; this makes the
+  // timeline say the same thing rather than leaving the SW to infer it.
+  if (data.sent === false && data.stub) return "not sent — no email provider configured";
   if (data.sent) return "email sent";
   const keys = Object.keys(data).filter((k) => k !== "stub");
   return keys.map((k) => `${k}: ${JSON.stringify(data[k])}`).join(" · ");

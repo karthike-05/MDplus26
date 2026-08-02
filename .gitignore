@@ -6,13 +6,29 @@ CLAUDE.md
 sample_forms/*.png
 demo/live-preview/*.png
 sample_forms/filled/
-frontend/dist/
+# frontend/dist/ is COMMITTED, deliberately — see the note in docs/local-setup.md.
+# Railway's Railpack builder provisions Python only (the repo root is a Python project),
+# so `npm` does not exist in the build image and the frontend cannot be built there.
+# Shipping the bundle makes the deploy `pip install` + `uvicorn`, nothing else.
+#
+# ⚠ THE TRADEOFF: a UI change is not deployed until you rebuild AND commit dist/.
+# Forget, and the deploy silently serves the previous bundle.
 
 # packages and venv
 .env
+.env.*
+!.env.example
 .venv/
 supabase/
 *.json
+# ...but NOT the JSON the build and the form-fill pipeline depend on. Already-tracked
+# files are unaffected by a later ignore rule, so this was latent rather than broken —
+# a NEW form schema would simply never get committed, and the deploy would 404 the
+# review screen with the file sitting happily on the author's disk.
+!contracts/schemas/*.json
+!package.json
+!frontend/package.json
+!frontend/package-lock.json
 node_modules/
 
 # artifacts and cache

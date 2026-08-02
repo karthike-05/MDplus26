@@ -1,6 +1,38 @@
 # Integration status & next steps (pick-up doc)
 
-**Last updated:** 2026-07-26 · branch `integration/voice-ranking-seams`
+**Last updated:** 2026-07-28
+
+> **2026-07-27 — what changed.** We now poll **two** components, not one: `karthik_form`
+> and **`backend`** (ownership confirmed; it previously had no poller anywhere, so a
+> single `select_resource` row deadlocked its referral). A real runner drives both —
+> [`orchestrator/worker.py`](../backend/orchestrator/worker.py), started in the FastAPI
+> lifespan, with crash recovery for actions stuck `in_progress`. Inbound webhooks persist
+> to `integration_events`. The backend serves the built frontend, so the product is one
+> deployable. A new **Integration** screen (`GET /api/system`) shows the queue, the
+> worker and the named blockers.
+>
+> Live mode also had three defects that offline could never surface, now fixed: the
+> referral column map silently dropped `status` (the live board showed everything as
+> `created`), `referrals` has no `form_id` column (resolved via `form_templates`), and
+> `attempts.attempt_number` is NOT NULL with no default.
+>
+> **2026-07-28 — A1 is shipped, by Ranking.** `rank_referral()` now writes
+> `referral_service_candidates`, closes the `rank_resources` action and calls
+> `advance_referral()` itself (`origin/service_ranking_and_call_agent` @ `03e21fc`).
+> We deleted our own competing version and build against theirs.
+>
+> Two follow-ons: their branch needs merging and their **Railway service redeploying**,
+> and **something has to trigger a ranking run** — they built no poller by design, so
+> that's ours (`BACKEND_CLAIM_RANKING=1`, whats-left A1b; it costs a Claude call per run).
+>
+> We also applied **`003_sw_selection_gate.sql`**: the SW now picks the service and that
+> choice triggers the next step, rather than `advance_referral` auto-taking rank 1. This
+> contradicts what Ranking's handoff assumed — because our own doc still recommended
+> Option A after we'd chosen B. Their code needs no change; their "zero open actions"
+> check now expects one (`select_resource → social_worker`).
+>
+> Run `python -m backend.scripts.demo_driver` for a read-only verdict on every live
+> referral.
 
 **Read this first if you just pulled.** Then
 **[`whats-left.md`](whats-left.md)** — the prioritised list of what integration and the
@@ -33,7 +65,7 @@ tell you to apply (`001_orchestration_bus.sql`) is **obsolete — do not run it.
 `referral_actions(referral_id, deduplication_key)` unique index already provides the
 idempotency we wanted `attempt_id` for.
 
-**Offline still works and is still the demo path.** `pytest` 76 green with no DB, no
+**Offline still works and is still the demo path.** `pytest tests` 112 green with no DB, no
 browser and no network; `python run_demo.py` closes the loop.
 
 ---
@@ -61,8 +93,14 @@ drifting, and `tests/test_actions.py` covers it.
    Nothing gets past this gate.
 5. Any attempt with `outcome='enrolled'` → mark enrolled, queue `complete_referral`.
 6. No rows in `referral_service_candidates` → status `ranking`, queue `rank_resources`.
-   **⚠ Everything currently stops here — see Blockers.**
-7. No service chosen → take the best candidate by `rank`, mark it selected.
+   *Ranking now writes candidates, so this no longer parks forever — but nothing
+   TRIGGERS a ranking run yet (whats-left A1b).*
+6b. **SW gate** (added by us — `003_sw_selection_gate.sql`): candidates exist and none is
+   `selected` → queue `select_resource` to **social_worker** and return
+   `awaiting_sw_selection`. A candidate already flagged `selected` is adopted as-is.
+7. ~~No service chosen → take the best candidate by `rank`~~ — unreachable for a
+   candidate-bearing referral now; step 6b answers first. Retained for the
+   "nothing available → escalate" path.
 8. An attempt in flight (`queued`/`started`/`sent`/`delivered`) → `waiting_for_response`.
 9. Service exhausted (3 attempts, or every channel tried) → queue `try_next_resource` and
    move down the shortlist. *Our own scheduler has no equivalent.*
@@ -249,7 +287,17 @@ test, so a populated `.env` can never turn a unit test into a live Retell call.
   the guard; keep it passing.
 - **Cost:** no Twilio or Retell call without explicit sign-off. `make_phone_call` stubs
   when `CALL_AGENT_BASE_URL` is unset and records `placed: false, stub: true`, so a
-  stubbed dispatch is never mistaken for a real one.
+  stubbed dispatch is never mistaken for a real one. `BACKEND_CLAIM_RANKING=1` spends a
+  Claude call per ranking run — leave it off unless you mean it.
+- **A finished action permanently poisons its dedup key.** `queue_referral_action`'s
+  ON CONFLICT only bumps `updated_at`, so a completed/cancelled row can never be
+  re-opened: `advance_referral` hands back the dead id and no open action exists. To
+  re-arm, DELETE the row (CLAUDE.md §7c).
+- **Never serve files by a user-supplied path without a containment check.** The SPA
+  fallback did, and `GET /%2e%2e%2f%2e%2e%2f.env` returned the service-role key.
+  Starlette does not normalise `..` out of a `:path` param.
+- **Re-apply a migration after editing it.** 003 was edited post-apply and the deployed
+  function silently drifted from the checked-in file for several hours.
 
 ## Open questions for the team
 

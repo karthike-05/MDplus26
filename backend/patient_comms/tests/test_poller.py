@@ -144,3 +144,37 @@ def test_notify_sends_before_shared_repo_write(db_session, monkeypatch):
                      {**_PATIENT, "phone": "+15551230002"}, booking)
     poller.run_action_poll(db_session, repo=r)
     assert calls.index("send") < calls.index("notified")
+
+
+def test_notify_logs_the_attempt_against_no_service(db_session, monkeypatch):
+    """service_id MUST be None on a patient notification.
+
+    `attempts` carries UNIQUE (referral_id, service_id, attempt_number) and log_attempt
+    defaults attempt_number to 1, so passing the action's service_id collided with the
+    outreach attempt that produced the booking — a duplicate-key violation on EVERY
+    notify, caught by run_action_poll and recorded as `handler_error`, leaving the
+    referral deadlocked on an open action. Consent never hit it because it already
+    passes None and Postgres treats NULLs as distinct in a unique index.
+
+    It is also the right value on its own terms: this is a message to the patient, not
+    an attempt on the service, and recording it against the service would burn one of
+    advance_referral's three per-service outreach attempts.
+
+    (_FakeRepo doesn't enforce the constraint, which is exactly why the bug shipped
+    green — so assert the value that constraint cares about.)
+    """
+    _patch_provider(monkeypatch)
+    booking = {"scheduled_start_at": datetime(2026, 8, 1, 14, 0),
+               "organization_name": "ModivCare", "confirmation_number": "ABC"}
+    db_session.add(PatientOutreach(referral_id="r-9", patient_phone="+15551230009",
+                                   stage=Stage.AWAITING_BOOKING)); db_session.commit()
+    r = _FakeRepo([{"id": "a-9", "referral_id": "r-9", "service_id": "svc-1",
+                    "action_type": "notify_patient", "input_payload": {}}],
+                  {**_PATIENT, "phone": "+15551230009"}, booking)
+
+    poller.run_action_poll(db_session, repo=r)
+
+    assert r.finished == ["a-9"], "the action must close, not fail"
+    booking_attempts = [a for a in r.attempts if a.get("purpose") == "booking"]
+    assert booking_attempts, "the notification should be logged"
+    assert all(a["service_id"] is None for a in booking_attempts)

@@ -71,8 +71,27 @@ def _handle_notify(session, action, repo) -> None:
     # state changes above via the single session.commit() at the end.
     conn = session.connection()
     repo.mark_booking_notified(action["referral_id"], conn=conn)
+    # service_id=None ON PURPOSE — matching _handle_consent, and NOT the action's
+    # service_id (which is what this used to pass).
+    #
+    # `attempts` carries UNIQUE (referral_id, service_id, attempt_number) and
+    # log_attempt defaults attempt_number to 1. By the time we notify, (referral_id,
+    # service_id, 1) is ALREADY TAKEN by the outreach attempt that produced this
+    # booking — so the insert was a duplicate-key violation on every single notify.
+    # run_action_poll caught it, rolled back and marked the action `handler_error`,
+    # which left the referral deadlocked on an open action forever. Consent never hit
+    # this only because it passes service_id=None and Postgres treats NULLs as
+    # distinct in a unique index.
+    #
+    # NULL is also the correct value regardless of the constraint: this is a message to
+    # the PATIENT, not an attempt on the service. Recorded against the service it would
+    # be counted by advance_referral's per-service three-attempt cap and silently burn
+    # an outreach attempt on a text the service never saw.
+    #
+    # Note the send above already happened and a rollback cannot recall a WhatsApp, so
+    # this failing meant the patient got the message while the DB recorded failure.
     repo.log_attempt(action["referral_id"], channel="whatsapp", direction="outbound",
-                     purpose="booking", status="sent", service_id=action.get("service_id"),
+                     purpose="booking", status="sent", service_id=None,
                      conn=conn)
     repo.finish_action(action["id"], {"notified": True}, conn=conn)
     session.commit()
