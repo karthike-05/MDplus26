@@ -229,6 +229,24 @@ def test_verified_utilized_completes_the_loop():
     assert body["outcome"]["data"]["patient_comms_event"] == "verified_utilized"
 
 
+def test_verified_utilized_advances_referral_live():
+    """LIVE branch: a patient's utilization YES (via patient_comms' emit) must drive
+    advance_referral(), so completion_outcome gets stamped and the loop closes. Before
+    this fix the seam only ran the offline scheduler live, so the referral stalled at
+    `enrolled` and only the manual button closed the loop."""
+    db, ref = _seed_at(sm.CHECK_IN_SCHEDULED)
+    live = _LiveKindDB(db)
+    app = FastAPI()
+    app.include_router(build_router(live, TOOLS))
+    r = TestClient(app).post("/api/patient-comms/event", json={
+        "referral_id": ref, "event": "verified_utilized", "reply_text": "yes went yesterday",
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert "advanced" in body                    # live branch taken -> advance_referral ran
+    assert body["event"] == "verified_utilized"
+
+
 def test_no_response_escalates():
     db, ref = _seed_at(sm.CHECK_IN_SCHEDULED)
     r = _client(db).post("/api/patient-comms/event", json={

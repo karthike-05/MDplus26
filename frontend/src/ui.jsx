@@ -26,7 +26,7 @@ export const STATE_META = {
   submitted: { label: "Submitted", color: C.purple },
   confirmed: { label: "Service accepted", color: C.teal },
   check_in_scheduled: { label: "Check-in sent", color: C.teal },
-  completed: { label: "Completed", color: C.ok },
+  completed: { label: "Closed Loop", color: C.ok },
   needs_human: { label: "Needs worker", color: C.warn },
   // Not a state_machine state — a live-only condition derived from an open
   // select_resource action (003_sw_selection_gate.sql). Distinct badge because

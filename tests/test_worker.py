@@ -284,11 +284,16 @@ def test_a_failing_event_log_does_not_break_the_transition():
     from fastapi.testclient import TestClient
     import backend.main as main
 
-    class NoLog(MockReferralDB):
-        async def record_integration_event(self, event):
-            raise ConnectionError("integration_events unreachable")
+    async def _failing_log(event):
+        raise ConnectionError("integration_events unreachable")
 
-    db = NoLog()
+    # Instance-level override rather than a MockReferralDB subclass: the patient-comms
+    # seam now branches live-vs-offline on `getattr(db,"kind",type(db).__name__) !=
+    # "MockReferralDB"` (matching the voice/org/utilization seams), so a subclass with a
+    # different class name would trip the LIVE branch. This test exercises the offline
+    # apply-and-cascade path (asserts the resulting `state`), so keep the class name.
+    db = MockReferralDB()
+    db.record_integration_event = _failing_log
     db._referrals["ref_1001"]["current_state"] = "check_in_scheduled"
     main.db.swap(db)
     try:

@@ -297,10 +297,26 @@ def build_router(db: ReferralDB, tools: Tools) -> APIRouter:
         status, channel = mapped if isinstance(mapped, tuple) else (mapped, channel_for)
         data = body.model_dump(exclude_none=True, exclude={"referral_id", "attempt_no"})
         data[data_key] = event_type          # keep the raw value for the UI / audit
-        result = await _apply_and_cascade(
-            body.referral_id, status=status, channel=channel,
-            attempt_no=body.attempt_no, data=data,
-        )
+        # Live: hand back to advance_referral (the owner of transitions), exactly like
+        # the voice/org/utilization seams below. patient_comms has already written the
+        # underlying signal (the consent / patient_confirmed_utilization column) AND
+        # closed its own action before emitting, so advance_referral just re-evaluates
+        # and transitions. Without this branch a `verified_utilized` event only drove the
+        # OFFLINE scheduler; live it never stamped completion_outcome, so the referral
+        # stalled at `enrolled` and the dashboard never showed the loop closing (only the
+        # manual "Patient used it" button worked, because /api/patient/utilization has
+        # this same branch). `kind` is DBSwitch's property; a bare adapter has none, so
+        # fall back to the class name rather than mis-routing to the offline branch.
+        # (Fix owned by the patient_comms track — this seam consumes our emit — touching
+        # the org adapter only to add the branch its 3 siblings already have.)
+        if getattr(db, "kind", type(db).__name__) != "MockReferralDB":
+            result = {"advanced": await db.advance_referral(body.referral_id),
+                      "event": event_type}
+        else:
+            result = await _apply_and_cascade(
+                body.referral_id, status=status, channel=channel,
+                attempt_no=body.attempt_no, data=data,
+            )
         await _log_event(db, provider=provider, event_type=event_type, payload=payload,
                          referral_id=body.referral_id, external_id=external_id)
         return result
