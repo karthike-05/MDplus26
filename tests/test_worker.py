@@ -850,3 +850,22 @@ def test_allow_live_calls_is_read_at_call_time_not_import(monkeypatch):
     assert voice_component.allow_live_calls() is True
     monkeypatch.setenv("ALLOW_LIVE_CALLS", "0")
     assert voice_component.allow_live_calls() is False
+
+
+def test_health_reports_every_real_world_flag(monkeypatch):
+    """OFF and BROKEN look identical from outside, and §7d showed a flag can silently
+    report its default forever. Each of these gates something that reaches a real
+    person, so each must be confirmable without shell access to the box."""
+    from fastapi.testclient import TestClient
+    from backend import main
+
+    monkeypatch.setenv("ALLOW_LIVE_CALLS", "1")
+    monkeypatch.setenv("ALLOW_LIVE_INTAKE", "0")
+    for name in send_email_mod.PROVIDER_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+    body = TestClient(main.app).get("/health").json()
+
+    assert body["allow_live_calls"] is True
+    assert body["allow_live_intake"] is False
+    assert body["email_provider_configured"] is False

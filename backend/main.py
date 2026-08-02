@@ -803,10 +803,21 @@ async def system_status() -> dict:
 async def health() -> dict:
     """Deploy health check. Reports the worker too: a process that answers HTTP while
     its worker died is "up" by every naive check and completely broken in practice."""
+    from backend.orchestrator import voice_component
+    from backend.tools.send_email import provider_configured
+
     return {"ok": True, "db": _db_status(), "worker": worker.status.as_dict(),
-            # Surfaced because "new referrals send no consent text" is otherwise
-            # indistinguishable from Messaging's poller being down.
-            "allow_live_intake": allow_live_intake()}
+            # Every flag here is surfaced for the same reason: OFF and BROKEN look
+            # identical from outside. "New referrals send no consent text" is
+            # indistinguishable from Messaging's poller being down; "the phone step
+            # never fires" from Voice being down; "the email step escalates" from a
+            # provider outage. §7d is the other half of this — a flag read at import
+            # silently ignores `.env`, and `/health` reporting the wrong value for
+            # ORCHESTRATOR_TICK is what cost a live debugging round on 2026-07-28. If a
+            # flag is worth having, it's worth being able to confirm from outside the box.
+            "allow_live_intake": allow_live_intake(),
+            "allow_live_calls": voice_component.allow_live_calls(),
+            "email_provider_configured": provider_configured()}
 
 
 class DBMode(BaseModel):
