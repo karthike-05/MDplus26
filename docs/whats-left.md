@@ -258,7 +258,10 @@ Cut on time grounds, not because the design failed: the `Injector` seam is genui
 target-agnostic, so picking this back up means building a fixture (a local page + a web
 schema) and running the existing code, not rearchitecting. **Until then nothing —
 CLAUDE.md, the deck, the demo narration — should describe web forms as working.**
-This is the half most services actually need, so it stays the top post-deadline item.
+This is the half most services actually need, so it stays a top post-deadline item —
+**the concrete four-step plan for resuming it lives in [CLAUDE.md §13](../CLAUDE.md#13-future-directions-post-aug-2)**
+(mock page → web schema → un-skip L3 → swap in a real form). Keep it in one place; this
+entry is the status, that one is the plan.
 
 ### B2. Nobody services escalations in the UI — ✅ DONE 2026-08-01
 `escalate_to_social_worker` actions are queued — by consent decline, resource exhaustion,

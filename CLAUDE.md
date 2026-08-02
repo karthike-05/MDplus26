@@ -641,17 +641,38 @@ Deferred on purpose — build only after the Aug-2 warm path is solid.
   `form_schemas`. This is the Aug-17 extraction stretch (§6 cold path, §3 Stagehand).
   Everything downstream (map → validate → review → inject) is already target-agnostic,
   so extraction only has to *produce a `FormSchema`* — no warm-path code changes.
+- **The online-application component — finish `WebInjector`.** *Cut 2026-08-01 on time,
+  not on design; this is the #2 item after the cold path.* Most real services take an
+  online application, not a PDF, so this is the half that decides whether the product
+  generalises beyond one hero form.
+
+  **What exists:** [`web_injector.py`](backend/tools/fill_form/injectors/web_injector.py)
+  — Playwright, fills by `selector`, leaves `human_only` blank, captures the
+  confirmation. It has **never been executed**: `frontend/mock_form/` is empty and no
+  `*_web.json` schema exists, so there has never been a fixture (§2, §9 L3).
+
+  **What it needs, in order — none of it touches the warm path:**
+  1. `frontend/mock_form/index.html` — a plain form with stable `id`s, one field per
+     `transport_intake` field, plus a signature box left blank to prove `human_only` is
+     never auto-filled. Served by `python -m http.server 8000 --directory frontend/mock_form`.
+  2. `contracts/schemas/transport_intake_web.json` — the same `FormSchema` shape as the
+     PDF one with `target_type: "web"`; `selector` replaces `page`/`rect`, everything
+     else (`source`, `fill_policy`, `maxlength`, `format`) is copied verbatim. That
+     symmetry is the point: same mapper, same validation, same review payload.
+  3. Un-skip the L3 layer in `tests/test_fill_form.py` and assert against the filled DOM.
+  4. Give one live service an `online_form` channel whose `application_url` points at a
+     real form, and swap `source_ref` + selectors. **No code change** — that swap is the
+     whole reason the Injector seam exists.
+
+  **Deliberately still out:** CAPTCHA solving, and any live third-party portal in a
+  recorded demo (§2). Multi-page and JS-gated forms are the first real difficulty; the
+  current injector assumes one page and no conditional fields.
 - **Real Supabase behind `ReferralDB`.** ✅ Built — `supabase_api.py` (REST +
   `service_role`, the stable path) and `supabase.py` (asyncpg). Column maps are aligned
   to the live schema. Flip by setting `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`;
   unset, `make_db()` returns the mock. Still gated on one blocker outside our control —
   nothing writes `referral_service_candidates`, so the live flow parks at
   `status='ranking'` (see [`docs/integration-status.md`](docs/integration-status.md)).
-- **The online-application form component.** ⚠ **Cut from scope 2026-08-01.** The PDF
-  half is built; filling a service's real web form is not (§6a). `WebInjector` exists but
-  has never been run — there is no mock page and no web schema to run it against, so
-  treat it as a design sketch. Picking this up means building the fixture first. No
-  CAPTCHA, no live third-party portal.
 - **Seed `form_templates`** from `contracts/schemas/*.json`. The live DB provisioned a
   better-designed home for our schemas than the original `form_schemas` idea —
   versioned, with verification provenance — and it's empty.
