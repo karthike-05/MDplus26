@@ -199,3 +199,88 @@ def test_unfiltered_fallback_writes_a_non_null_candidate_score():
             "referral_service_candidates.score is NOT NULL — a null here makes the "
             "degrade path raise, which is the exact failure it exists to prevent"
         )
+
+
+# --- 5. F1: a validation bounce is not an outreach attempt -------------------
+
+class _SubmitDB(_FakeDB):
+    """Records what post_submit would write to the shared bus."""
+
+    def __init__(self, actions_):
+        super().__init__(actions_)
+        self.shared_attempts: list[dict] = []
+        self.advanced = 0
+
+    async def get_referral(self, referral_id):
+        return {"id": referral_id, "patient_id": "p1", "form_id": "transport_intake",
+                "service_id": "svc_1", "status": "in_progress", "outreach_channel": "online_form"}
+
+    async def get_form_schema(self, form_id):
+        from backend.db.mock import SCHEMA_DIR, _load_schemas
+        return _load_schemas(SCHEMA_DIR)[form_id]
+
+    async def next_attempt_number(self, referral_id, service_id):
+        return len(self.shared_attempts) + 1
+
+    async def record_shared_attempt(self, row):
+        self.shared_attempts.append(row)
+
+    async def advance_referral(self, referral_id):
+        self.advanced += 1
+        return {"state": "advanced"}
+
+
+def _post_submit(monkeypatch, fake, outcome_status):
+    """Drive post_submit with a stubbed submit() returning `outcome_status`."""
+    from backend import main
+    from contracts.models import ToolOutcome
+
+    async def fake_submit(referral_id, values, db, **kw):
+        return ToolOutcome(referral_id=referral_id, channel="form",
+                           status=outcome_status, attempt_id="att_1",
+                           data={"problems": {"appointment_date": ["bad date format"]}}
+                                if outcome_status == "needs_human" else {})
+
+    monkeypatch.setattr(main, "db", fake)
+    monkeypatch.setattr(main, "submit", fake_submit)
+    monkeypatch.setattr(main, "_owns_transitions", lambda: False)
+    return asyncio.run(main.post_submit("ref_1", main.ReviewedValues(values={})))
+
+
+def test_validation_bounce_leaves_the_action_open_for_the_reviewer(monkeypatch):
+    """F1. `needs_human` means re-validation rejected a value: nothing was injected and
+    nothing reached the service. Closing the action as `failed` — what this used to do —
+    poisoned attempt:<referral>:<service>:online_form permanently (§7c), so the
+    corrected resubmit could never be re-queued."""
+    fake = _SubmitDB([{"id": "a1", "action_type": "prepare_online_form",
+                       "action_status": "blocked"}])
+
+    _post_submit(monkeypatch, fake, "needs_human")
+
+    assert fake.closed == [], "the reviewer isn't finished — leave it blocked"
+
+
+def test_validation_bounce_does_not_spend_an_outreach_attempt(monkeypatch):
+    """advance_referral counts shared attempts for the three-attempt cap AND reads
+    'is there an attempt on this channel' as channel-exhausted. Recording a bounce
+    would burn a real attempt on a form that was never sent, and step 9 would then move
+    the referral off the service it was about to apply to."""
+    fake = _SubmitDB([{"id": "a1", "action_type": "prepare_online_form",
+                       "action_status": "blocked"}])
+
+    _post_submit(monkeypatch, fake, "needs_human")
+
+    assert fake.shared_attempts == []
+    assert fake.advanced == 0, "nothing changed, so nothing to advance"
+
+
+def test_a_successful_submit_still_records_closes_and_advances(monkeypatch):
+    """The other side of F1 — the fix must not disarm the happy path."""
+    fake = _SubmitDB([{"id": "a1", "action_type": "prepare_online_form",
+                       "action_status": "blocked"}])
+
+    _post_submit(monkeypatch, fake, "success")
+
+    assert len(fake.shared_attempts) == 1
+    assert fake.closed == [("a1", "completed")]
+    assert fake.advanced == 1

@@ -4,6 +4,11 @@
 to end on live data (`changes-2026-08-01.md` §1). This is the list of ways it can go wrong
 that nobody has exercised.
 
+> **F1 and F2 were fixed the same day** — both were one-line-ish, both caused a silently
+> stalled or abandoned referral, and F1 was a regression from that morning's work. F3–F8
+> remain open. Each entry below keeps its original diagnosis so the reasoning survives,
+> with the fix appended.
+
 Ordered by **what it costs when it happens**, not by how likely it is. The expensive ones
 are the silent ones: a referral that stalls or abandons a service reads exactly like a
 referral that's fine, which is the failure mode this whole product exists to eliminate.
@@ -13,7 +18,7 @@ pretty half now works.
 
 ---
 
-## 🔴 F1. A validation failure on submit abandons the service
+## ✅ F1. A validation failure on submit abandons the service — FIXED 2026-08-01
 
 **`backend/main.py:611`** — `_close_open_form_action(referral_id, outcome.status)` closes
 the action as `"completed" if status == "success" else "failed"`.
@@ -35,13 +40,18 @@ directly (the route doesn't need the action), but the bus has already moved on.
 > **I introduced this today** as part of the fix for "submit never closed its action."
 > Closing on success was right; closing on `needs_human` was not.
 
-**Fix:** leave the action `blocked` on `needs_human` — the reviewer hasn't finished, which
-is exactly what `blocked` means. Only `success` and `failed` should close it. One line,
-plus a test that a `needs_human` submit leaves the action re-submittable.
+**Fixed.** `post_submit` now short-circuits on `needs_human` and does *none* of the three
+things: no shared `attempts` row (a validation bounce never reached the service, and
+recording one spends a real outreach attempt), no action close (the reviewer isn't
+finished — `blocked` is exactly that state), no `advance_referral` (nothing changed).
+
+Verified live: submitting `appointment_time: "quarter to three"` returns `needs_human`
+with the problems listed, leaves the action `blocked`, and writes **zero** attempts. The
+corrected resubmit then succeeds as `attempt_number: 1` — the bounce cost nothing.
 
 ---
 
-## 🔴 F2. The `service_requests` write-back can throw *after* the PDF is written
+## ✅ F2. The `service_requests` write-back can throw *after* the PDF is written — FIXED 2026-08-01
 
 **`backend/tools/fill_form/fill_form.py:152-156`** — unguarded:
 
@@ -69,9 +79,18 @@ A concrete trigger already exists: `appointment_time` maps to
 instead of `14:45` produces a type error — and `format` isn't set on that field, so
 validation won't catch it first.
 
-**Fix:** wrap in try/except, record the outcome regardless, and surface the write-back
-failure in `outcome.data` rather than raising. Bookkeeping must never roll back a side
-effect that already left the building.
+**Fixed, in both directions.**
+
+*Containment* — the write-back is wrapped; a failure is reported as
+`outcome.data["writeback_failed"]` (with the values it tried) and the submit still
+succeeds, because the injection really happened.
+
+*Prevention* — the trigger named above is gone. `appointment_time` now carries
+`"format": "time"`, and a new `time` validator accepts what the DB emits (`09:30:00`),
+what a reviewer types (`2:45 PM`), and 24h without seconds — while
+`service_request_writeback` normalises through each field's own `format` on the way out.
+So the PDF carries `2:45 PM` (what a human should read on a form) and the `time` column
+gets `14:45:00`. Verified live end to end.
 
 ---
 
@@ -193,7 +212,9 @@ thing that only ever shows up in a live demo with two laptops.
 
 ## Suggested order
 
-**F1 and F2 first** — both are one-line-ish, both cause a silently stalled or abandoned
-referral, and F1 is a regression from today. **F3** next because it's five minutes and
-turns a 500 into a sentence. **F4** matters the moment anyone double-clicks in front of an
-audience. F5–F8 are real but need someone to decide the behaviour, not just write the fix.
+~~F1 and F2~~ — **done 2026-08-01.**
+
+**F3** next: five minutes, and it turns a 500 into a sentence. **F4** matters the moment
+anyone double-clicks in front of an audience, and the fix is known (key the shared attempt
+on the action id, as `actions.py` already does). F5–F8 are real but need someone to decide
+the behaviour, not just write the fix.

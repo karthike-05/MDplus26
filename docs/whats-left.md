@@ -428,7 +428,7 @@ Same items, grouped by owner. Roles per `CLAUDE.md` §4.
 | B2 | ✅ **Done 2026-08-01.** Escalations queue in the UI | `GET /api/escalations` + resolve; `Escalations.jsx`. |
 | B3 | Wire a provider behind `send_email` | Still a stub — but it now reports `needs_human` and lands in Escalations instead of claiming a phantom send. Set `RESEND_API_KEY` / `SMTP_URL` / `EMAIL_PROVIDER_URL` and fill the TODO; all callers already wired. Free tiers cover demo volume. |
 | B4, B8, B9, B12 | Cold path; observability; retry/dead-letter; live-mode tests | Post-Aug-2 hardening. |
-| B14 | **Harden the form component's failure paths** | 8 enumerated, code-grounded, ordered by cost: [`form-failure-paths.md`](form-failure-paths.md). F1 and F2 both silently stall or abandon a referral. |
+| B14 | **Harden the form component's failure paths** | 8 enumerated, code-grounded, ordered by cost: [`form-failure-paths.md`](form-failure-paths.md). **F1 + F2 fixed 2026-08-01**; F3–F8 open. |
 
 ### Whole team (decide together, quickly)
 | # | Decision |

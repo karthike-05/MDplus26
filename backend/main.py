@@ -589,6 +589,27 @@ async def post_submit(referral_id: str, body: ReviewedValues) -> dict:
     if _owns_transitions():
         await db.set_state(referral_id, sm.next_state(from_state, outcome.status))
         advanced = None
+    elif outcome.status == "needs_human":
+        # A VALIDATION BOUNCE IS NOT AN OUTREACH ATTEMPT. `submit()` returns needs_human
+        # when re-validation rejects a value, which means nothing was injected and
+        # nothing reached the service — the reviewer simply isn't finished.
+        #
+        # So this branch does none of the three things below, and each omission matters:
+        #   - no shared `attempts` row: advance_referral counts those for the
+        #     three-attempt cap and reads "is there an attempt on this channel" as
+        #     channel-exhausted, so recording one would spend a real outreach attempt on
+        #     a form that was never sent;
+        #   - the action stays `blocked`, which is exactly what blocked means (awaiting
+        #     human review). Closing it as `failed` — what this used to do — poisoned
+        #     `attempt:<referral>:<service>:online_form` permanently (§7c), so the
+        #     corrected resubmit could never be re-queued;
+        #   - no advance_referral: nothing changed, and calling it after the two above
+        #     is what made one bad date abandon the service entirely.
+        #
+        # docs/form-failure-paths.md F1. The reviewer fixes the value and POSTs again.
+        advanced = {"state": "awaiting_review",
+                    "reason": "validation failed — nothing was sent, the action is "
+                              "still open for the reviewer"}
     else:
         # Live, a submit is an `attempts` row plus a handoff back to the DB scheduler —
         # the same two steps the worker takes (orchestrator/actions.py). Doing only our

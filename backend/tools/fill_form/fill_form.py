@@ -41,12 +41,17 @@ def service_request_writeback(schema: FormSchema, values: dict) -> dict:
     the single place the correspondence is declared, and adding a field needs no change
     here. Skips blanks — never overwrite a stored value with an empty one — and skips
     ``human_only`` fields, which the agent may not fill at all (§2).
+
+    Values are normalised through the field's own ``format`` on the way out. The PDF gets
+    what the reviewer typed ("2:45 PM", which is what a human should read on a form); the
+    DB gets ``14:45:00``, because ``requested_start_time`` is a Postgres ``time`` column
+    and the reviewer's spelling is a type error there (F2).
     """
     out: dict = {}
     for field in schema.fillable_fields():
         root, _, column = (field.source or "").partition(".")
         if root == "service_request" and column and values.get(field.name) not in (None, ""):
-            out[column] = values[field.name]
+            out[column] = mapper.normalize(values[field.name], field.format)
     return out
 
 
@@ -150,10 +155,29 @@ async def submit(
     # so Voice and the dashboard see the corrected trip details rather than only the
     # PDF holding them. Only on success: a failed injection must not leave the shared
     # row claiming values that were never submitted.
+    #
+    # GUARDED, AND NEVER ALLOWED TO RAISE. The injection has already happened by this
+    # point — the PDF is written, the application is out. If this throws (a type error on
+    # a `time`/`date` column, a value too long for it, a network blip) and the exception
+    # escapes, the ToolOutcome below is never recorded, the caller never closes the
+    # action, `advance_referral`'s open-action guard freezes the referral, and the
+    # reviewer is told their submit failed — for a submission that really happened.
+    #
+    # That is the `save_call_outcome` failure shape (changes-2026-07-31 §2) where one bad
+    # field killed the whole post-call chain. Bookkeeping must not roll back a side effect
+    # that already left the building, so a write-back failure is REPORTED in
+    # `outcome.data` and the submit still succeeds.
     if status == "success":
         writeback = service_request_writeback(schema, clean)
         if writeback:
-            await db.save_service_request(referral_id, writeback)
+            try:
+                await db.save_service_request(referral_id, writeback)
+            except Exception as exc:  # noqa: BLE001 — see above
+                confirmation = {
+                    **confirmation,
+                    "writeback_failed": f"{type(exc).__name__}: {exc}",
+                    "writeback_values": writeback,
+                }
 
     outcome = ToolOutcome(
         referral_id=referral_id,
