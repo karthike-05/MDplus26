@@ -137,3 +137,54 @@ def test_execute_inbound_flags_escalation_opened(db_session, monkeypatch):
 def test_execute_inbound_no_escalation_on_plain_consent_yes(db_session, monkeypatch):
     result = _run_consent_yes(db_session, monkeypatch)
     assert result.escalation_opened is False
+
+
+import responder
+import service
+
+
+def test_ack_routes_through_responder_when_enabled(db_session, monkeypatch):
+    _prov(monkeypatch)
+    from state_machine import ReplyClass
+    monkeypatch.setenv("RESPONDER", "on")
+    seen = {}
+    def _fake_compose(template_body, *, facts, patient_question, history):
+        seen["facts"] = facts; seen["q"] = patient_question
+        return "CONVERSATIONAL REPLY"
+    monkeypatch.setattr(responder, "compose_reply", _fake_compose)
+    o = _mk(db_session)
+    r = _Repo(booking={"scheduled_start_at": None, "pickup_address": "123 Main St"})
+    res = inbound.execute_inbound(db_session, o, ReplyClass.APPOINTMENT_QUESTION,
+                                  "what time?", _PATIENT, None, repo=r)
+    db_session.commit()
+    assert res.ack == "CONVERSATIONAL REPLY"
+    assert seen["q"] == "what time?"
+    assert "123 Main St" in seen["facts"]["details"]           # booking data reached the responder
+    assert seen["facts"]["patient_name"] == "Sam"
+
+
+def test_responder_failure_still_sends_and_writes_state(db_session, monkeypatch):
+    _prov(monkeypatch)
+    from state_machine import ReplyClass
+    monkeypatch.setenv("RESPONDER", "on")
+    # compose_reply contract: it never raises; it returns the template on failure.
+    monkeypatch.setattr(responder, "compose_reply",
+                        lambda tb, **kw: tb)  # simulate full fallback
+    o = _mk(db_session)
+    r = _Repo()
+    res = inbound.execute_inbound(db_session, o, ReplyClass.NEEDS_HELP, "stuck",
+                                  _PATIENT, None, repo=r)
+    db_session.commit()
+    assert res.ack  # a templated ack was still produced and sent
+    assert r.opened == [("r-1", "patient_reported_problem")]  # state write intact
+
+
+def test_disabled_keeps_templated_ack(db_session, monkeypatch):
+    _prov(monkeypatch)
+    from state_machine import ReplyClass
+    monkeypatch.setenv("RESPONDER", "off")
+    o = _mk(db_session)
+    r = _Repo()
+    res = inbound.execute_inbound(db_session, o, ReplyClass.YES, "yes", _PATIENT, None, repo=r)
+    db_session.commit()
+    assert "Sam" in res.ack  # rendered template, not a generative reply

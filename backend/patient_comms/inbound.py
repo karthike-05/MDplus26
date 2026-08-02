@@ -4,7 +4,8 @@ every write on the session's connection so the webhook can commit them
 atomically; it never commits itself."""
 from dataclasses import dataclass
 
-from service import compose_details, log_message, send_templated
+import responder
+from service import compose_details, log_message, recent_messages, render_message, send_body
 from state_machine import route_inbound
 
 
@@ -66,9 +67,16 @@ def execute_inbound(session, outreach, reply_class, body, patient, open_escalati
     elif d["loop"] == "resume":
         outreach.paused = False
 
+    # Pre-fetch booking logistics so the responder can answer specific questions
+    # on ANY reply, not just ones the router flagged as appointment questions.
+    # One cheap read; compose_details(None) is a safe placeholder pre-booking.
+    details = None
+    if d["needs_booking_lookup"] or responder.is_enabled():
+        details = compose_details(repo.get_booking_details(outreach.referral_id))
+
     extra = {}
-    if d["needs_booking_lookup"]:
-        extra["details"] = compose_details(repo.get_booking_details(outreach.referral_id))
+    if d["needs_booking_lookup"] and details is not None:
+        extra["details"] = details
 
     if d["new_stage"] is not None:
         outreach.stage = d["new_stage"]
@@ -78,6 +86,18 @@ def execute_inbound(session, outreach, reply_class, body, patient, open_escalati
 
     repo.log_attempt(outreach.referral_id, channel="whatsapp", direction="inbound",
                      purpose=received_stage.value, status="delivered", conn=conn)
-    ack = send_templated(session, outreach, d["ack_key"], ctx, "ack", **extra)
+
+    # Render the approved ack (content contract + fallback), then let the
+    # responder make it conversational. compose_reply returns the template
+    # unchanged when RESPONDER=off or on any failure -- it never raises.
+    template_body = render_message(d["ack_key"], ctx, **extra)
+    facts = dict(ctx)
+    if details is not None:
+        facts["details"] = details
+    ack = responder.compose_reply(
+        template_body, facts=facts, patient_question=body,
+        history=recent_messages(session, outreach, limit=6))
+    send_body(session, outreach, ack, "ack")
+
     return InboundResult(ack=ack, writeback=wb, received_stage=received_stage.value,
                          escalation_opened=(d["escalation"] == "open"))

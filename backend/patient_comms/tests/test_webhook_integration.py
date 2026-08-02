@@ -82,6 +82,10 @@ def _setup(monkeypatch, *, stage, phone=_PHONE, referral_id="r-int-1"):
     fake_repo = _Repo()
     monkeypatch.setattr(main.repo, "get_patient_for_referral", lambda rid: _PATIENT)
     monkeypatch.setattr(main.repo, "find_open_escalation", lambda rid: None)
+    # The responder pre-fetches booking details on every reply (not just
+    # appointment questions) whenever RESPONDER is enabled -- stub it so this
+    # test never touches the real Supabase engine.
+    monkeypatch.setattr(main.repo, "get_booking_details", fake_repo.get_booking_details)
     monkeypatch.setattr(main.repo, "set_consent", fake_repo.set_consent)
     monkeypatch.setattr(main.repo, "set_utilization", fake_repo.set_utilization)
     monkeypatch.setattr(main.repo, "set_preferred_contact_method", fake_repo.set_preferred_contact_method)
