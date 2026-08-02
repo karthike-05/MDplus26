@@ -83,6 +83,7 @@ def _get_client():
 def compose_reply(template_body: str, *, facts: dict, patient_question: str,
                   history: list[dict]) -> str:
     if not is_enabled():
+        _audit.info("model=%s decision=disabled", DEFAULT_MODEL)
         return template_body
 
     allowed = _build_allowed_context(facts)

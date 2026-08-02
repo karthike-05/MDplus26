@@ -2,11 +2,14 @@
 that turns a `route_inbound` decision into DB writes + a templated ack. It runs
 every write on the session's connection so the webhook can commit them
 atomically; it never commits itself."""
+import logging
 from dataclasses import dataclass
 
 import responder
 from service import compose_details, log_message, recent_messages, render_message, send_body
 from state_machine import route_inbound
+
+logger = logging.getLogger("inbound")
 
 
 @dataclass
@@ -72,7 +75,12 @@ def execute_inbound(session, outreach, reply_class, body, patient, open_escalati
     # One cheap read; compose_details(None) is a safe placeholder pre-booking.
     details = None
     if d["needs_booking_lookup"] or responder.is_enabled():
-        details = compose_details(repo.get_booking_details(outreach.referral_id))
+        try:
+            details = compose_details(repo.get_booking_details(outreach.referral_id))
+        except Exception:  # noqa: BLE001 -- a booking-read failure must not 500 the webhook
+            logger.warning("booking pre-fetch failed for referral=%s", outreach.referral_id,
+                           exc_info=True)
+            details = None
 
     extra = {}
     if d["needs_booking_lookup"] and details is not None:

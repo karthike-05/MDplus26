@@ -178,6 +178,27 @@ def test_responder_failure_still_sends_and_writes_state(db_session, monkeypatch)
     assert r.opened == [("r-1", "patient_reported_problem")]  # state write intact
 
 
+class _RepoBookingRaises(_Repo):
+    def get_booking_details(self, rid):
+        raise RuntimeError("db exploded")
+
+
+def test_booking_prefetch_failure_does_not_500_webhook(db_session, monkeypatch):
+    # I1 regression: repo.get_booking_details raising must not propagate out of
+    # execute_inbound (it sits outside compose_reply's own try/except).
+    _prov(monkeypatch)
+    from state_machine import ReplyClass
+    monkeypatch.setenv("RESPONDER", "on")
+    monkeypatch.setattr(responder, "compose_reply", lambda tb, **kw: tb)
+    o = _mk(db_session)
+    r = _RepoBookingRaises()
+    res = inbound.execute_inbound(db_session, o, ReplyClass.NEEDS_HELP, "stuck",
+                                  _PATIENT, None, repo=r)
+    db_session.commit()
+    assert res.ack  # execute_inbound returned an ack instead of raising
+    assert r.opened == [("r-1", "patient_reported_problem")]  # state write still happened
+
+
 def test_disabled_keeps_templated_ack(db_session, monkeypatch):
     _prov(monkeypatch)
     from state_machine import ReplyClass
