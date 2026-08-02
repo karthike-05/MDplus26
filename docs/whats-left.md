@@ -247,13 +247,20 @@ adapters apply and forget. A dropped or duplicated webhook is currently untracea
 Beyond making the four services talk, these are needed before this is something a real
 social worker could use.
 
-### B1. The online-application form component
+### B1. The online-application form component — ❌ CUT FROM SCOPE 2026-08-01
 Form-filling has two halves. The **PDF** half is built; **filling a service's real web
-application** is not. `WebInjector` works against `frontend/mock_form/` but has never run
-against a live third-party form, and that directory is currently empty (no
-`transport_intake_web.json` either). This is the half most services actually need.
+application** is not, and will not be for this deadline. `WebInjector` has *never run at
+all* — the earlier note that it "works against `frontend/mock_form/`" was wrong, that
+directory is empty and there is no `transport_intake_web.json`, so there has never been
+anything to run it against.
 
-### B2. Nobody services escalations in the UI
+Cut on time grounds, not because the design failed: the `Injector` seam is genuinely
+target-agnostic, so picking this back up means building a fixture (a local page + a web
+schema) and running the existing code, not rearchitecting. **Until then nothing —
+CLAUDE.md, the deck, the demo narration — should describe web forms as working.**
+This is the half most services actually need, so it stays the top post-deadline item.
+
+### B2. Nobody services escalations in the UI — ✅ DONE 2026-08-01
 `escalate_to_social_worker` actions are queued — by consent decline, resource exhaustion,
 and now by a denied utilization — and **there is no screen to see or claim them.** The
 dashboard's "Needs you" group reads referral state, not the action queue. A referral that
@@ -414,8 +421,8 @@ Same items, grouped by owner. Roles per `CLAUDE.md` §4.
 | ~~A8~~ | ~~Make our backend reachable~~ | ✅ Single deployable; tunnel or Railway, no rebuild on URL change |
 | A6 | Run the seeder — it needs a `--service-id` | Script is written; the table is still empty until a service is chosen. |
 | A11 | Get one ground-transport service an `online_form` channel row | 🔴 Without it the form component **never fires** on a live referral. |
-| B1 | Build the online-application component + its `mock_form` fixture and web schema | The PDF half is built; this half is what most services need. |
-| B2 | An escalations queue in the UI | `escalate_to_social_worker` actions are queued and **unclaimable** — a product hole. |
+| B1 | ❌ **Cut 2026-08-01.** Online-application component + its `mock_form` fixture and web schema | Deferred on time. `WebInjector` has never run — don't describe web as working. |
+| B2 | ✅ **Done 2026-08-01.** Escalations queue in the UI | `GET /api/escalations` + resolve; `Escalations.jsx`. |
 | B3 | Wire a provider behind `send_email` | Now reachable via `contact_service_by_email`, but still a stub that records without sending. |
 | B4, B8, B9, B12 | Cold path; observability; retry/dead-letter; live-mode tests | Post-Aug-2 hardening. |
 

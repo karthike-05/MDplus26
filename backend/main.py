@@ -970,7 +970,12 @@ async def create_referral(body: NewReferral) -> dict:
     # form tools have nothing to fill in later (verified via supabase MCP: no DB trigger
     # creates it either). Values not asked on the intake form come from the patient
     # record instead of duplicating a second box for them (mobility/insurance/phone).
-    if category == "transportation":
+    # Written for EVERY category that collected something, not just transportation.
+    # `patients` has no street-address column (§7e), so `pickup_address` on this row is
+    # the only place a street address lives — and `food_assistance.home_address` sources
+    # from it exactly as the transport form's does. Gating this on transportation meant a
+    # food referral got no row at all and that field rendered blank on the pantry form.
+    if sr_input:
         sr_fields = {
             **sr_input,
             "mobility_requirements": patient.get("mobility_needs"),

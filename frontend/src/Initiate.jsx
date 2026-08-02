@@ -109,6 +109,12 @@ const INCOME_OPTIONS = [
 // etc. get added here once their own flows exist.
 const CATEGORY_OPTIONS = [
   { value: "transportation", label: "Transportation" },
+  // Food is wired end to end but thinly stocked: the only active `food` service in the
+  // catalog is [Demo] Northside Community Food Pantry, so ranking returns exactly one
+  // candidate (fine — MIN_ELIGIBLE_CANDIDATES is 1). It exists because it's the only way
+  // to reach the `food_assistance` form schema through the UI, which otherwise could
+  // never be exercised. Housing etc. get added here once a service exists to route to.
+  { value: "food", label: "Food assistance" },
 ];
 
 export default function Initiate({ onDone, onCancel }) {
@@ -347,6 +353,29 @@ export default function Initiate({ onDone, onCancel }) {
               </select>
             </Field>
 
+            {/* Food needs exactly one thing the patient record cannot supply: a street
+                address. `patients` has no address column (§7e) — intake geocodes it away
+                into postal_code/county/lat-long — so `food_assistance.home_address`
+                sources from `service_request.pickup_address` like the transport form's
+                does. Same column, same row, one box instead of the whole trip block. */}
+            {ref.category === "food" && (
+              <>
+                <div style={s.step}>Food assistance details</div>
+                <Field label="Home address" required
+                       hint="Goes on the pantry's application form. The patient record only
+                             stores a ZIP and county, not a street address.">
+                  <input style={s.input} value={ref.pickup_address}
+                         placeholder="3312 Parallel Pkwy, Kansas City, KS 66104"
+                         onChange={(e) => setRef({ ...ref, pickup_address: e.target.value })} />
+                </Field>
+                <Field label="Notes for the pantry">
+                  <input style={s.input} value={ref.request_notes}
+                         placeholder="Dietary restrictions, pickup constraints, household details"
+                         onChange={(e) => setRef({ ...ref, request_notes: e.target.value })} />
+                </Field>
+              </>
+            )}
+
             {/* Trip payload for `service_requests` (§6a) — Voice and fill_form both
                 read this row, so it's created alongside the referral (backend/main.py). */}
             {ref.category === "transportation" && (
@@ -433,7 +462,10 @@ export default function Initiate({ onDone, onCancel }) {
 
             <Btn disabled={busy || !ref.category
                            || (ref.category === "transportation" && (!ref.pickup_address.trim()
-                               || !ref.destination_address.trim() || !ref.appointment_date.trim()))}
+                               || !ref.destination_address.trim() || !ref.appointment_date.trim()))
+                           // Food needs only the address — it's the one field on the
+                           // pantry form with no source on the patient record (§7e).
+                           || (ref.category === "food" && !ref.pickup_address.trim())}
                  onClick={create}>{busy ? "Creating…" : "Create referral →"}</Btn>
           </>
         )}
@@ -445,10 +477,11 @@ export default function Initiate({ onDone, onCancel }) {
 }
 
 const Row = ({ children }) => <div style={s.row}>{children}</div>;
-const Field = ({ label, children, required }) => (
+const Field = ({ label, children, required, hint }) => (
   <label style={s.field}>
     <span style={s.label}>{label}{required && <span style={s.required}> *</span>}</span>
     {children}
+    {hint && <span style={s.hint}>{hint}</span>}
   </label>
 );
 const Note = ({ tone, children }) => (

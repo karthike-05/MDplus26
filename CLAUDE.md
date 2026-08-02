@@ -70,7 +70,14 @@ building. Every one of them was added after finding the app could already do the
 - **No live LLM in the submission path.** Claude is used only inside bounded steps (value mapping, call-script generation) and must return validated JSON that deterministic code acts on.
 - **Never auto-fill or auto-submit `human_only` fields** (signatures, consent, attestations). Enforced by `FormSchema.fillable_fields()`, not by model judgment.
 - **Deterministic fill + validation before any injection.** Malformed values are flagged for human review, never injected.
-- **Web and PDF are both first-class form targets.** They differ only in the field locator and the injector — see [§6](#6-form-fill-architecture--the-injector-seam). Flat (non-fillable) PDFs are IN scope for a known template; only autonomous extraction of an *unseen* scanned form is deferred.
+- **PDF is the form target we ship. Web is DEFERRED — do not claim it works.** The
+  `Injector` seam ([§6](#6-form-fill-architecture--the-injector-seam)) is genuinely
+  target-agnostic and `WebInjector` is written, but it has never run against anything:
+  `frontend/mock_form/` is empty and no `*_web.json` schema exists, so there is no
+  fixture and the L3 test layer is inert. Cut from scope 2026-08-01 on time grounds.
+  Describe web as *what the seam is designed for*, never as a capability we have.
+  Flat (non-fillable) PDFs ARE in scope for a known template; only autonomous
+  extraction of an *unseen* scanned form is deferred.
 - **No CAPTCHA solving. No live third-party portal in the hero demo.** The hero form is self-hosted / a local fixture under our control.
 - **Freeze the shared contracts ([§5](#5-the-shared-contracts-freeze-first)) before building logic.** Everyone codes against them.
 
@@ -83,7 +90,7 @@ building. Every one of them was added after finding the app could already do the
 | **Backend** | Python 3.11+, FastAPI | Async throughout. |
 | **DB** | Supabase (Postgres) | Backend accesses Postgres **directly** (asyncpg / async SQLAlchemy) for logic/transactions. Frontend uses `supabase-js` for reads + realtime. |
 | **Agent/LLM** | Anthropic Claude API | Structured tool-use / JSON output. No agent framework (no LangChain) — discrete tools + our own state machine. |
-| **Web automation** | Playwright **for Python** | In-process with the backend. Stagehand (Node-only) deferred to the Aug 17 extraction stretch — no Node in the backend before then. |
+| **Web automation** | Playwright **for Python** | ⚠ Dependency present, `WebInjector` written, **never exercised** — web forms are out of scope (§2). Stagehand (Node-only) deferred with it. |
 | **PDF automation** | PyMuPDF (`fitz`), `pypdf` | `fitz` for deterministic text overlay onto flat PDFs; `pypdf` for AcroForm fillable PDFs. |
 | **Messaging** | Twilio | WhatsApp sandbox — chosen over SMS to avoid 10DLC delays. |
 | **Voice** | Retell | Outbound calls to social services. Budget in Retell/Twilio minutes, not Claude tokens. |
@@ -108,7 +115,7 @@ building. Every one of them was added after finding the app could already do the
 │   └─ db-contract.md              # live columns + CHECK constraints
 ├─ contracts/                      # SHARED SOURCE OF TRUTH — freeze early
 │   ├─ models.py                   # FormSchema / FormField / ToolOutcome (Pydantic)
-│   └─ schemas/                    # one verified schema per form (web XOR pdf)
+│   └─ schemas/                    # one verified schema per form (pdf only today)
 │       ├─ transport_intake_pdf.json
 │       └─ food_assistance_pdf.json
 │                                  # NOTE: no *_web.json yet — the online-application
@@ -142,7 +149,7 @@ building. Every one of them was added after finding the app could already do the
 │   ├─ src/ReviewUI.jsx            # per-patient review screen
 │   ├─ src/ChooseService.jsx       # the SW selection gate (§7b)
 │   ├─ src/Integration.jsx         # the shared bus: queue, worker, named blockers
-│   └─ mock_form/index.html        # local web-form test double
+│   └─ mock_form/                  # EMPTY — the web test double was never built
 ├─ sample_forms/                   # PDF fixtures + rendered previews
 ├─ tests/test_fill_form.py         # layered suite (runs with no DB/browser)
 ├─ run_demo.py                     # headless end-to-end
@@ -255,7 +262,9 @@ submit(referral_id, schema, reviewed_values, db)
 ```
 
 - **PdfInjector** — overlays text at each field's `rect` (PyMuPDF). Flat digital PDFs and scanned PDFs fill identically once a rect is verified.
-- **WebInjector** — fills by `selector` (Playwright), leaving `human_only` blank, capturing the confirmation.
+- **WebInjector** — ⚠ **written but never run.** Fills by `selector` (Playwright),
+  leaving `human_only` blank, capturing the confirmation. No fixture exists, so this is
+  unproven code, not a supported target — see the golden rule in §2.
 - Adding an API-based submission later = one more `Injector`. Mapping, validation, and the review UI never change.
 
 **The review screen** (`frontend/src/ReviewUI.jsx`) is a split view: extracted **fields on the left**, the **PDF form on the right**. Selecting a field boxes its `rect` on the page (and vice-versa) so the reviewer can confirm the agent mapped the right region before submit. It reads the `ReviewPayload` (values) + the `FormSchema` fields (rect geometry, `fill_policy`). For it to work the backend must expose, per form:
@@ -527,14 +536,12 @@ You can finish a workstream before its dependencies exist.
 **Two fixtures, one pipeline.** Develop web and PDF simultaneously off the same `prepare()` / `submit()` flow:
 
 - **PDF:** `sample_forms/transport_intake_blank.pdf` (generated by `make_sample_pdf.py`) + `transport_intake_pdf.json`.
-- **Web:** ⚠ **not built yet.** `frontend/mock_form/` is empty and there is no
-  `transport_intake_web.json`, so `WebInjector` currently has no fixture and the L3 layer
-  below has nothing to run against. The plan is unchanged — a local page plus a web
-  schema, swapped for a real form later by editing `source_ref` + selectors with no code
-  change — but building it is open work (docs/whats-left.md B1):
-  ```bash
-  python -m http.server 8000 --directory frontend/mock_form   # once it has an index.html
-  ```
+- **Web:** ⚠ **cut from scope 2026-08-01.** `frontend/mock_form/` is empty and there is
+  no `transport_intake_web.json`, so `WebInjector` has no fixture and the L3 layer below
+  has nothing to run against. The design still holds — a local page plus a web schema,
+  swapped for a real form later by editing `source_ref` + selectors with no code change —
+  but it is not being built for this deadline, and nothing should describe web forms as
+  working.
 
 **Test in layers** (`tests/test_fill_form.py`):
 
@@ -542,7 +549,7 @@ You can finish a workstream before its dependencies exist.
 | --- | --- | --- |
 | **L1 unit** | mapping + validation, no I/O | Runs in ms. The correctness core (G2) — keep it fast and exhaustive. |
 | **L2 injector** | `submit()` writes a real PDF | Assert by extracting the text layer (`fitz … get_text()`), not by pixel-diff. |
-| **L3 web** | Playwright smoke against the mock page | Skips if no browser. |
+| **L3 web** | ⚠ **inert** — no mock page, no web schema. Skips always, and would skip even with a browser. |
 
 **The visual loop for PDF coordinate authoring:** fill → render page to PNG (`page.get_pixmap`) → eyeball → nudge `rect`. Fast way to design a template. But pair it with a text-extraction assertion — the eye misses things a substring check catches (e.g. `insert_textbox` silently drops text in short boxes; use a baseline `insert_text` for single-line fields).
 
@@ -575,7 +582,6 @@ pytest tests -q                             # our suite — `pytest -q` also col
                                             # backend/patient_comms, which needs sqlalchemy
 python -m backend.scripts.demo_driver       # read-only: what the LIVE loop will do next
 python -m backend.scripts.seed_form_templates --list   # form_templates + candidate services
-python -m http.server 8000 --directory frontend/mock_form   # mock web form (EMPTY — see §9)
 cd frontend && npm run dev                  # frontend
 supabase db push                            # apply contracts/db_schema.sql (when using the CLI)
 ```
@@ -641,9 +647,11 @@ Deferred on purpose — build only after the Aug-2 warm path is solid.
   unset, `make_db()` returns the mock. Still gated on one blocker outside our control —
   nothing writes `referral_service_candidates`, so the live flow parks at
   `status='ranking'` (see [`docs/integration-status.md`](docs/integration-status.md)).
-- **The online-application form component.** The PDF half is built; filling a service's
-  real web form is not (§6a). `WebInjector` exists and works against
-  `frontend/mock_form/`. No CAPTCHA, no live third-party portal.
+- **The online-application form component.** ⚠ **Cut from scope 2026-08-01.** The PDF
+  half is built; filling a service's real web form is not (§6a). `WebInjector` exists but
+  has never been run — there is no mock page and no web schema to run it against, so
+  treat it as a design sketch. Picking this up means building the fixture first. No
+  CAPTCHA, no live third-party portal.
 - **Seed `form_templates`** from `contracts/schemas/*.json`. The live DB provisioned a
   better-designed home for our schemas than the original `form_schemas` idea —
   versioned, with verification provenance — and it's empty.
