@@ -124,6 +124,12 @@ export function Btn({ children, onClick, tone = "accent", disabled, small }) {
   );
 }
 
+// Two spellings for the same channel: offline uses "form" (state_machine.py
+// DEFAULT_OUTREACH_CHANNEL), live uses "online_form" (service_application_channels /
+// THEIR_CHANNELS, backend/orchestrator/actions.py). Both mean "this is our form-fill
+// review step" — a literal `=== "form"` check silently never matches live rows.
+export const FORM_CHANNELS = new Set(["form", "online_form"]);
+
 // What the social worker can do next, by state. Sim signals stand in for the real
 // inbound webhooks (patient/service replies) so the loop is demoable offline (§7).
 export function actionFor(row) {
@@ -136,7 +142,7 @@ export function actionFor(row) {
     case "consent_granted":
       return { run: "Place referral" };
     case "outreach_in_progress":
-      return row.outreach_channel === "form" ? { review: "Review & submit" } : { run: "Place referral" };
+      return FORM_CHANNELS.has(row.outreach_channel) ? { review: "Review & submit" } : { run: "Place referral" };
     case "submitted":
       return { wait: "Awaiting service response", sims: [["response", "Service accepts ✓"], ["no_response", "No response ✕"]] };
     case "confirmed":

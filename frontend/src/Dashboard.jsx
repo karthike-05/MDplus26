@@ -15,7 +15,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { api } from "./api.js";
-import { C, Badge, Btn, RowActions, ChannelsTried, PatientResponse, CHANNEL_LABEL } from "./ui.jsx";
+import { C, Badge, Btn, RowActions, ChannelsTried, PatientResponse, CHANNEL_LABEL, FORM_CHANNELS } from "./ui.jsx";
 import { DEV_TOOLS } from "./devtools.js";
 
 const fmtTime = (iso) => {
@@ -42,7 +42,7 @@ const GROUPS = [
     match: (r) =>
       r.needs_attention ||
       r.awaiting_sw_selection ||
-      (r.current_state === "outreach_in_progress" && r.outreach_channel === "form"),
+      (r.current_state === "outreach_in_progress" && FORM_CHANNELS.has(r.outreach_channel)),
   },
   {
     key: "active",
