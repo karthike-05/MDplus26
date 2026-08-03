@@ -202,7 +202,7 @@ export default function Dashboard({ onReview, onOpen, onChoose, onNew }) {
                       <td style={s.td}>
                         {r.awaiting_sw_selection
                           ? <Badge state="awaiting_sw_selection" />
-                          : <Badge state={r.current_state} />}
+                          : <Badge state={r.current_state} declined={r.patient_response?.consent === "declined"} />}
                       </td>
                       <td style={s.td}><ChannelsTried channels={r.channels_tried} count={r.attempt_count} /></td>
                       <td style={s.td}><PatientResponse response={r.patient_response} /></td>

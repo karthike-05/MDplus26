@@ -71,7 +71,8 @@ export default function ReferralDetail({ referralId, onBack, onReview }) {
           <div style={s.h1}>{patient.name}</div>
           <div style={s.sub}>{service?.name || referral.service_name} · {CHANNEL_LABEL[referral.outreach_channel] || referral.outreach_channel}</div>
         </div>
-        <Badge state={display_state || referral.current_state} />
+        <Badge state={display_state || referral.current_state}
+               declined={patient_response?.consent === "declined"} />
       </div>
 
       <div style={s.cols}>

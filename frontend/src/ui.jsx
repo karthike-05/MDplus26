@@ -46,29 +46,18 @@ export const CHANNEL_LABEL = {
   none: "⚠ no channel configured",
 };
 
-// The PATIENT's own answers, kept visually separate from the service's (§7). Two
-// independent questions, and "not asked yet" is a real third answer for each — never
-// render a missing answer as a "no".
-const CONSENT_META = {
-  confirmed: { text: "Opted in ✓", color: C.ok },
-  pending: { text: "Awaiting opt-in", color: C.warn },
-  not_sent: { text: "Not asked", color: C.sub },
-  declined: { text: "Declined ✕", color: C.danger },
-};
-
+// The PATIENT's own answer to the check-in — did they actually use the service.
+// "Not asked yet" is a real third answer, distinct from a "no": never render a missing
+// answer as a decline. Consent (opted in / declined) lives on the Status badge instead
+// (see Badge below) — it's a different, earlier question and showing both here read as
+// one confusing column.
 export function PatientResponse({ response }) {
   if (!response) return <span style={{ color: C.sub }}>—</span>;
-  const consent = CONSENT_META[response.consent] || { text: response.consent, color: C.sub };
   const used =
     response.used_service === true ? { text: "Used it ✓", color: C.ok }
     : response.used_service === false ? { text: "Didn’t use ✕", color: C.danger }
     : { text: response.asked ? "Awaiting reply" : "Not asked yet", color: C.sub };
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 12 }}>
-      <span style={{ color: consent.color, fontWeight: 600 }}>{consent.text}</span>
-      <span style={{ color: used.color }}>{used.text}</span>
-    </div>
-  );
+  return <span style={{ color: used.color, fontSize: 12 }}>{used.text}</span>;
 }
 
 // Which channels were actually attempted — this is where all three services become
@@ -90,8 +79,13 @@ export function ChannelsTried({ channels, count }) {
   );
 }
 
-export function Badge({ state }) {
-  const m = STATE_META[state] || { label: state, color: C.sub };
+export function Badge({ state, declined }) {
+  // `escalated` covers every dead-end reason (declined consent, exhausted channels,
+  // no eligible service) — a real content difference, not cosmetic, so a declined
+  // consent gets its own label rather than the generic "Escalated".
+  const m = declined && state === "escalated"
+    ? { label: "Declined", color: C.danger }
+    : STATE_META[state] || { label: state, color: C.sub };
   return (
     <span style={{ background: m.color, color: "#fff", fontSize: 11, fontWeight: 600, padding: "3px 9px", borderRadius: 999, whiteSpace: "nowrap" }}>
       {m.label}
